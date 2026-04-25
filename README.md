@@ -44,6 +44,26 @@ It also registers the app to start automatically at Windows login using:
 HKCU\Software\Microsoft\Windows\CurrentVersion\Run
 ```
 
+## MSI Installer
+
+Build the MSI locally:
+
+```powershell
+.\build-installer.ps1
+```
+
+The MSI is written to:
+
+```text
+Installer\bin\Release\CodexBarWindows-<version>-win-x64.msi
+```
+
+Install it silently:
+
+```powershell
+msiexec /i .\Installer\bin\Release\CodexBarWindows-0.1.0-win-x64.msi /qn
+```
+
 ## Uninstall
 
 ```powershell
@@ -71,6 +91,43 @@ Publish manually:
 ```powershell
 dotnet publish .\CodexBarWindows.csproj -c Release -r win-x64 --self-contained:true
 ```
+
+## Versioning
+
+The app version is defined in [Directory.Build.props](Directory.Build.props):
+
+```xml
+<VersionPrefix>0.1.0</VersionPrefix>
+```
+
+Use semantic versions in the form `major.minor.patch`. MSI upgrades use this version, and the updater compares it against GitHub release tags.
+
+To publish a new version:
+
+```powershell
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+The GitHub Actions release workflow builds an MSI and attaches it to a GitHub Release.
+
+## Auto Updates
+
+Installed builds check GitHub Releases on startup and then every 6 hours. If a newer release exists and includes a `.msi` asset, the app downloads it, exits, installs the update silently, and restarts.
+
+Release requirements:
+
+- Tags must look like `v0.1.1`.
+- The release must include an MSI asset, for example `CodexBarWindows-0.1.1-win-x64.msi`.
+- The new version must be greater than the installed assembly version.
+
+For private repositories, GitHub release checks require authentication. The app checks these sources in order:
+
+- `CODEXBAR_GITHUB_TOKEN`
+- `GITHUB_TOKEN`
+- `gh auth token`
+
+If the repository is made public later, no token is required.
 
 ## How Usage Is Read
 

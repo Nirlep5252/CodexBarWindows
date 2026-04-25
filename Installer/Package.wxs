@@ -1,0 +1,57 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="CodexBarWindows"
+    Manufacturer="Nirlep5252"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="{503495F2-E909-46F8-9629-A6C504ADFF7A}"
+    Scope="perUser">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of CodexBarWindows is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsDirectory" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="CodexBarWindows">
+          <Directory Id="AssetsFolder" Name="Assets" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="ApplicationFiles" Guid="{6C18C26E-8D13-4F6C-820F-48CD3D449938}">
+        <File Id="CodexBarWindowsExe" Source="$(var.PublishDir)\CodexBarWindows.exe" />
+        <File Id="CodexBarWindowsPdb" Source="$(var.PublishDir)\CodexBarWindows.pdb" />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Microsoft\Windows\CurrentVersion\Run"
+          Name="CodexBarWindows"
+          Value="&quot;[INSTALLFOLDER]CodexBarWindows.exe&quot;"
+          Type="string"
+          KeyPath="yes" />
+        <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+        <RemoveFolder Id="RemoveProgramsDirectory" Directory="ProgramsDirectory" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="AssetsFolder">
+      <Component Id="OpenAiLogoAssets" Guid="{4DE0485C-F980-43BD-9604-C9B4E6A1F44A}">
+        <File Id="OpenAICodexLogoSvg" Source="$(var.PublishDir)\Assets\OpenAICodexLogo.svg" />
+        <File Id="OpenAICodexLogoBlackPng" Source="$(var.PublishDir)\Assets\OpenAICodexLogoBlack.png" />
+        <File Id="OpenAICodexLogoWhitePng" Source="$(var.PublishDir)\Assets\OpenAICodexLogoWhite.png" />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\CodexBarWindows"
+          Name="AssetsInstalled"
+          Value="1"
+          Type="integer"
+          KeyPath="yes" />
+        <RemoveFolder Id="RemoveAssetsFolder" Directory="AssetsFolder" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="MainFeature" Title="CodexBarWindows" Level="1">
+      <ComponentRef Id="ApplicationFiles" />
+      <ComponentRef Id="OpenAiLogoAssets" />
+    </Feature>
+  </Package>
+</Wix>

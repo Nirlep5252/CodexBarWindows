@@ -3,14 +3,17 @@ namespace CodexBarWindows;
 public sealed class TrayApplicationContext : ApplicationContext
 {
     private readonly CodexUsageReader usageReader = new();
+    private readonly GitHubReleaseUpdater releaseUpdater = new();
     private readonly Icon trayIcon = TrayIconFactory.Create();
     private readonly NotifyIcon notifyIcon;
     private readonly UsagePopupForm popup = new();
     private readonly System.Windows.Forms.Timer refreshTimer = new();
+    private readonly System.Windows.Forms.Timer updateTimer = new();
     private readonly SynchronizationContext uiContext;
     private UsageLookupResult latestUsage = new(null, "Usage has not been loaded yet.");
     private CancellationTokenSource? refreshCancellation;
     private int refreshGeneration;
+    private int updateCheckInProgress;
     private bool disposed;
 
     public TrayApplicationContext()
@@ -29,7 +32,12 @@ public sealed class TrayApplicationContext : ApplicationContext
         refreshTimer.Tick += (_, _) => BeginRefresh(showLoading: false);
         refreshTimer.Start();
 
+        updateTimer.Interval = (int)TimeSpan.FromHours(6).TotalMilliseconds;
+        updateTimer.Tick += (_, _) => BeginUpdateCheck();
+        updateTimer.Start();
+
         BeginRefresh(showLoading: false);
+        _ = Task.Delay(TimeSpan.FromSeconds(10)).ContinueWith(_ => BeginUpdateCheck(), TaskScheduler.Default);
     }
 
     protected override void Dispose(bool disposing)
@@ -40,6 +48,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             refreshCancellation?.Cancel();
             refreshCancellation?.Dispose();
             refreshTimer.Dispose();
+            updateTimer.Dispose();
             popup.Dispose();
             notifyIcon.Visible = false;
             notifyIcon.Dispose();
@@ -138,6 +147,49 @@ public sealed class TrayApplicationContext : ApplicationContext
                 cancellation.Dispose();
             }, null);
         }, CancellationToken.None);
+    }
+
+    private void BeginUpdateCheck()
+    {
+        if (Interlocked.Exchange(ref updateCheckInProgress, 1) == 1)
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            UpdateCheckResult result;
+            try
+            {
+                result = await releaseUpdater.CheckAndInstallLatestAsync(CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                result = UpdateCheckResult.Skipped($"Update check failed: {ex.Message}");
+            }
+
+            uiContext.Post(_ =>
+            {
+                updateCheckInProgress = 0;
+                if (disposed)
+                {
+                    return;
+                }
+
+                if (result.Status != UpdateCheckStatus.Installing)
+                {
+                    return;
+                }
+
+                notifyIcon.ShowBalloonTip(
+                    5000,
+                    "CodexBarWindows update",
+                    $"Installing version {result.Version}. The app will restart shortly.",
+                    ToolTipIcon.Info);
+
+                ExitThread();
+            }, null);
+        });
     }
 
     private static string BuildTooltip(UsageLookupResult usage)

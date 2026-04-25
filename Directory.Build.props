@@ -1,0 +1,13 @@
+<Project>
+  <PropertyGroup>
+    <VersionPrefix>0.1.0</VersionPrefix>
+    <Version>$(VersionPrefix)</Version>
+    <AssemblyVersion>$(VersionPrefix).0</AssemblyVersion>
+    <FileVersion>$(VersionPrefix).0</FileVersion>
+    <InformationalVersion>$(VersionPrefix)</InformationalVersion>
+    <Company>Nirlep5252</Company>
+    <Authors>Nirlep5252</Authors>
+    <Product>CodexBarWindows</Product>
+    <RepositoryUrl>https://github.com/Nirlep5252/CodexBarWindows</RepositoryUrl>
+  </PropertyGroup>
+</Project>
