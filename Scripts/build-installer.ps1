@@ -6,7 +6,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoRoot = Split-Path -Parent $scriptRoot
 $projectPath = Join-Path $repoRoot "CodexBarWindows.csproj"
 $installerProjectPath = Join-Path $repoRoot "Installer\CodexBarWindows.Installer.wixproj"
 $publishRoot = Join-Path $repoRoot "bin\publish\$Runtime"

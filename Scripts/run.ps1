@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 
-$repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoRoot = Split-Path -Parent $scriptRoot
 $projectPath = Join-Path $repoRoot "CodexBarWindows.csproj"
 $appName = "CodexBarWindows"
 $exePath = Join-Path $repoRoot "bin\x64\Debug\net10.0-windows\$appName.exe"

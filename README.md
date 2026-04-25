@@ -29,7 +29,7 @@ The installer publishes a self-contained Windows build, so the installed app doe
 From PowerShell:
 
 ```powershell
-.\install.ps1
+.\Scripts\install.ps1
 ```
 
 This publishes the app, installs it to:
@@ -49,7 +49,7 @@ HKCU\Software\Microsoft\Windows\CurrentVersion\Run
 Build the MSI locally:
 
 ```powershell
-.\build-installer.ps1
+.\Scripts\build-installer.ps1
 ```
 
 The MSI is written to:
@@ -67,7 +67,7 @@ msiexec /i .\Installer\bin\Release\CodexBarWindows-0.1.4-win-x64.msi /qn
 ## Uninstall
 
 ```powershell
-.\uninstall.ps1
+.\Scripts\uninstall.ps1
 ```
 
 This stops the app, removes the startup entry, and deletes the per-user install folder.
@@ -77,7 +77,7 @@ This stops the app, removes the startup entry, and deletes the per-user install 
 Run a local debug build:
 
 ```powershell
-.\run.ps1
+.\Scripts\run.ps1
 ```
 
 Build manually:
@@ -97,6 +97,7 @@ dotnet publish .\CodexBarWindows.csproj -c Release -r win-x64 --self-contained:t
 ```text
 Assets/                    App icon and tray logo assets
 Installer/                 WiX MSI package definition
+Scripts/                   Local run, install, uninstall, and MSI build scripts
 Source/App/                Program entry point and tray application context
 Source/Codex/              Codex CLI/RPC usage reading and usage models
 Source/UI/                 Popup form, meter control, and tray icon rendering
@@ -104,7 +105,7 @@ Source/Updates/            GitHub Releases update checker
 .github/workflows/         Release workflow for building and publishing MSI files
 ```
 
-The PowerShell scripts stay at the repository root because they are the primary local commands for development, install, uninstall, and MSI packaging.
+The PowerShell scripts are grouped under `Scripts/` because they are the primary local commands for development, install, uninstall, and MSI packaging.
 
 ## Versioning
 

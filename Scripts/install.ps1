@@ -7,9 +7,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoRoot = Split-Path -Parent $scriptRoot
 $appName = "CodexBarWindows"
-$installerScript = Join-Path $repoRoot "build-installer.ps1"
+$installerScript = Join-Path $scriptRoot "build-installer.ps1"
 
 function Find-InstalledProductCodes {
     $roots = @(

@@ -25,7 +25,7 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
-          .\build-installer.ps1 -Version $version
+          .\Scripts\build-installer.ps1 -Version $version
 
       - name: Create GitHub release
         shell: pwsh
