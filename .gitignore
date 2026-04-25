@@ -1,0 +1,15 @@
+bin/
+obj/
+*.user
+.vs/
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Publish artifacts
+publish/
+*.nupkg
+
+# Logs and local runtime files
+*.log
+*.tmp
