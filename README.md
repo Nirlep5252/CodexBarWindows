@@ -61,7 +61,7 @@ Installer\bin\Release\CodexBarWindows-<version>-win-x64.msi
 Install it silently:
 
 ```powershell
-msiexec /i .\Installer\bin\Release\CodexBarWindows-0.1.3-win-x64.msi /qn
+msiexec /i .\Installer\bin\Release\CodexBarWindows-0.1.4-win-x64.msi /qn
 ```
 
 ## Uninstall
@@ -111,7 +111,7 @@ The PowerShell scripts stay at the repository root because they are the primary 
 The app version is defined in [Directory.Build.props](Directory.Build.props):
 
 ```xml
-<VersionPrefix>0.1.3</VersionPrefix>
+<VersionPrefix>0.1.4</VersionPrefix>
 ```
 
 Use semantic versions in the form `major.minor.patch`. MSI upgrades use this version, and the updater compares it against GitHub release tags.
@@ -119,8 +119,8 @@ Use semantic versions in the form `major.minor.patch`. MSI upgrades use this ver
 To publish a new version:
 
 ```powershell
-git tag v0.1.3
-git push origin v0.1.3
+git tag v0.1.4
+git push origin v0.1.4
 ```
 
 The GitHub Actions release workflow builds an MSI and attaches it to a GitHub Release.
@@ -133,8 +133,8 @@ You can also right-click the tray icon and choose `Check for updates`.
 
 Release requirements:
 
-- Tags must look like `v0.1.3`.
-- The release must include an MSI asset, for example `CodexBarWindows-0.1.3-win-x64.msi`.
+- Tags must look like `v0.1.4`.
+- The release must include an MSI asset, for example `CodexBarWindows-0.1.4-win-x64.msi`.
 - The new version must be greater than the installed assembly version.
 
 For private repositories, GitHub release checks require authentication. The app checks these sources in order:

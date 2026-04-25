@@ -8,15 +8,13 @@ public sealed class SettingsForm : Form
     private readonly Label headingLabel;
     private readonly Label versionLabel;
     private readonly CheckBox startWithWindowsCheckBox;
-    private readonly Label startupDescriptionLabel;
-    private readonly Button closeButton;
     private readonly bool isDark = IsDarkTheme();
 
     public SettingsForm()
     {
         AutoScaleMode = AutoScaleMode.Dpi;
         BackColor = isDark ? Color.FromArgb(32, 32, 32) : SystemColors.Control;
-        ClientSize = new Size(440, 220);
+        ClientSize = new Size(440, 158);
         Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         Icon = TrayIconFactory.Create();
@@ -54,31 +52,10 @@ public sealed class SettingsForm : Form
         };
         startWithWindowsCheckBox.CheckedChanged += (_, _) => StartupSettings.SetEnabled(startWithWindowsCheckBox.Checked);
 
-        startupDescriptionLabel = new Label
-        {
-            AutoSize = false,
-            Location = new Point(46, 132),
-            Size = new Size(360, 36),
-            Text = "Launch CodexBarWindows automatically when you sign in."
-        };
-
-        closeButton = new Button
-        {
-            Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
-            DialogResult = DialogResult.OK,
-            Location = new Point(332, 176),
-            Size = new Size(84, 30),
-            Text = "Close",
-            UseVisualStyleBackColor = true
-        };
-
         Controls.Add(headingLabel);
         Controls.Add(versionLabel);
         Controls.Add(startWithWindowsCheckBox);
-        Controls.Add(startupDescriptionLabel);
-        Controls.Add(closeButton);
 
-        AcceptButton = closeButton;
         ApplyTheme();
     }
 
@@ -100,7 +77,6 @@ public sealed class SettingsForm : Form
         }
 
         versionLabel.ForeColor = textSecondary;
-        startupDescriptionLabel.ForeColor = textSecondary;
     }
 
     private static Font CreateFont(string family, float size, FontStyle style)
