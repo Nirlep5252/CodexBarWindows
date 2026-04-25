@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.Net.Http.Headers;
-using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -80,7 +79,7 @@ public sealed class GitHubReleaseUpdater
             Timeout = RequestTimeout
         };
 
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("CodexBarWindows/" + CurrentVersion());
+        client.DefaultRequestHeaders.UserAgent.ParseAdd(AppInfo.AppName + "/" + AppInfo.CurrentVersion);
         client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
         client.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28");
 
@@ -208,10 +207,7 @@ public sealed class GitHubReleaseUpdater
 
     private static Version CurrentVersion()
     {
-        var version = Assembly.GetExecutingAssembly().GetName().Version;
-        return version is null
-            ? new Version(0, 0, 0)
-            : new Version(version.Major, version.Minor, Math.Max(0, version.Build));
+        return AppInfo.CurrentVersion;
     }
 
     private static bool TryParseVersion(string tag, out Version version)

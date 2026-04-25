@@ -7,9 +7,11 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly Icon trayIcon = TrayIconFactory.Create();
     private readonly NotifyIcon notifyIcon;
     private readonly UsagePopupForm popup = new();
+    private SettingsForm? settingsForm;
     private readonly System.Windows.Forms.Timer refreshTimer = new();
     private readonly System.Windows.Forms.Timer updateTimer = new();
     private readonly SynchronizationContext uiContext;
+    private ToolStripMenuItem? checkForUpdatesItem;
     private UsageLookupResult latestUsage = new(null, "Usage has not been loaded yet.");
     private CancellationTokenSource? refreshCancellation;
     private int refreshGeneration;
@@ -49,6 +51,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             refreshCancellation?.Dispose();
             refreshTimer.Dispose();
             updateTimer.Dispose();
+            settingsForm?.Dispose();
             popup.Dispose();
             notifyIcon.Visible = false;
             notifyIcon.Dispose();
@@ -62,9 +65,18 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         var menu = new ContextMenuStrip();
 
+        var settingsItem = new ToolStripMenuItem("Settings");
+        settingsItem.Click += (_, _) => ShowSettings();
+
+        checkForUpdatesItem = new ToolStripMenuItem("Check for updates");
+        checkForUpdatesItem.Click += (_, _) => BeginUpdateCheck(showResult: true);
+
         var exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (_, _) => ExitThread();
 
+        menu.Items.Add(settingsItem);
+        menu.Items.Add(checkForUpdatesItem);
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exitItem);
 
         return menu;
@@ -149,12 +161,38 @@ public sealed class TrayApplicationContext : ApplicationContext
         }, CancellationToken.None);
     }
 
-    private void BeginUpdateCheck()
+    private void ShowSettings()
+    {
+        if (settingsForm is { IsDisposed: false })
+        {
+            settingsForm.Show();
+            settingsForm.Activate();
+            return;
+        }
+
+        settingsForm = new SettingsForm();
+        settingsForm.FormClosed += (_, _) => settingsForm = null;
+        settingsForm.Show();
+        settingsForm.Activate();
+    }
+
+    private void BeginUpdateCheck(bool showResult = false)
     {
         if (Interlocked.Exchange(ref updateCheckInProgress, 1) == 1)
         {
+            if (showResult)
+            {
+                notifyIcon.ShowBalloonTip(
+                    3000,
+                    "CodexBarWindows update",
+                    "An update check is already running.",
+                    ToolTipIcon.Info);
+            }
+
             return;
         }
+
+        SetUpdateMenuState(isChecking: true);
 
         _ = Task.Run(async () =>
         {
@@ -171,25 +209,47 @@ public sealed class TrayApplicationContext : ApplicationContext
             uiContext.Post(_ =>
             {
                 updateCheckInProgress = 0;
+                SetUpdateMenuState(isChecking: false);
                 if (disposed)
                 {
                     return;
                 }
 
-                if (result.Status != UpdateCheckStatus.Installing)
+                if (result.Status == UpdateCheckStatus.Installing)
+                {
+                    notifyIcon.ShowBalloonTip(
+                        5000,
+                        "CodexBarWindows update",
+                        $"Installing version {result.Version}. The app will restart shortly.",
+                        ToolTipIcon.Info);
+
+                    ExitThread();
+                    return;
+                }
+
+                if (!showResult)
                 {
                     return;
                 }
 
                 notifyIcon.ShowBalloonTip(
-                    5000,
+                    4000,
                     "CodexBarWindows update",
-                    $"Installing version {result.Version}. The app will restart shortly.",
-                    ToolTipIcon.Info);
-
-                ExitThread();
+                    result.Message,
+                    result.Status == UpdateCheckStatus.UpToDate ? ToolTipIcon.Info : ToolTipIcon.Warning);
             }, null);
         });
+    }
+
+    private void SetUpdateMenuState(bool isChecking)
+    {
+        if (checkForUpdatesItem is null)
+        {
+            return;
+        }
+
+        checkForUpdatesItem.Enabled = !isChecking;
+        checkForUpdatesItem.Text = isChecking ? "Checking for updates..." : "Check for updates";
     }
 
     private static string BuildTooltip(UsageLookupResult usage)
