@@ -92,6 +92,20 @@ Publish manually:
 dotnet publish .\CodexBarWindows.csproj -c Release -r win-x64 --self-contained:true
 ```
 
+## Project Layout
+
+```text
+Assets/                    App icon and tray logo assets
+Installer/                 WiX MSI package definition
+Source/App/                Program entry point and tray application context
+Source/Codex/              Codex CLI/RPC usage reading and usage models
+Source/UI/                 Popup form, meter control, and tray icon rendering
+Source/Updates/            GitHub Releases update checker
+.github/workflows/         Release workflow for building and publishing MSI files
+```
+
+The PowerShell scripts stay at the repository root because they are the primary local commands for development, install, uninstall, and MSI packaging.
+
 ## Versioning
 
 The app version is defined in [Directory.Build.props](Directory.Build.props):
