@@ -34,4 +34,8 @@ jobs:
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
           $msi = "Installer\bin\Release\CodexBarWindows-$version-win-x64.msi"
-          gh release create "${{ github.ref_name }}" $msi --title "CodexBarWindows $version" --notes "CodexBarWindows $version"
+          if (gh release view "${{ github.ref_name }}" *> $null) {
+            gh release upload "${{ github.ref_name }}" $msi --clobber
+          } else {
+            gh release create "${{ github.ref_name }}" $msi --title "CodexBarWindows $version" --notes "CodexBarWindows $version"
+          }

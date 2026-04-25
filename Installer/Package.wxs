@@ -8,6 +8,7 @@
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of CodexBarWindows is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <Icon Id="CodexBarWindowsIcon" SourceFile="$(var.PublishDir)\Assets\CodexBarWindows.ico" />
 
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="ProgramsDirectory" Name="Programs">
@@ -59,6 +60,8 @@
           Name="CodexBarWindows"
           Description="Show Codex rate limits from the Windows tray"
           Target="[INSTALLFOLDER]CodexBarWindows.exe"
+          Icon="CodexBarWindowsIcon"
+          IconIndex="0"
           WorkingDirectory="INSTALLFOLDER" />
         <RemoveFolder Id="RemoveApplicationProgramsFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
         <RegistryValue
