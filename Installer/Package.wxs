@@ -16,6 +16,9 @@
         </Directory>
       </Directory>
     </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="CodexBarWindows" />
+    </StandardDirectory>
 
     <DirectoryRef Id="INSTALLFOLDER">
       <Component Id="ApplicationFiles" Guid="{6C18C26E-8D13-4F6C-820F-48CD3D449938}">
@@ -49,9 +52,29 @@
       </Component>
     </DirectoryRef>
 
+    <DirectoryRef Id="ApplicationProgramsFolder">
+      <Component Id="StartMenuShortcut" Guid="{8A88A55F-2754-4E97-B5F3-5C06C8B8ABA7}">
+        <Shortcut
+          Id="ApplicationStartMenuShortcut"
+          Name="CodexBarWindows"
+          Description="Show Codex rate limits from the Windows tray"
+          Target="[INSTALLFOLDER]CodexBarWindows.exe"
+          WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveApplicationProgramsFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\CodexBarWindows"
+          Name="StartMenuShortcut"
+          Value="1"
+          Type="integer"
+          KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
     <Feature Id="MainFeature" Title="CodexBarWindows" Level="1">
       <ComponentRef Id="ApplicationFiles" />
       <ComponentRef Id="OpenAiLogoAssets" />
+      <ComponentRef Id="StartMenuShortcut" />
     </Feature>
   </Package>
 </Wix>

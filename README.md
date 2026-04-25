@@ -38,7 +38,7 @@ This publishes the app, installs it to:
 %LOCALAPPDATA%\Programs\CodexBarWindows
 ```
 
-It also registers the app to start automatically at Windows login using:
+It also creates a Start Menu shortcut so `CodexBarWindows` appears in Windows search, and registers the app to start automatically at Windows login using:
 
 ```text
 HKCU\Software\Microsoft\Windows\CurrentVersion\Run
@@ -61,7 +61,7 @@ Installer\bin\Release\CodexBarWindows-<version>-win-x64.msi
 Install it silently:
 
 ```powershell
-msiexec /i .\Installer\bin\Release\CodexBarWindows-0.1.0-win-x64.msi /qn
+msiexec /i .\Installer\bin\Release\CodexBarWindows-0.1.1-win-x64.msi /qn
 ```
 
 ## Uninstall
@@ -97,7 +97,7 @@ dotnet publish .\CodexBarWindows.csproj -c Release -r win-x64 --self-contained:t
 The app version is defined in [Directory.Build.props](Directory.Build.props):
 
 ```xml
-<VersionPrefix>0.1.0</VersionPrefix>
+<VersionPrefix>0.1.1</VersionPrefix>
 ```
 
 Use semantic versions in the form `major.minor.patch`. MSI upgrades use this version, and the updater compares it against GitHub release tags.
