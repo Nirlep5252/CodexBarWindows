@@ -5,18 +5,25 @@ namespace CodexBarWindows;
 public sealed class UsagePopupForm : Form
 {
     private readonly Label titleLabel;
+    private readonly ProviderTabButton codexTabButton;
+    private readonly ProviderTabButton claudeTabButton;
     private readonly Label planLabel;
     private readonly Label statusLabel;
     private readonly UsageSection fiveHourSection;
     private readonly UsageSection weeklySection;
     private readonly CloseGlyphButton closeButton;
     private ThemePalette theme = ThemePalette.FromWindows();
+    private UsageProvider selectedProvider = UsageProvider.Codex;
+    private ProviderUsageLookupResult codexUsage = new(null, "Usage has not been loaded yet.");
+    private ProviderUsageLookupResult claudeUsage = new(null, "Usage has not been loaded yet.");
+
+    public event EventHandler<UsageProvider>? SelectedProviderChanged;
 
     public UsagePopupForm()
     {
         AutoScaleMode = AutoScaleMode.Dpi;
         BackColor = theme.Surface;
-        ClientSize = new Size(420, 294);
+        ClientSize = new Size(420, 334);
         ControlBox = false;
         DoubleBuffered = true;
         Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular);
@@ -51,19 +58,33 @@ public sealed class UsagePopupForm : Form
         {
             AutoSize = false,
             Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular),
-            Location = new Point(24, 50),
+            Location = new Point(24, 88),
             Size = new Size(330, 22)
         };
 
+        codexTabButton = new ProviderTabButton("Codex", UsageProvider.Codex)
+        {
+            Location = new Point(22, 54),
+            Size = new Size(86, 28)
+        };
+        codexTabButton.Click += (_, _) => SelectProvider(UsageProvider.Codex);
+
+        claudeTabButton = new ProviderTabButton("Claude", UsageProvider.Claude)
+        {
+            Location = new Point(112, 54),
+            Size = new Size(90, 28)
+        };
+        claudeTabButton.Click += (_, _) => SelectProvider(UsageProvider.Claude);
+
         fiveHourSection = new UsageSection("5 hour limit")
         {
-            Location = new Point(18, 78),
+            Location = new Point(18, 116),
             Size = new Size(384, 86)
         };
 
         weeklySection = new UsageSection("Weekly limit")
         {
-            Location = new Point(18, 174),
+            Location = new Point(18, 212),
             Size = new Size(384, 86)
         };
 
@@ -72,11 +93,13 @@ public sealed class UsagePopupForm : Form
             AutoEllipsis = true,
             AutoSize = false,
             Font = CreateFont("Segoe UI Variable Text", 8.5f, FontStyle.Regular),
-            Location = new Point(24, 264),
+            Location = new Point(24, 304),
             Size = new Size(372, 22)
         };
 
         Controls.Add(titleLabel);
+        Controls.Add(codexTabButton);
+        Controls.Add(claudeTabButton);
         Controls.Add(planLabel);
         Controls.Add(fiveHourSection);
         Controls.Add(weeklySection);
@@ -93,7 +116,10 @@ public sealed class UsagePopupForm : Form
         Deactivate += (_, _) => Hide();
         FormClosing += OnFormClosing;
         ApplyTheme();
+        RenderSelectedProvider();
     }
+
+    public UsageProvider SelectedProvider => selectedProvider;
 
     protected override CreateParams CreateParams
     {
@@ -144,39 +170,103 @@ public sealed class UsagePopupForm : Form
         }
     }
 
-    public void UpdateUsage(UsageLookupResult result)
+    public void UpdateUsage(UsageProvider provider, ProviderUsageLookupResult result)
     {
+        SetProviderUsage(provider, result);
+
+        if (provider == selectedProvider)
+        {
+            RenderSelectedProvider();
+        }
+    }
+
+    public void SetLoading(UsageProvider provider)
+    {
+        var current = GetProviderUsage(provider);
+        if (current.Snapshot is { } && provider == selectedProvider)
+        {
+            RenderSelectedProvider();
+            statusLabel.Text = $"Refreshing {ProviderName(provider)} limits...";
+            return;
+        }
+
+        if (provider == selectedProvider)
+        {
+            planLabel.Text = $"Fetching {ProviderName(provider)} limits...";
+            fiveHourSection.SetLoading("5 hour limit");
+            weeklySection.SetLoading("Weekly limit");
+            statusLabel.Text = provider == UsageProvider.Claude
+                ? "Reading from Claude Code OAuth..."
+                : "Reading from Codex CLI...";
+        }
+    }
+
+    private void SelectProvider(UsageProvider provider)
+    {
+        if (selectedProvider == provider)
+        {
+            return;
+        }
+
+        selectedProvider = provider;
+        RenderSelectedProvider();
+        SelectedProviderChanged?.Invoke(this, provider);
+    }
+
+    private void RenderSelectedProvider()
+    {
+        codexTabButton.Selected = selectedProvider == UsageProvider.Codex;
+        claudeTabButton.Selected = selectedProvider == UsageProvider.Claude;
+
+        titleLabel.Text = $"{ProviderName(selectedProvider)} rate limits";
+        var result = GetProviderUsage(selectedProvider);
+
         if (result.Snapshot is not { } snapshot)
         {
-            planLabel.Text = "Waiting for local Codex usage data";
-            fiveHourSection.SetUnavailable();
-            weeklySection.SetUnavailable();
+            planLabel.Text = $"Waiting for local {ProviderName(selectedProvider)} usage data";
+            fiveHourSection.SetUnavailable("5 hour limit");
+            weeklySection.SetUnavailable("Weekly limit");
             statusLabel.Text = result.Error ?? "No usage data found.";
             return;
         }
 
         planLabel.Text = string.IsNullOrWhiteSpace(snapshot.PlanType)
-            ? "Local Codex session data"
+            ? selectedProvider == UsageProvider.Claude ? "Claude Code usage data" : "Local Codex session data"
             : $"{ToTitleCase(snapshot.PlanType)} plan";
 
-        fiveHourSection.SetUsage(snapshot.FiveHour);
-        weeklySection.SetUsage(snapshot.Weekly);
+        fiveHourSection.SetUsage(snapshot.Primary);
+        if (snapshot.Secondary is { } secondary)
+        {
+            weeklySection.SetUsage(secondary);
+        }
+        else
+        {
+            weeklySection.SetUnavailable("Weekly limit");
+        }
+
         statusLabel.Text = string.Empty;
     }
 
-    public void SetLoading(UsageLookupResult current)
+    private ProviderUsageLookupResult GetProviderUsage(UsageProvider provider)
     {
-        if (current.Snapshot is { })
-        {
-            UpdateUsage(current);
-            statusLabel.Text = "Refreshing Codex limits...";
-            return;
-        }
+        return provider == UsageProvider.Claude ? claudeUsage : codexUsage;
+    }
 
-        planLabel.Text = "Fetching Codex limits...";
-        fiveHourSection.SetLoading();
-        weeklySection.SetLoading();
-        statusLabel.Text = "Reading from Codex CLI...";
+    private void SetProviderUsage(UsageProvider provider, ProviderUsageLookupResult result)
+    {
+        if (provider == UsageProvider.Claude)
+        {
+            claudeUsage = result;
+        }
+        else
+        {
+            codexUsage = result;
+        }
+    }
+
+    private static string ProviderName(UsageProvider provider)
+    {
+        return provider == UsageProvider.Claude ? "Claude" : "Codex";
     }
 
     private Point CalculateLocation(Point anchor)
@@ -243,6 +333,8 @@ public sealed class UsagePopupForm : Form
         statusLabel.ForeColor = theme.TextSecondary;
 
         closeButton.ApplyTheme(theme);
+        codexTabButton.ApplyTheme(theme);
+        claudeTabButton.ApplyTheme(theme);
         fiveHourSection.ApplyTheme(theme);
         weeklySection.ApplyTheme(theme);
 
@@ -428,28 +520,33 @@ public sealed class UsagePopupForm : Form
             Invalidate(true);
         }
 
-        public void SetUnavailable()
+        public void SetUnavailable(string title)
         {
+            nameLabel.Text = title;
             percentLabel.Text = "-- used";
             meter.Value = 0;
             remainingLabel.Text = "-- remaining";
             resetLabel.Text = "Reset unknown";
         }
 
-        public void SetLoading()
+        public void SetLoading(string title)
         {
+            nameLabel.Text = title;
             percentLabel.Text = "Loading...";
             meter.Value = 0;
             remainingLabel.Text = "Fetching usage";
             resetLabel.Text = "Reset loading";
         }
 
-        public void SetUsage(UsageWindow usage)
+        public void SetUsage(ProviderUsageWindow usage)
         {
+            nameLabel.Text = usage.Title;
             percentLabel.Text = $"{usage.UsedPercent:0.#}% used";
             meter.Value = usage.UsedPercent;
             remainingLabel.Text = $"{usage.RemainingPercent:0.#}% remaining";
-            resetLabel.Text = $"Resets {FormatReset(usage.ResetsAt)}";
+            resetLabel.Text = usage.ResetsAt is { } resetAt
+                ? $"Resets {FormatReset(resetAt)}"
+                : "Reset unknown";
         }
 
         private static string FormatReset(DateTimeOffset resetAt)
@@ -564,6 +661,134 @@ public sealed class UsagePopupForm : Form
                 Color.FromArgb(225, 225, 225),
                 Color.FromArgb(202, 80, 16),
                 Color.FromArgb(196, 43, 28));
+        }
+    }
+
+    private sealed class ProviderTabButton : Control
+    {
+        private ThemePalette theme = ThemePalette.FromWindows();
+        private bool hovering;
+        private bool pressing;
+        private bool selected;
+
+        public ProviderTabButton(string text, UsageProvider provider)
+        {
+            Text = text;
+            Provider = provider;
+            Cursor = Cursors.Hand;
+            Font = CreateFont("Segoe UI Variable Text", 8.75f, FontStyle.Bold);
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.OptimizedDoubleBuffer |
+                ControlStyles.ResizeRedraw |
+                ControlStyles.Selectable |
+                ControlStyles.UserPaint,
+                true);
+        }
+
+        [System.ComponentModel.Browsable(false)]
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public UsageProvider Provider { get; }
+
+        [System.ComponentModel.Browsable(false)]
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public bool Selected
+        {
+            get => selected;
+            set
+            {
+                if (selected == value)
+                {
+                    return;
+                }
+
+                selected = value;
+                Invalidate();
+            }
+        }
+
+        public void ApplyTheme(ThemePalette palette)
+        {
+            theme = palette;
+            BackColor = theme.Surface;
+            Invalidate();
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            hovering = true;
+            Invalidate();
+            base.OnMouseEnter(e);
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            hovering = false;
+            pressing = false;
+            Invalidate();
+            base.OnMouseLeave(e);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                pressing = true;
+                Invalidate();
+            }
+
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            pressing = false;
+            Invalidate();
+            base.OnMouseUp(e);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode is Keys.Enter or Keys.Space)
+            {
+                OnClick(EventArgs.Empty);
+                e.Handled = true;
+            }
+
+            base.OnKeyDown(e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+            var fill = selected
+                ? theme.Accent
+                : pressing
+                    ? theme.Pressed
+                    : hovering
+                        ? theme.Hover
+                        : theme.Surface;
+
+            using var fillBrush = new SolidBrush(fill);
+            using var borderPen = new Pen(selected ? theme.Accent : theme.CardBorder);
+            using var path = RoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), 8);
+            e.Graphics.FillPath(fillBrush, path);
+            e.Graphics.DrawPath(borderPen, path);
+
+            var textColor = selected && theme.IsDark
+                ? Color.Black
+                : selected
+                    ? Color.White
+                    : theme.TextPrimary;
+
+            TextRenderer.DrawText(
+                e.Graphics,
+                Text,
+                Font,
+                ClientRectangle,
+                textColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
         }
     }
 

@@ -3,6 +3,7 @@ namespace CodexBarWindows;
 public sealed class TrayApplicationContext : ApplicationContext
 {
     private readonly CodexUsageReader usageReader = new();
+    private readonly ClaudeUsageReader claudeUsageReader = new();
     private readonly GitHubReleaseUpdater releaseUpdater = new();
     private readonly Icon trayIcon = TrayIconFactory.Create();
     private readonly NotifyIcon notifyIcon;
@@ -12,7 +13,8 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly System.Windows.Forms.Timer updateTimer = new();
     private readonly SynchronizationContext uiContext;
     private ToolStripMenuItem? checkForUpdatesItem;
-    private UsageLookupResult latestUsage = new(null, "Usage has not been loaded yet.");
+    private ProviderUsageLookupResult latestCodexUsage = new(null, "Usage has not been loaded yet.");
+    private ProviderUsageLookupResult latestClaudeUsage = new(null, "Usage has not been loaded yet.");
     private CancellationTokenSource? refreshCancellation;
     private int refreshGeneration;
     private int updateCheckInProgress;
@@ -29,6 +31,13 @@ public sealed class TrayApplicationContext : ApplicationContext
             Visible = true
         };
         notifyIcon.MouseUp += OnTrayMouseUp;
+        popup.SelectedProviderChanged += (_, provider) =>
+        {
+            if (!GetLatestUsage(provider).HasSnapshot)
+            {
+                BeginRefresh(showLoading: true);
+            }
+        };
 
         refreshTimer.Interval = (int)TimeSpan.FromMinutes(1).TotalMilliseconds;
         refreshTimer.Tick += (_, _) => BeginRefresh(showLoading: false);
@@ -105,7 +114,8 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private void ShowPopup(Point anchor, bool refresh)
     {
-        popup.UpdateUsage(latestUsage);
+        popup.UpdateUsage(UsageProvider.Codex, latestCodexUsage);
+        popup.UpdateUsage(UsageProvider.Claude, latestClaudeUsage);
         popup.ShowNear(anchor);
 
         if (refresh)
@@ -118,7 +128,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         if (showLoading)
         {
-            popup.SetLoading(latestUsage);
+            popup.SetLoading(popup.SelectedProvider);
         }
 
         refreshCancellation?.Cancel();
@@ -128,8 +138,39 @@ public sealed class TrayApplicationContext : ApplicationContext
         var cancellation = new CancellationTokenSource();
         refreshCancellation = cancellation;
 
-        _ = Task.Run(usageReader.ReadLatest, cancellation.Token).ContinueWith(task =>
+        _ = Task.Run(async () =>
         {
+            ProviderUsageLookupResult codexResult;
+            ProviderUsageLookupResult claudeResult;
+
+            try
+            {
+                var codexTask = Task.Run(
+                    () =>
+                    {
+                        try
+                        {
+                            return usageReader.ReadLatest().ToProviderResult();
+                        }
+                        catch (Exception exception)
+                        {
+                            return new ProviderUsageLookupResult(
+                                null,
+                                $"Could not refresh Codex limits: {exception.Message}");
+                        }
+                    },
+                    cancellation.Token);
+
+                var claudeTask = claudeUsageReader.ReadLatestAsync(cancellation.Token);
+
+                codexResult = await codexTask.ConfigureAwait(false);
+                claudeResult = await claudeTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
             uiContext.Post(_ =>
             {
                 if (disposed || cancellation.IsCancellationRequested || generation != refreshGeneration)
@@ -143,14 +184,40 @@ public sealed class TrayApplicationContext : ApplicationContext
                     return;
                 }
 
-                latestUsage = task.IsCanceled
-                    ? latestUsage
-                    : task.Exception is null
-                    ? task.Result
-                    : new UsageLookupResult(null, $"Could not refresh Codex limits: {task.Exception.GetBaseException().Message}");
+                latestCodexUsage = codexResult;
+                latestClaudeUsage = claudeResult;
 
-                popup.UpdateUsage(latestUsage);
-                notifyIcon.Text = BuildTooltip(latestUsage);
+                popup.UpdateUsage(UsageProvider.Codex, latestCodexUsage);
+                popup.UpdateUsage(UsageProvider.Claude, latestClaudeUsage);
+                notifyIcon.Text = BuildTooltip(latestCodexUsage, latestClaudeUsage);
+                if (ReferenceEquals(refreshCancellation, cancellation))
+                {
+                    refreshCancellation = null;
+                }
+
+                cancellation.Dispose();
+            }, null);
+        }, CancellationToken.None).ContinueWith(task =>
+        {
+            if (task.Exception is null)
+            {
+                return;
+            }
+
+            uiContext.Post(_ =>
+            {
+                if (disposed || cancellation.IsCancellationRequested || generation != refreshGeneration)
+                {
+                    return;
+                }
+
+                latestCodexUsage = new ProviderUsageLookupResult(
+                    null,
+                    $"Could not refresh usage limits: {task.Exception.GetBaseException().Message}");
+                latestClaudeUsage = latestCodexUsage;
+                popup.UpdateUsage(UsageProvider.Codex, latestCodexUsage);
+                popup.UpdateUsage(UsageProvider.Claude, latestClaudeUsage);
+                notifyIcon.Text = BuildTooltip(latestCodexUsage, latestClaudeUsage);
                 if (ReferenceEquals(refreshCancellation, cancellation))
                 {
                     refreshCancellation = null;
@@ -252,15 +319,26 @@ public sealed class TrayApplicationContext : ApplicationContext
         checkForUpdatesItem.Text = isChecking ? "Checking for updates..." : "Check for updates";
     }
 
-    private static string BuildTooltip(UsageLookupResult usage)
+    private ProviderUsageLookupResult GetLatestUsage(UsageProvider provider)
     {
-        if (usage.Snapshot is not { } snapshot)
+        return provider == UsageProvider.Claude ? latestClaudeUsage : latestCodexUsage;
+    }
+
+    private static string BuildTooltip(ProviderUsageLookupResult codexUsage, ProviderUsageLookupResult claudeUsage)
+    {
+        if (codexUsage.Snapshot is null && claudeUsage.Snapshot is null)
         {
-            return TrimTooltip("Codex rate limits: no data found");
+            return TrimTooltip("CodexBarWindows: no usage data found");
         }
 
-        return TrimTooltip(
-            $"Codex limits: 5h {snapshot.FiveHour.UsedPercent:0.#}% used, weekly {snapshot.Weekly.UsedPercent:0.#}% used");
+        var codexText = codexUsage.Snapshot is { } codex
+            ? $"Codex {codex.Primary.UsedPercent:0.#}%"
+            : "Codex --";
+        var claudeText = claudeUsage.Snapshot is { } claude
+            ? $"Claude {claude.Primary.UsedPercent:0.#}%"
+            : "Claude --";
+
+        return TrimTooltip($"{codexText} 5h used, {claudeText} 5h used");
     }
 
     private static string TrimTooltip(string value)
