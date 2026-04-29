@@ -4,6 +4,8 @@ namespace CodexBarWindows;
 
 public sealed class UsagePopupForm : Form
 {
+    private const int BaseWidth = 420;
+    private const int BaseHeight = 304;
     private readonly Label titleLabel;
     private readonly ProviderTabButton codexTabButton;
     private readonly ProviderTabButton claudeTabButton;
@@ -21,9 +23,9 @@ public sealed class UsagePopupForm : Form
 
     public UsagePopupForm()
     {
-        AutoScaleMode = AutoScaleMode.Dpi;
+        AutoScaleMode = AutoScaleMode.None;
         BackColor = theme.Surface;
-        ClientSize = new Size(420, 304);
+        ClientSize = new Size(BaseWidth, BaseHeight);
         ControlBox = false;
         DoubleBuffered = true;
         Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular);
@@ -39,8 +41,6 @@ public sealed class UsagePopupForm : Form
         closeButton = new CloseGlyphButton
         {
             Anchor = AnchorStyles.Top | AnchorStyles.Right,
-            Location = new Point(374, 14),
-            Size = new Size(30, 30),
             TabIndex = 0
         };
         closeButton.Click += (_, _) => Hide();
@@ -49,54 +49,38 @@ public sealed class UsagePopupForm : Form
         {
             AutoSize = false,
             Font = CreateFont("Segoe UI Variable Display", 15.5f, FontStyle.Bold),
-            Location = new Point(22, 18),
-            Size = new Size(254, 30),
             Text = "Codex rate limits"
         };
 
         planLabel = new Label
         {
             AutoSize = false,
-            Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular),
-            Location = new Point(24, 54),
-            Size = new Size(330, 22)
+            Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular)
         };
 
         codexTabButton = new ProviderTabButton("Codex", UsageProvider.Codex)
         {
             Anchor = AnchorStyles.Top | AnchorStyles.Right,
-            Location = new Point(292, 16),
-            Size = new Size(34, 30)
+            AccessibleName = "Codex"
         };
         codexTabButton.Click += (_, _) => SelectProvider(UsageProvider.Codex);
 
         claudeTabButton = new ProviderTabButton("Claude", UsageProvider.Claude)
         {
             Anchor = AnchorStyles.Top | AnchorStyles.Right,
-            Location = new Point(330, 16),
-            Size = new Size(34, 30)
+            AccessibleName = "Claude"
         };
         claudeTabButton.Click += (_, _) => SelectProvider(UsageProvider.Claude);
 
-        fiveHourSection = new UsageSection("5 hour limit")
-        {
-            Location = new Point(18, 82),
-            Size = new Size(384, 86)
-        };
+        fiveHourSection = new UsageSection("5 hour limit");
 
-        weeklySection = new UsageSection("Weekly limit")
-        {
-            Location = new Point(18, 178),
-            Size = new Size(384, 86)
-        };
+        weeklySection = new UsageSection("Weekly limit");
 
         statusLabel = new Label
         {
             AutoEllipsis = true,
             AutoSize = false,
-            Font = CreateFont("Segoe UI Variable Text", 8.5f, FontStyle.Regular),
-            Location = new Point(24, 274),
-            Size = new Size(372, 22)
+            Font = CreateFont("Segoe UI Variable Text", 8.5f, FontStyle.Regular)
         };
 
         Controls.Add(titleLabel);
@@ -117,6 +101,7 @@ public sealed class UsagePopupForm : Form
 
         Deactivate += (_, _) => Hide();
         FormClosing += OnFormClosing;
+        ApplyScaledLayout();
         ApplyTheme();
         RenderSelectedProvider();
     }
@@ -137,6 +122,7 @@ public sealed class UsagePopupForm : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
+        ApplyScaledLayout();
         NativeMethods.ApplyWindowAttributes(Handle, theme.IsDark);
     }
 
@@ -154,6 +140,7 @@ public sealed class UsagePopupForm : Form
     public void ShowNear(Point anchor)
     {
         RefreshTheme();
+        ApplyScaledLayout();
         Location = CalculateLocation(anchor);
         Show();
         Activate();
@@ -162,14 +149,62 @@ public sealed class UsagePopupForm : Form
     protected override void WndProc(ref Message m)
     {
         const int wmSettingChange = 0x001A;
+        const int wmDpiChanged = 0x02E0;
         const int wmThemeChanged = 0x031A;
 
         base.WndProc(ref m);
 
-        if (m.Msg is wmSettingChange or wmThemeChanged)
+        if (m.Msg is wmSettingChange or wmDpiChanged or wmThemeChanged)
         {
             RefreshTheme();
+            ApplyScaledLayout();
         }
+    }
+
+    private void ApplyScaledLayout()
+    {
+        var scale = DpiScale;
+        SuspendLayout();
+
+        ClientSize = new Size(ScaleInt(BaseWidth, scale), ScaleInt(BaseHeight, scale));
+
+        closeButton.Bounds = ScaleRect(374, 14, 30, 30, scale);
+        titleLabel.Bounds = ScaleRect(22, 17, 254, 34, scale);
+        planLabel.Bounds = ScaleRect(24, 54, 330, 24, scale);
+        codexTabButton.Bounds = ScaleRect(292, 16, 34, 30, scale);
+        claudeTabButton.Bounds = ScaleRect(330, 16, 34, 30, scale);
+        fiveHourSection.Bounds = ScaleRect(18, 82, 384, 86, scale);
+        weeklySection.Bounds = ScaleRect(18, 178, 384, 86, scale);
+        statusLabel.Bounds = ScaleRect(24, 274, 372, 22, scale);
+
+        fiveHourSection.ApplyLayoutScale(scale);
+        weeklySection.ApplyLayoutScale(scale);
+
+        ResumeLayout(performLayout: true);
+        Invalidate(true);
+    }
+
+    private float DpiScale
+    {
+        get
+        {
+            var dpi = IsHandleCreated ? DeviceDpi : 96;
+            return Math.Max(1f, dpi / 96f);
+        }
+    }
+
+    private static Rectangle ScaleRect(int x, int y, int width, int height, float scale)
+    {
+        return new Rectangle(
+            ScaleInt(x, scale),
+            ScaleInt(y, scale),
+            ScaleInt(width, scale),
+            ScaleInt(height, scale));
+    }
+
+    private static int ScaleInt(int value, float scale)
+    {
+        return (int)Math.Round(value * scale, MidpointRounding.AwayFromZero);
     }
 
     public void UpdateUsage(UsageProvider provider, ProviderUsageLookupResult result)
@@ -411,6 +446,7 @@ public sealed class UsagePopupForm : Form
         private readonly Label resetLabel;
         private readonly UsageMeterControl meter;
         private ThemePalette theme = ThemePalette.FromWindows();
+        private float layoutScale = 1f;
 
         public UsageSection(string name)
         {
@@ -422,8 +458,6 @@ public sealed class UsagePopupForm : Form
             {
                 AutoSize = false,
                 Font = CreateFont("Segoe UI Variable Text", 9.5f, FontStyle.Bold),
-                Location = new Point(16, 13),
-                Size = new Size(164, 22),
                 Text = name
             };
 
@@ -432,24 +466,18 @@ public sealed class UsagePopupForm : Form
                 Anchor = AnchorStyles.Top | AnchorStyles.Right,
                 AutoSize = false,
                 Font = CreateFont("Segoe UI Variable Text", 9.5f, FontStyle.Bold),
-                Location = new Point(198, 13),
-                Size = new Size(168, 22),
                 TextAlign = ContentAlignment.TopRight
             };
 
             meter = new UsageMeterControl
             {
-                Anchor = AnchorStyles.Left | AnchorStyles.Top,
-                Location = new Point(16, 43),
-                Size = new Size(320, 8)
+                Anchor = AnchorStyles.Left | AnchorStyles.Top
             };
 
             remainingLabel = new Label
             {
                 AutoSize = false,
-                Font = CreateFont("Segoe UI Variable Text", 8.75f, FontStyle.Regular),
-                Location = new Point(16, 59),
-                Size = new Size(160, 20)
+                Font = CreateFont("Segoe UI Variable Text", 8.75f, FontStyle.Regular)
             };
 
             resetLabel = new Label
@@ -457,8 +485,6 @@ public sealed class UsagePopupForm : Form
                 Anchor = AnchorStyles.Top | AnchorStyles.Right,
                 AutoSize = false,
                 Font = CreateFont("Segoe UI Variable Text", 8.75f, FontStyle.Regular),
-                Location = new Point(174, 59),
-                Size = new Size(192, 20),
                 TextAlign = ContentAlignment.TopRight
             };
 
@@ -520,6 +546,12 @@ public sealed class UsagePopupForm : Form
             meter.BackColor = theme.Card;
 
             Invalidate(true);
+        }
+
+        public void ApplyLayoutScale(float scale)
+        {
+            layoutScale = Math.Max(1f, scale);
+            UpdateChildLayout();
         }
 
         public void SetUnavailable(string title)
@@ -593,14 +625,50 @@ public sealed class UsagePopupForm : Form
 
         private void UpdateChildLayout()
         {
-            const int horizontalPadding = 16;
-            const int rightPadding = 34;
+            var leftPadding = ScaleInt(16, layoutScale);
+            var rightPadding = ScaleInt(34, layoutScale);
+            var titleTop = ScaleInt(13, layoutScale);
+            var titleHeight = ScaleInt(24, layoutScale);
+            var meterTop = ScaleInt(43, layoutScale);
+            var meterHeight = ScaleInt(8, layoutScale);
+            var footerTop = ScaleInt(59, layoutScale);
+            var footerHeight = ScaleInt(22, layoutScale);
 
-            meter.Width = Math.Max(80, Width - horizontalPadding - rightPadding);
-            percentLabel.Left = Math.Max(horizontalPadding, Width - 186);
-            resetLabel.Left = Math.Max(horizontalPadding, Width - 210);
-            percentLabel.Width = Math.Max(120, Width - percentLabel.Left - rightPadding);
-            resetLabel.Width = Math.Max(140, Width - resetLabel.Left - rightPadding);
+            nameLabel.Bounds = new Rectangle(
+                leftPadding,
+                titleTop,
+                Math.Max(ScaleInt(130, layoutScale), Width - ScaleInt(220, layoutScale)),
+                titleHeight);
+
+            percentLabel.Bounds = new Rectangle(
+                Math.Max(leftPadding, Width - ScaleInt(186, layoutScale)),
+                titleTop,
+                Math.Max(ScaleInt(120, layoutScale), ScaleInt(168, layoutScale)),
+                titleHeight);
+            percentLabel.Width = Math.Max(
+                ScaleInt(110, layoutScale),
+                Width - percentLabel.Left - rightPadding);
+
+            meter.Bounds = new Rectangle(
+                leftPadding,
+                meterTop,
+                Math.Max(ScaleInt(80, layoutScale), Width - leftPadding - rightPadding),
+                meterHeight);
+
+            remainingLabel.Bounds = new Rectangle(
+                leftPadding,
+                footerTop,
+                Math.Max(ScaleInt(120, layoutScale), Width / 2 - leftPadding),
+                footerHeight);
+
+            resetLabel.Bounds = new Rectangle(
+                Math.Max(leftPadding, Width - ScaleInt(210, layoutScale)),
+                footerTop,
+                Math.Max(ScaleInt(140, layoutScale), ScaleInt(192, layoutScale)),
+                footerHeight);
+            resetLabel.Width = Math.Max(
+                ScaleInt(140, layoutScale),
+                Width - resetLabel.Left - rightPadding);
         }
     }
 
@@ -790,7 +858,8 @@ public sealed class UsagePopupForm : Form
             e.Graphics.FillPath(fillBrush, path);
             e.Graphics.DrawPath(borderPen, path);
 
-            var iconBounds = new Rectangle(Width / 2 - 9, Height / 2 - 9, 18, 18);
+            var iconSize = Math.Max(16, Math.Min(Width, Height) - Math.Max(8, Height / 3));
+            var iconBounds = new Rectangle(Width / 2 - iconSize / 2, Height / 2 - iconSize / 2, iconSize, iconSize);
             if (Provider == UsageProvider.Claude)
             {
                 DrawClaudeLogo(e.Graphics, iconBounds);
@@ -1074,7 +1143,7 @@ public sealed class UsagePopupForm : Form
                 EndCap = System.Drawing.Drawing2D.LineCap.Round
             };
 
-            var inset = 10;
+            var inset = Math.Max(8, Width / 3);
             e.Graphics.DrawLine(pen, inset, inset, Width - inset, Height - inset);
             e.Graphics.DrawLine(pen, Width - inset, inset, inset, Height - inset);
         }
