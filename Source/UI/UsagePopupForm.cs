@@ -23,7 +23,7 @@ public sealed class UsagePopupForm : Form
     {
         AutoScaleMode = AutoScaleMode.Dpi;
         BackColor = theme.Surface;
-        ClientSize = new Size(420, 334);
+        ClientSize = new Size(420, 304);
         ControlBox = false;
         DoubleBuffered = true;
         Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular);
@@ -50,7 +50,7 @@ public sealed class UsagePopupForm : Form
             AutoSize = false,
             Font = CreateFont("Segoe UI Variable Display", 15.5f, FontStyle.Bold),
             Location = new Point(22, 18),
-            Size = new Size(310, 30),
+            Size = new Size(254, 30),
             Text = "Codex rate limits"
         };
 
@@ -58,33 +58,35 @@ public sealed class UsagePopupForm : Form
         {
             AutoSize = false,
             Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular),
-            Location = new Point(24, 88),
+            Location = new Point(24, 54),
             Size = new Size(330, 22)
         };
 
         codexTabButton = new ProviderTabButton("Codex", UsageProvider.Codex)
         {
-            Location = new Point(22, 54),
-            Size = new Size(86, 28)
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            Location = new Point(292, 16),
+            Size = new Size(34, 30)
         };
         codexTabButton.Click += (_, _) => SelectProvider(UsageProvider.Codex);
 
         claudeTabButton = new ProviderTabButton("Claude", UsageProvider.Claude)
         {
-            Location = new Point(112, 54),
-            Size = new Size(90, 28)
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            Location = new Point(330, 16),
+            Size = new Size(34, 30)
         };
         claudeTabButton.Click += (_, _) => SelectProvider(UsageProvider.Claude);
 
         fiveHourSection = new UsageSection("5 hour limit")
         {
-            Location = new Point(18, 116),
+            Location = new Point(18, 82),
             Size = new Size(384, 86)
         };
 
         weeklySection = new UsageSection("Weekly limit")
         {
-            Location = new Point(18, 212),
+            Location = new Point(18, 178),
             Size = new Size(384, 86)
         };
 
@@ -93,7 +95,7 @@ public sealed class UsagePopupForm : Form
             AutoEllipsis = true,
             AutoSize = false,
             Font = CreateFont("Segoe UI Variable Text", 8.5f, FontStyle.Regular),
-            Location = new Point(24, 304),
+            Location = new Point(24, 274),
             Size = new Size(372, 22)
         };
 
@@ -666,6 +668,19 @@ public sealed class UsagePopupForm : Form
 
     private sealed class ProviderTabButton : Control
     {
+        private const string ClaudeSymbolPathData =
+            "m19.6 66.5 19.7-11 .3-1-.3-.5h-1l-3.3-.2-11.2-.3L14 53l-9.5-.5-2.4-.5L0 49l.2-1.5 2-1.3 2.9.2 6.3.5 9.5.6 6.9.4L38 49.1h1.6l.2-.7-.5-.4-.4-.4L29 41l-10.6-7-5.6-4.1-3-2-1.5-2-.6-4.2 2.7-3 3.7.3.9.2 3.7 2.9 8 6.1L37 36l1.5 1.2.6-.4.1-.3-.7-1.1L33 25l-6-10.4-2.7-4.3-.7-2.6c-.3-1-.4-2-.4-3l3-4.2L28 0l4.2.6L33.8 2l2.6 6 4.1 9.3L47 29.9l2 3.8 1 3.4.3 1h.7v-.5l.5-7.2 1-8.7 1-11.2.3-3.2 1.6-3.8 3-2L61 2.6l2 2.9-.3 1.8-1.1 7.7L59 27.1l-1.5 8.2h.9l1-1.1 4.1-5.4 6.9-8.6 3-3.5L77 13l2.3-1.8h4.3l3.1 4.7-1.4 4.9-4.4 5.6-3.7 4.7-5.3 7.1-3.2 5.7.3.4h.7l12-2.6 6.4-1.1 7.6-1.3 3.5 1.6.4 1.6-1.4 3.4-8.2 2-9.6 2-14.3 3.3-.2.1.2.3 6.4.6 2.8.2h6.8l12.6 1 3.3 2 1.9 2.7-.3 2-5.1 2.6-6.8-1.6-16-3.8-5.4-1.3h-.8v.4l4.6 4.5 8.3 7.5L89 80.1l.5 2.4-1.3 2-1.4-.2-9.2-7-3.6-3-8-6.8h-.5v.7l1.8 2.7 9.8 14.7.5 4.5-.7 1.4-2.6 1-2.7-.6-5.8-8-6-9-4.7-8.2-.5.4-2.9 30.2-1.3 1.5-3 1.2-2.5-2-1.4-3 1.4-6.2 1.6-8 1.3-6.4 1.2-7.9.7-2.6v-.2H49L43 72l-9 12.3-7.2 7.6-1.7.7-3-1.5.3-2.8L24 86l10-12.8 6-7.9 4-4.6-.1-.5h-.3L17.2 77.4l-4.7.6-2-2 .2-3 1-1 8-5.5Z";
+
+        private static readonly string OpenAiWhiteLogoPath = Path.Combine(
+            AppContext.BaseDirectory,
+            "Assets",
+            "OpenAICodexLogoWhite.png");
+
+        private static readonly string OpenAiBlackLogoPath = Path.Combine(
+            AppContext.BaseDirectory,
+            "Assets",
+            "OpenAICodexLogoBlack.png");
+
         private ThemePalette theme = ThemePalette.FromWindows();
         private bool hovering;
         private bool pressing;
@@ -676,7 +691,6 @@ public sealed class UsagePopupForm : Form
             Text = text;
             Provider = provider;
             Cursor = Cursors.Hand;
-            Font = CreateFont("Segoe UI Variable Text", 8.75f, FontStyle.Bold);
             SetStyle(
                 ControlStyles.AllPaintingInWmPaint |
                 ControlStyles.OptimizedDoubleBuffer |
@@ -776,19 +790,219 @@ public sealed class UsagePopupForm : Form
             e.Graphics.FillPath(fillBrush, path);
             e.Graphics.DrawPath(borderPen, path);
 
-            var textColor = selected && theme.IsDark
-                ? Color.Black
-                : selected
-                    ? Color.White
-                    : theme.TextPrimary;
+            var iconBounds = new Rectangle(Width / 2 - 9, Height / 2 - 9, 18, 18);
+            if (Provider == UsageProvider.Claude)
+            {
+                DrawClaudeLogo(e.Graphics, iconBounds);
+                return;
+            }
 
-            TextRenderer.DrawText(
-                e.Graphics,
-                Text,
-                Font,
-                ClientRectangle,
-                textColor,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            DrawOpenAiLogo(e.Graphics, iconBounds, selected);
+        }
+
+        private void DrawOpenAiLogo(Graphics graphics, Rectangle bounds, bool isSelected)
+        {
+            var preferredPath = isSelected || !theme.IsDark ? OpenAiBlackLogoPath : OpenAiWhiteLogoPath;
+            var fallbackPath = preferredPath == OpenAiBlackLogoPath ? OpenAiWhiteLogoPath : OpenAiBlackLogoPath;
+            var path = File.Exists(preferredPath) ? preferredPath : fallbackPath;
+
+            if (File.Exists(path))
+            {
+                using var image = Image.FromFile(path);
+                graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                graphics.DrawImage(image, bounds);
+                return;
+            }
+
+            var fallbackColor = isSelected || !theme.IsDark ? Color.Black : Color.White;
+            using var pen = new Pen(fallbackColor, 2.2f)
+            {
+                StartCap = System.Drawing.Drawing2D.LineCap.Round,
+                EndCap = System.Drawing.Drawing2D.LineCap.Round,
+                LineJoin = System.Drawing.Drawing2D.LineJoin.Round
+            };
+            graphics.DrawEllipse(pen, bounds);
+            graphics.DrawLine(pen, bounds.Left + 4, bounds.Top + 13, bounds.Right - 3, bounds.Top + 5);
+            graphics.DrawLine(pen, bounds.Left + 5, bounds.Top + 5, bounds.Right - 4, bounds.Bottom - 4);
+        }
+
+        private static void DrawClaudeLogo(Graphics graphics, Rectangle bounds)
+        {
+            using var brush = new SolidBrush(Color.FromArgb(217, 119, 87));
+            try
+            {
+                using var path = CreateSvgPath(ClaudeSymbolPathData);
+                using var transform = new System.Drawing.Drawing2D.Matrix(
+                    bounds.Width / 100f,
+                    0,
+                    0,
+                    bounds.Height / 100f,
+                    bounds.Left,
+                    bounds.Top);
+                path.Transform(transform);
+                graphics.FillPath(brush, path);
+            }
+            catch
+            {
+                graphics.FillEllipse(brush, bounds);
+            }
+        }
+
+        private static System.Drawing.Drawing2D.GraphicsPath CreateSvgPath(string data)
+        {
+            var tokens = System.Text.RegularExpressions.Regex.Matches(
+                    data,
+                    @"[AaCcHhLlMmQqSsTtVvZz]|[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?")
+                .Select(match => match.Value)
+                .ToArray();
+
+            var path = new System.Drawing.Drawing2D.GraphicsPath();
+            var index = 0;
+            var command = '\0';
+            var current = PointF.Empty;
+            var start = PointF.Empty;
+
+            while (index < tokens.Length)
+            {
+                if (IsCommand(tokens[index][0]))
+                {
+                    command = tokens[index++][0];
+                }
+
+                switch (command)
+                {
+                    case 'M':
+                    case 'm':
+                    {
+                        var first = true;
+                        while (HasNumberPair(tokens, index))
+                        {
+                            var point = ReadPoint(tokens, ref index, current, command == 'm');
+                            if (first)
+                            {
+                                path.StartFigure();
+                                current = point;
+                                start = point;
+                                first = false;
+                            }
+                            else
+                            {
+                                path.AddLine(current, point);
+                                current = point;
+                            }
+                        }
+
+                        command = command == 'm' ? 'l' : 'L';
+                        break;
+                    }
+                    case 'L':
+                    case 'l':
+                        while (HasNumberPair(tokens, index))
+                        {
+                            var point = ReadPoint(tokens, ref index, current, command == 'l');
+                            path.AddLine(current, point);
+                            current = point;
+                        }
+
+                        break;
+                    case 'H':
+                    case 'h':
+                        while (HasNumber(tokens, index))
+                        {
+                            var x = ReadNumber(tokens, ref index);
+                            if (command == 'h')
+                            {
+                                x += current.X;
+                            }
+
+                            var point = new PointF(x, current.Y);
+                            path.AddLine(current, point);
+                            current = point;
+                        }
+
+                        break;
+                    case 'V':
+                    case 'v':
+                        while (HasNumber(tokens, index))
+                        {
+                            var y = ReadNumber(tokens, ref index);
+                            if (command == 'v')
+                            {
+                                y += current.Y;
+                            }
+
+                            var point = new PointF(current.X, y);
+                            path.AddLine(current, point);
+                            current = point;
+                        }
+
+                        break;
+                    case 'C':
+                    case 'c':
+                        while (HasNumbers(tokens, index, 6))
+                        {
+                            var relative = command == 'c';
+                            var control1 = ReadPoint(tokens, ref index, current, relative);
+                            var control2 = ReadPoint(tokens, ref index, current, relative);
+                            var end = ReadPoint(tokens, ref index, current, relative);
+                            path.AddBezier(current, control1, control2, end);
+                            current = end;
+                        }
+
+                        break;
+                    case 'Z':
+                    case 'z':
+                        path.CloseFigure();
+                        current = start;
+                        break;
+                    default:
+                        index++;
+                        break;
+                }
+            }
+
+            return path;
+        }
+
+        private static PointF ReadPoint(string[] tokens, ref int index, PointF current, bool relative)
+        {
+            var x = ReadNumber(tokens, ref index);
+            var y = ReadNumber(tokens, ref index);
+            return relative ? new PointF(current.X + x, current.Y + y) : new PointF(x, y);
+        }
+
+        private static float ReadNumber(string[] tokens, ref int index)
+        {
+            return float.Parse(tokens[index++], System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        private static bool HasNumber(string[] tokens, int index)
+        {
+            return index < tokens.Length && !IsCommand(tokens[index][0]);
+        }
+
+        private static bool HasNumberPair(string[] tokens, int index)
+        {
+            return HasNumbers(tokens, index, 2);
+        }
+
+        private static bool HasNumbers(string[] tokens, int index, int count)
+        {
+            for (var offset = 0; offset < count; offset++)
+            {
+                if (!HasNumber(tokens, index + offset))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static bool IsCommand(char value)
+        {
+            return char.IsAsciiLetter(value);
         }
     }
 
