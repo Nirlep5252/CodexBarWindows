@@ -14,8 +14,14 @@ public static class AppInfo
                 .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
                 ?.InformationalVersion;
 
-            return string.IsNullOrWhiteSpace(version)
-                ? CurrentVersion.ToString()
+            if (string.IsNullOrWhiteSpace(version))
+            {
+                return CurrentVersion.ToString(3);
+            }
+
+            var metadataSeparator = version.IndexOf('+', StringComparison.Ordinal);
+            return metadataSeparator > 0
+                ? version[..metadataSeparator]
                 : version;
         }
     }

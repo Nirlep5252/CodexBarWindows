@@ -184,7 +184,7 @@ public sealed class SettingsForm : Form
             AutoSize = false,
             Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular),
             Location = new Point(30, 696),
-            Size = new Size(280, 24),
+            Size = new Size(360, 24),
             Text = $"Version {AppInfo.VersionText}"
         };
 
