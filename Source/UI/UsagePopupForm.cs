@@ -7,19 +7,18 @@ public sealed class UsagePopupForm : Form
     private const int BaseWidth = 420;
     private const int BaseHeight = 304;
     private readonly Label titleLabel;
-    private readonly ProviderTabButton codexTabButton;
-    private readonly ProviderTabButton claudeTabButton;
+    private readonly List<ProviderTabButton> tabButtons = [];
+    private readonly List<ProviderDescriptor> providers = [];
+    private readonly Dictionary<string, ProviderUsageLookupResult> usageByProvider = [];
     private readonly Label planLabel;
     private readonly Label statusLabel;
     private readonly UsageSection fiveHourSection;
     private readonly UsageSection weeklySection;
     private readonly CloseGlyphButton closeButton;
     private ThemePalette theme = ThemePalette.FromWindows();
-    private UsageProvider selectedProvider = UsageProvider.Codex;
-    private ProviderUsageLookupResult codexUsage = new(null, "Usage has not been loaded yet.");
-    private ProviderUsageLookupResult claudeUsage = new(null, "Usage has not been loaded yet.");
+    private string selectedProviderKey = CodexProviderKey("default");
 
-    public event EventHandler<UsageProvider>? SelectedProviderChanged;
+    public event EventHandler<string>? SelectedProviderChanged;
 
     public UsagePopupForm()
     {
@@ -48,6 +47,7 @@ public sealed class UsagePopupForm : Form
         titleLabel = new Label
         {
             AutoSize = false,
+            AutoEllipsis = true,
             Font = CreateFont("Segoe UI Variable Display", 15.5f, FontStyle.Bold),
             Text = "Codex rate limits"
         };
@@ -57,20 +57,6 @@ public sealed class UsagePopupForm : Form
             AutoSize = false,
             Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular)
         };
-
-        codexTabButton = new ProviderTabButton("Codex", UsageProvider.Codex)
-        {
-            Anchor = AnchorStyles.Top | AnchorStyles.Right,
-            AccessibleName = "Codex"
-        };
-        codexTabButton.Click += (_, _) => SelectProvider(UsageProvider.Codex);
-
-        claudeTabButton = new ProviderTabButton("Claude", UsageProvider.Claude)
-        {
-            Anchor = AnchorStyles.Top | AnchorStyles.Right,
-            AccessibleName = "Claude"
-        };
-        claudeTabButton.Click += (_, _) => SelectProvider(UsageProvider.Claude);
 
         fiveHourSection = new UsageSection("5 hour limit");
 
@@ -84,8 +70,6 @@ public sealed class UsagePopupForm : Form
         };
 
         Controls.Add(titleLabel);
-        Controls.Add(codexTabButton);
-        Controls.Add(claudeTabButton);
         Controls.Add(planLabel);
         Controls.Add(fiveHourSection);
         Controls.Add(weeklySection);
@@ -101,12 +85,13 @@ public sealed class UsagePopupForm : Form
 
         Deactivate += (_, _) => Hide();
         FormClosing += OnFormClosing;
+        ConfigureProviders([new ProviderDescriptor(CodexProviderKey("default"), "Codex", false), ClaudeProvider]);
         ApplyScaledLayout();
         ApplyTheme();
         RenderSelectedProvider();
     }
 
-    public UsageProvider SelectedProvider => selectedProvider;
+    public string SelectedProvider => selectedProviderKey;
 
     protected override CreateParams CreateParams
     {
@@ -169,10 +154,14 @@ public sealed class UsagePopupForm : Form
         ClientSize = new Size(ScaleInt(BaseWidth, scale), ScaleInt(BaseHeight, scale));
 
         closeButton.Bounds = ScaleRect(374, 14, 30, 30, scale);
-        titleLabel.Bounds = ScaleRect(22, 17, 254, 34, scale);
         planLabel.Bounds = ScaleRect(24, 54, 330, 24, scale);
-        codexTabButton.Bounds = ScaleRect(292, 16, 34, 30, scale);
-        claudeTabButton.Bounds = ScaleRect(330, 16, 34, 30, scale);
+        var firstTabLeft = LayoutTabButtons(scale);
+        var titleLeft = ScaleInt(22, scale);
+        titleLabel.Bounds = new Rectangle(
+            titleLeft,
+            ScaleInt(17, scale),
+            Math.Max(ScaleInt(140, scale), firstTabLeft - titleLeft - ScaleInt(10, scale)),
+            ScaleInt(34, scale));
         fiveHourSection.Bounds = ScaleRect(18, 82, 384, 86, scale);
         weeklySection.Bounds = ScaleRect(18, 178, 384, 86, scale);
         statusLabel.Bounds = ScaleRect(24, 274, 372, 22, scale);
@@ -207,60 +196,74 @@ public sealed class UsagePopupForm : Form
         return (int)Math.Round(value * scale, MidpointRounding.AwayFromZero);
     }
 
-    public void UpdateUsage(UsageProvider provider, ProviderUsageLookupResult result)
+    public void ConfigureCodexEntries(IReadOnlyList<CodexCliEntry> codexEntries)
     {
-        SetProviderUsage(provider, result);
+        var descriptors = codexEntries
+            .Select(entry => new ProviderDescriptor(CodexProviderKey(entry.Id), entry.Name, false))
+            .Append(ClaudeProvider)
+            .ToList();
 
-        if (provider == selectedProvider)
+        ConfigureProviders(descriptors);
+    }
+
+    public void UpdateUsage(string providerKey, ProviderUsageLookupResult result)
+    {
+        usageByProvider[providerKey] = result;
+
+        if (providerKey == selectedProviderKey)
         {
             RenderSelectedProvider();
         }
     }
 
-    public void SetLoading(UsageProvider provider)
+    public void SetLoading(string providerKey)
     {
-        var current = GetProviderUsage(provider);
-        if (current.Snapshot is { } && provider == selectedProvider)
+        var provider = GetProvider(providerKey);
+        var current = GetProviderUsage(providerKey);
+        if (current.Snapshot is { } && providerKey == selectedProviderKey)
         {
             RenderSelectedProvider();
-            statusLabel.Text = $"Refreshing {ProviderName(provider)} limits...";
+            statusLabel.Text = $"Refreshing {provider.Name} limits...";
             return;
         }
 
-        if (provider == selectedProvider)
+        if (providerKey == selectedProviderKey)
         {
-            planLabel.Text = $"Fetching {ProviderName(provider)} limits...";
+            planLabel.Text = $"Fetching {provider.Name} limits...";
             fiveHourSection.SetLoading("5 hour limit");
             weeklySection.SetLoading("Weekly limit");
-            statusLabel.Text = provider == UsageProvider.Claude
+            statusLabel.Text = provider.IsClaude
                 ? "Reading from Claude Code OAuth..."
                 : "Reading from Codex CLI...";
         }
     }
 
-    private void SelectProvider(UsageProvider provider)
+    private void SelectProvider(string providerKey)
     {
-        if (selectedProvider == provider)
+        if (selectedProviderKey == providerKey)
         {
             return;
         }
 
-        selectedProvider = provider;
+        selectedProviderKey = providerKey;
         RenderSelectedProvider();
-        SelectedProviderChanged?.Invoke(this, provider);
+        SelectedProviderChanged?.Invoke(this, providerKey);
     }
 
     private void RenderSelectedProvider()
     {
-        codexTabButton.Selected = selectedProvider == UsageProvider.Codex;
-        claudeTabButton.Selected = selectedProvider == UsageProvider.Claude;
+        foreach (var tabButton in tabButtons)
+        {
+            tabButton.Selected = tabButton.ProviderKey == selectedProviderKey;
+        }
 
-        titleLabel.Text = $"{ProviderName(selectedProvider)} rate limits";
-        var result = GetProviderUsage(selectedProvider);
+        var provider = GetProvider(selectedProviderKey);
+        titleLabel.Text = $"{provider.Name} rate limits";
+        var result = GetProviderUsage(selectedProviderKey);
 
         if (result.Snapshot is not { } snapshot)
         {
-            planLabel.Text = $"Waiting for local {ProviderName(selectedProvider)} usage data";
+            planLabel.Text = $"Waiting for local {provider.Name} usage data";
             fiveHourSection.SetUnavailable("5 hour limit");
             weeklySection.SetUnavailable("Weekly limit");
             statusLabel.Text = result.Error ?? "No usage data found.";
@@ -268,7 +271,7 @@ public sealed class UsagePopupForm : Form
         }
 
         planLabel.Text = string.IsNullOrWhiteSpace(snapshot.PlanType)
-            ? selectedProvider == UsageProvider.Claude ? "Claude Code usage data" : "Local Codex session data"
+            ? provider.IsClaude ? "Claude Code usage data" : "Local Codex session data"
             : $"{ToTitleCase(snapshot.PlanType)} plan";
 
         fiveHourSection.SetUsage(snapshot.Primary);
@@ -278,33 +281,87 @@ public sealed class UsagePopupForm : Form
         }
         else
         {
-            weeklySection.SetUnavailable("Weekly limit");
+            weeklySection.SetUnavailable(snapshot.Primary.WindowMinutes == 10080 ? "5 hour limit" : "Weekly limit");
         }
 
         statusLabel.Text = string.Empty;
     }
 
-    private ProviderUsageLookupResult GetProviderUsage(UsageProvider provider)
+    private ProviderUsageLookupResult GetProviderUsage(string providerKey)
     {
-        return provider == UsageProvider.Claude ? claudeUsage : codexUsage;
+        return usageByProvider.TryGetValue(providerKey, out var result)
+            ? result
+            : new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
     }
 
-    private void SetProviderUsage(UsageProvider provider, ProviderUsageLookupResult result)
+    private ProviderDescriptor GetProvider(string providerKey)
     {
-        if (provider == UsageProvider.Claude)
-        {
-            claudeUsage = result;
-        }
-        else
-        {
-            codexUsage = result;
-        }
+        return providers.FirstOrDefault(provider => provider.Key == providerKey)
+            ?? providers.FirstOrDefault()
+            ?? new ProviderDescriptor(CodexProviderKey("default"), "Codex", false);
     }
 
-    private static string ProviderName(UsageProvider provider)
+    private void ConfigureProviders(IReadOnlyList<ProviderDescriptor> descriptors)
     {
-        return provider == UsageProvider.Claude ? "Claude" : "Codex";
+        providers.Clear();
+        providers.AddRange(descriptors);
+
+        foreach (var tabButton in tabButtons)
+        {
+            Controls.Remove(tabButton);
+            tabButton.Dispose();
+        }
+
+        tabButtons.Clear();
+        foreach (var provider in providers)
+        {
+            usageByProvider.TryAdd(provider.Key, new ProviderUsageLookupResult(null, "Usage has not been loaded yet."));
+            var tabButton = new ProviderTabButton(provider.Name, provider.Key, provider.IsClaude)
+            {
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
+                AccessibleName = provider.Name
+            };
+            tabButton.Click += (_, _) => SelectProvider(provider.Key);
+            tabButton.ApplyTheme(theme);
+            tabButtons.Add(tabButton);
+            Controls.Add(tabButton);
+        }
+
+        if (!providers.Any(provider => provider.Key == selectedProviderKey))
+        {
+            selectedProviderKey = providers.FirstOrDefault()?.Key ?? CodexProviderKey("default");
+        }
+
+        ApplyScaledLayout();
+        RenderSelectedProvider();
     }
+
+    private int LayoutTabButtons(float scale)
+    {
+        var right = ScaleInt(366, scale);
+        var width = ScaleInt(34, scale);
+        var gap = ScaleInt(4, scale);
+        var firstLeft = right;
+        for (var index = tabButtons.Count - 1; index >= 0; index--)
+        {
+            firstLeft = right - width;
+            tabButtons[index].Bounds = new Rectangle(firstLeft, ScaleInt(16, scale), width, ScaleInt(30, scale));
+            tabButtons[index].BringToFront();
+            right -= width + gap;
+        }
+
+        closeButton.BringToFront();
+        return firstLeft;
+    }
+
+    public static string CodexProviderKey(string id)
+    {
+        return $"codex:{id}";
+    }
+
+    public const string ClaudeProviderKey = "claude";
+    private static readonly ProviderDescriptor ClaudeProvider = new(ClaudeProviderKey, "Claude", true);
+    private sealed record ProviderDescriptor(string Key, string Name, bool IsClaude);
 
     private Point CalculateLocation(Point anchor)
     {
@@ -370,8 +427,11 @@ public sealed class UsagePopupForm : Form
         statusLabel.ForeColor = theme.TextSecondary;
 
         closeButton.ApplyTheme(theme);
-        codexTabButton.ApplyTheme(theme);
-        claudeTabButton.ApplyTheme(theme);
+        foreach (var tabButton in tabButtons)
+        {
+            tabButton.ApplyTheme(theme);
+        }
+
         fiveHourSection.ApplyTheme(theme);
         weeklySection.ApplyTheme(theme);
 
@@ -754,10 +814,11 @@ public sealed class UsagePopupForm : Form
         private bool pressing;
         private bool selected;
 
-        public ProviderTabButton(string text, UsageProvider provider)
+        public ProviderTabButton(string text, string providerKey, bool isClaude)
         {
             Text = text;
-            Provider = provider;
+            ProviderKey = providerKey;
+            IsClaude = isClaude;
             Cursor = Cursors.Hand;
             SetStyle(
                 ControlStyles.AllPaintingInWmPaint |
@@ -770,7 +831,11 @@ public sealed class UsagePopupForm : Form
 
         [System.ComponentModel.Browsable(false)]
         [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
-        public UsageProvider Provider { get; }
+        public string ProviderKey { get; }
+
+        [System.ComponentModel.Browsable(false)]
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public bool IsClaude { get; }
 
         [System.ComponentModel.Browsable(false)]
         [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
@@ -860,13 +925,21 @@ public sealed class UsagePopupForm : Form
 
             var iconSize = Math.Max(16, Math.Min(Width, Height) - Math.Max(8, Height / 3));
             var iconBounds = new Rectangle(Width / 2 - iconSize / 2, Height / 2 - iconSize / 2, iconSize, iconSize);
-            if (Provider == UsageProvider.Claude)
+            if (IsClaude)
             {
                 DrawClaudeLogo(e.Graphics, iconBounds);
                 return;
             }
 
             DrawOpenAiLogo(e.Graphics, iconBounds, selected);
+
+            if (!string.Equals(Text, "Codex", StringComparison.OrdinalIgnoreCase))
+            {
+                using var font = new Font(Font.FontFamily, Math.Max(6f, Font.Size - 2f), FontStyle.Bold);
+                using var brush = new SolidBrush(selected || !theme.IsDark ? Color.Black : theme.TextPrimary);
+                var label = Text.Length <= 2 ? Text : Text[^1..];
+                e.Graphics.DrawString(label, font, brush, Width - 12, Height - 13);
+            }
         }
 
         private void DrawOpenAiLogo(Graphics graphics, Rectangle bounds, bool isSelected)

@@ -3,8 +3,8 @@ namespace CodexBarWindows;
 public sealed record CodexRateLimitSnapshot(
     DateTimeOffset ObservedAt,
     string? PlanType,
-    UsageWindow FiveHour,
-    UsageWindow Weekly,
+    UsageWindow Primary,
+    UsageWindow? Secondary,
     string Source);
 
 public sealed record UsageWindow(
@@ -32,16 +32,29 @@ public sealed record UsageLookupResult(CodexRateLimitSnapshot? Snapshot, string?
                 snapshot.ObservedAt,
                 snapshot.PlanType,
                 new ProviderUsageWindow(
-                    "5 hour limit",
-                    snapshot.FiveHour.UsedPercent,
-                    snapshot.FiveHour.WindowMinutes,
-                    snapshot.FiveHour.ResetsAt),
-                new ProviderUsageWindow(
-                    "Weekly limit",
-                    snapshot.Weekly.UsedPercent,
-                    snapshot.Weekly.WindowMinutes,
-                    snapshot.Weekly.ResetsAt),
+                    WindowTitle(snapshot.Primary.WindowMinutes),
+                    snapshot.Primary.UsedPercent,
+                    snapshot.Primary.WindowMinutes,
+                    snapshot.Primary.ResetsAt),
+                snapshot.Secondary is { } secondary
+                    ? new ProviderUsageWindow(
+                        WindowTitle(secondary.WindowMinutes),
+                        secondary.UsedPercent,
+                        secondary.WindowMinutes,
+                        secondary.ResetsAt)
+                    : null,
                 snapshot.Source),
             null);
+    }
+
+    private static string WindowTitle(int windowMinutes)
+    {
+        return windowMinutes switch
+        {
+            300 => "5 hour limit",
+            10080 => "Weekly limit",
+            _ when windowMinutes >= 60 && windowMinutes % 60 == 0 => $"{windowMinutes / 60} hour limit",
+            _ => $"{windowMinutes} minute limit"
+        };
     }
 }

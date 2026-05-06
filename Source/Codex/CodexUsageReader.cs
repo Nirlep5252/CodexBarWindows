@@ -9,17 +9,26 @@ public sealed class CodexUsageReader
     private const int MaxSessionFilesToScan = 80;
     private static readonly TimeSpan RpcTimeout = TimeSpan.FromSeconds(10);
     private readonly string sessionsRoot;
+    private readonly string? codexPath;
 
     public CodexUsageReader()
-        : this(Path.Combine(
+        : this(null)
+    {
+    }
+
+    public CodexUsageReader(string? codexPath)
+        : this(
+            codexPath,
+            Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
             ".codex",
             "sessions"))
     {
     }
 
-    public CodexUsageReader(string sessionsRoot)
+    public CodexUsageReader(string? codexPath, string sessionsRoot)
     {
+        this.codexPath = string.IsNullOrWhiteSpace(codexPath) ? null : codexPath;
         this.sessionsRoot = sessionsRoot;
     }
 
@@ -29,6 +38,11 @@ public sealed class CodexUsageReader
     {
         var rpcResult = ReadLatestFromRpc();
         if (rpcResult.HasSnapshot)
+        {
+            return rpcResult;
+        }
+
+        if (codexPath is not null)
         {
             return rpcResult;
         }
@@ -48,18 +62,22 @@ public sealed class CodexUsageReader
         return new UsageLookupResult(null, error);
     }
 
-    private static UsageLookupResult ReadLatestFromRpc()
+    private UsageLookupResult ReadLatestFromRpc()
     {
-        var codexPath = ResolveCodexExecutable();
-        if (codexPath is null)
+        var resolvedCodexPath = ResolveCodexExecutable(codexPath);
+        if (resolvedCodexPath is null)
         {
-            return new UsageLookupResult(null, "Codex CLI was not found on PATH.");
+            return new UsageLookupResult(
+                null,
+                codexPath is null
+                    ? "Codex CLI was not found on PATH."
+                    : $"Codex CLI was not found: {codexPath}");
         }
 
         Process? process = null;
         try
         {
-            process = StartCodexRpc(codexPath);
+            process = StartCodexRpc(resolvedCodexPath);
             var stderr = new List<string>();
             process.ErrorDataReceived += (_, args) =>
             {
@@ -82,7 +100,7 @@ public sealed class CodexUsageReader
             var response = ReadRpcResponse(process, 2, RpcTimeout);
             TryKill(process);
 
-            var snapshot = ParseRpcSnapshot(response, "Codex CLI RPC");
+            var snapshot = ParseRpcSnapshot(response, $"Codex CLI RPC ({resolvedCodexPath})");
             return snapshot is null
                 ? new UsageLookupResult(null, "Codex CLI RPC returned no rate-limit windows.")
                 : new UsageLookupResult(snapshot, null);
@@ -236,8 +254,7 @@ public sealed class CodexUsageReader
 
         var primary = ParseRpcWindow(rateLimits, "primary");
         var secondary = ParseRpcWindow(rateLimits, "secondary");
-        var (fiveHour, weekly) = NormalizeWindows(primary, secondary);
-        if (fiveHour is null || weekly is null)
+        if (primary is null)
         {
             return null;
         }
@@ -249,8 +266,8 @@ public sealed class CodexUsageReader
         return new CodexRateLimitSnapshot(
             DateTimeOffset.Now,
             planType,
-            fiveHour,
-            weekly,
+            primary,
+            secondary,
             source);
     }
 
@@ -382,15 +399,20 @@ public sealed class CodexUsageReader
 
             if (!root.TryGetProperty("payload", out var payload) ||
                 !payload.TryGetProperty("rate_limits", out var rateLimits) ||
-                !rateLimits.TryGetProperty("primary", out var primary) ||
-                !rateLimits.TryGetProperty("secondary", out var secondary))
+                !rateLimits.TryGetProperty("primary", out var primary))
             {
                 return null;
             }
 
-            var fiveHour = ParseUsageWindow(primary);
-            var weekly = ParseUsageWindow(secondary);
-            if (fiveHour is null || weekly is null)
+            var primaryWindow = ParseUsageWindow(primary);
+            UsageWindow? secondaryWindow = null;
+            if (rateLimits.TryGetProperty("secondary", out var secondary) &&
+                secondary.ValueKind != JsonValueKind.Null)
+            {
+                secondaryWindow = ParseUsageWindow(secondary);
+            }
+
+            if (primaryWindow is null)
             {
                 return null;
             }
@@ -402,8 +424,8 @@ public sealed class CodexUsageReader
             return new CodexRateLimitSnapshot(
                 observedAt,
                 planType,
-                fiveHour,
-                weekly,
+                primaryWindow,
+                secondaryWindow,
                 sourcePath);
         }
         catch (JsonException)
@@ -428,35 +450,17 @@ public sealed class CodexUsageReader
         return new UsageWindow(usedPercent, windowMinutes, resetsAt);
     }
 
-    private static (UsageWindow? FiveHour, UsageWindow? Weekly) NormalizeWindows(
-        UsageWindow? primary,
-        UsageWindow? secondary)
+    private static string? ResolveCodexExecutable(string? explicitPath)
     {
-        UsageWindow? fiveHour = null;
-        UsageWindow? weekly = null;
-
-        foreach (var window in new[] { primary, secondary }.OfType<UsageWindow>())
-        {
-            switch (window.WindowMinutes)
-            {
-                case 300:
-                    fiveHour ??= window;
-                    break;
-                case 10080:
-                    weekly ??= window;
-                    break;
-            }
-        }
-
-        return (fiveHour, weekly);
-    }
-
-    private static string? ResolveCodexExecutable()
-    {
-        var explicitPath = Environment.GetEnvironmentVariable("CODEX_BINARY");
         if (!string.IsNullOrWhiteSpace(explicitPath) && File.Exists(explicitPath))
         {
             return explicitPath;
+        }
+
+        var environmentPath = Environment.GetEnvironmentVariable("CODEX_BINARY");
+        if (explicitPath is null && !string.IsNullOrWhiteSpace(environmentPath) && File.Exists(environmentPath))
+        {
+            return environmentPath;
         }
 
         var path = Environment.GetEnvironmentVariable("PATH");
