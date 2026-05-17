@@ -29,24 +29,34 @@ public sealed class CodexUsageInsightsReader
             var firstReportDay = today.AddDays(-(DaysToReport - 1));
             var firstScanDay = today.AddDays(-ScanLookbackDays);
 
-            var files = EnumerateCodexJsonlFiles(firstScanDay)
+            var codexFiles = EnumerateCodexJsonlFiles(firstScanDay)
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .Take(MaxFilesToScan)
+                .ToArray();
+            var piSessionsRoot = ResolvePiSessionsRoot();
+            var piFiles = EnumeratePiJsonlFiles(piSessionsRoot, firstScanDay)
                 .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
                 .Take(MaxFilesToScan)
                 .ToArray();
 
-            if (files.Length == 0)
+            if (codexFiles.Length == 0 && piFiles.Length == 0)
             {
                 return new CodexUsageInsightsLookupResult(
                     EmptyInsights(now, firstReportDay),
-                    $"No Codex session logs were found under {codexHome}.");
+                    $"No Codex or pi session logs were found under {codexHome} or {piSessionsRoot}.");
             }
 
             var daily = new Dictionary<DateOnly, MutableUsage>();
             var models = new Dictionary<string, MutableUsage>(StringComparer.OrdinalIgnoreCase);
 
-            foreach (var file in files)
+            foreach (var file in codexFiles)
             {
-                ScanFile(file, firstScanDay, daily, models);
+                ScanCodexFile(file, firstScanDay, daily, models);
+            }
+
+            foreach (var file in piFiles)
+            {
+                ScanPiFile(file, firstScanDay, daily, models);
             }
 
             var dailyRows = Enumerable.Range(0, DaysToReport)
@@ -72,7 +82,7 @@ public sealed class CodexUsageInsightsReader
 
             var result = new CodexUsageInsights(
                 now,
-                $"Local Codex sessions ({codexHome})",
+                $"Local Codex + pi sessions ({codexHome}; {piSessionsRoot})",
                 dailyRows,
                 modelRows,
                 todayUsage.TotalTokens,
@@ -80,7 +90,7 @@ public sealed class CodexUsageInsightsReader
                 dailyRows.Sum(row => row.TotalTokens),
                 dailyRows.Sum(row => row.EstimatedCostUsd));
 
-            var error = result.HasUsage ? null : "No token usage entries were found in recent Codex session logs.";
+            var error = result.HasUsage ? null : "No token usage entries were found in recent Codex or pi session logs.";
             return new CodexUsageInsightsLookupResult(result, error);
         }
         catch (Exception exception)
@@ -95,7 +105,7 @@ public sealed class CodexUsageInsightsReader
             .Select(offset => new CodexDailyUsage(firstReportDay.AddDays(offset), 0, 0, 0, 0))
             .ToArray();
 
-        return new CodexUsageInsights(observedAt, "Local Codex sessions", daily, [], 0, 0, 0, 0);
+        return new CodexUsageInsights(observedAt, "Local Codex + pi sessions", daily, [], 0, 0, 0, 0);
     }
 
     private IEnumerable<string> EnumerateCodexJsonlFiles(DateOnly firstScanDay)
@@ -127,6 +137,32 @@ public sealed class CodexUsageInsightsReader
         }
     }
 
+    private static IEnumerable<string> EnumeratePiJsonlFiles(string piSessionsRoot, DateOnly firstScanDay)
+    {
+        if (!Directory.Exists(piSessionsRoot))
+        {
+            yield break;
+        }
+
+        IEnumerable<string> files;
+        try
+        {
+            files = Directory.EnumerateFiles(piSessionsRoot, "*.jsonl", SearchOption.AllDirectories);
+        }
+        catch
+        {
+            yield break;
+        }
+
+        foreach (var file in files)
+        {
+            if (IsRelevantFile(file, firstScanDay))
+            {
+                yield return file;
+            }
+        }
+    }
+
     private IEnumerable<string> SessionRoots()
     {
         yield return Path.Combine(codexHome, "sessions");
@@ -151,7 +187,7 @@ public sealed class CodexUsageInsightsReader
         }
     }
 
-    private static void ScanFile(
+    private static void ScanCodexFile(
         string file,
         DateOnly firstScanDay,
         IDictionary<DateOnly, MutableUsage> daily,
@@ -213,6 +249,95 @@ public sealed class CodexUsageInsightsReader
             catch
             {
                 // Session logs may contain partial or future-format rows. Ignore only the bad row.
+            }
+        }
+    }
+
+    private static void ScanPiFile(
+        string file,
+        DateOnly firstScanDay,
+        IDictionary<DateOnly, MutableUsage> daily,
+        IDictionary<string, MutableUsage> models)
+    {
+        string? currentModel = null;
+        var currentProviderIsCodex = false;
+
+        foreach (var line in ReadSharedLines(file))
+        {
+            if (string.IsNullOrWhiteSpace(line) ||
+                (!line.Contains("\"model_change\"", StringComparison.Ordinal) &&
+                 !line.Contains("\"message\"", StringComparison.Ordinal)))
+            {
+                continue;
+            }
+
+            try
+            {
+                using var document = JsonDocument.Parse(line);
+                var root = document.RootElement;
+                if (!root.TryGetProperty("type", out var typeElement) || typeElement.ValueKind != JsonValueKind.String)
+                {
+                    continue;
+                }
+
+                var type = typeElement.GetString();
+                if (string.Equals(type, "model_change", StringComparison.OrdinalIgnoreCase))
+                {
+                    currentProviderIsCodex = IsPiCodexProvider(ReadString(root, "provider"));
+                    currentModel = currentProviderIsCodex ? ReadString(root, "modelId") ?? ReadModel(root) : null;
+                    continue;
+                }
+
+                if (!string.Equals(type, "message", StringComparison.OrdinalIgnoreCase) ||
+                    !root.TryGetProperty("message", out var message) ||
+                    !string.Equals(ReadString(message, "role"), "assistant", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var providerText = ReadString(message, "provider") ?? ReadString(root, "provider");
+                var isCodex = providerText is null ? currentProviderIsCodex : IsPiCodexProvider(providerText);
+                if (!isCodex)
+                {
+                    continue;
+                }
+
+                var day = ReadDay(message) ?? ReadDay(root);
+                if (day is null || day < firstScanDay)
+                {
+                    continue;
+                }
+
+                var model = ReadString(message, "model")
+                    ?? ReadString(message, "modelId")
+                    ?? ReadString(root, "model")
+                    ?? ReadString(root, "modelId")
+                    ?? currentModel
+                    ?? "Codex model";
+
+                if (!message.TryGetProperty("usage", out var usage))
+                {
+                    continue;
+                }
+
+                var input = ReadLong(usage, "input", "inputTokens", "input_tokens", "promptTokens", "prompt_tokens");
+                var cacheRead = ReadLong(usage, "cacheRead", "cacheReadTokens", "cache_read", "cache_read_tokens", "cacheReadInputTokens", "cache_read_input_tokens");
+                var cacheWrite = ReadLong(usage, "cacheWrite", "cacheWriteTokens", "cache_write", "cache_write_tokens", "cacheCreationTokens", "cache_creation_tokens", "cacheCreationInputTokens", "cache_creation_input_tokens");
+                var output = ReadLong(usage, "output", "outputTokens", "output_tokens", "completionTokens", "completion_tokens");
+                var directTotal = ReadLong(usage, "totalTokens", "total_tokens", "tokenCount", "token_count", "tokens");
+                if (input == 0 && cacheRead == 0 && cacheWrite == 0 && output == 0 && directTotal == 0)
+                {
+                    continue;
+                }
+
+                var effectiveInput = Math.Max(input + cacheRead + cacheWrite, Math.Max(0, directTotal - output));
+                var tokens = new TokenTotals(effectiveInput, Math.Min(cacheRead, effectiveInput), output);
+                Add(daily, day.Value, model, tokens);
+                Add(models, NormalizeModelName(model), model, tokens);
+            }
+            catch
+            {
+                // pi session logs may contain partial or future-format rows. Ignore only the bad row.
             }
         }
     }
@@ -328,11 +453,31 @@ public sealed class CodexUsageInsightsReader
         var timestamp = timestampElement.ValueKind switch
         {
             JsonValueKind.String => timestampElement.GetString(),
-            JsonValueKind.Number when timestampElement.TryGetInt64(out var seconds) => DateTimeOffset.FromUnixTimeSeconds(seconds).ToLocalTime().ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+            JsonValueKind.Number when timestampElement.TryGetInt64(out var raw) => UnixTimestampToLocalDateText(raw),
             _ => null
         };
 
         return DayFromText(timestamp);
+    }
+
+    private static string UnixTimestampToLocalDateText(long raw)
+    {
+        var timestamp = raw > 1_000_000_000_000
+            ? DateTimeOffset.FromUnixTimeMilliseconds(raw)
+            : DateTimeOffset.FromUnixTimeSeconds(raw);
+        return timestamp.ToLocalTime().ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+    }
+
+    private static string? ReadString(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+    }
+
+    private static bool IsPiCodexProvider(string? provider)
+    {
+        return string.Equals(provider, "openai-codex", StringComparison.OrdinalIgnoreCase);
     }
 
     private static DateOnly? DayFromText(string? value)
@@ -394,6 +539,17 @@ public sealed class CodexUsageInsightsReader
         }
 
         return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex");
+    }
+
+    private static string ResolvePiSessionsRoot()
+    {
+        var piHome = Environment.GetEnvironmentVariable("PI_HOME");
+        if (!string.IsNullOrWhiteSpace(piHome))
+        {
+            return Path.Combine(piHome.Trim(), "agent", "sessions");
+        }
+
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".pi", "agent", "sessions");
     }
 
     private readonly record struct TokenTotals(long InputTokens, long CachedInputTokens, long OutputTokens)
