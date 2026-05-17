@@ -6,14 +6,18 @@ public sealed class UsagePopupForm : Form
 {
     private const int BaseWidth = 420;
     private const int BaseHeight = 304;
+    private const int CodexInsightsExpandedHeight = 660;
+    private const int CodexInsightsCollapsedHeight = 360;
     private readonly Label titleLabel;
     private readonly List<ProviderTabButton> tabButtons = [];
     private readonly List<ProviderDescriptor> providers = [];
     private readonly Dictionary<string, ProviderUsageLookupResult> usageByProvider = [];
+    private readonly Dictionary<string, CodexUsageInsightsLookupResult> codexInsightsByProvider = [];
     private readonly Label planLabel;
     private readonly Label statusLabel;
     private readonly UsageSection fiveHourSection;
     private readonly UsageSection weeklySection;
+    private readonly CodexInsightsSection codexInsightsSection;
     private readonly CloseGlyphButton closeButton;
     private ThemePalette theme = ThemePalette.FromWindows();
     private string selectedProviderKey = CodexProviderKey("default");
@@ -61,6 +65,12 @@ public sealed class UsagePopupForm : Form
         fiveHourSection = new UsageSection("5 hour limit");
 
         weeklySection = new UsageSection("Weekly limit");
+        codexInsightsSection = new CodexInsightsSection();
+        codexInsightsSection.ExpandedChanged += (_, _) =>
+        {
+            ApplyScaledLayout();
+            RenderSelectedProvider();
+        };
 
         statusLabel = new Label
         {
@@ -73,6 +83,7 @@ public sealed class UsagePopupForm : Form
         Controls.Add(planLabel);
         Controls.Add(fiveHourSection);
         Controls.Add(weeklySection);
+        Controls.Add(codexInsightsSection);
         Controls.Add(statusLabel);
         Controls.Add(closeButton);
 
@@ -82,6 +93,7 @@ public sealed class UsagePopupForm : Form
         EnableDragMove(statusLabel);
         fiveHourSection.EnableDragMove();
         weeklySection.EnableDragMove();
+        codexInsightsSection.EnableDragMove();
 
         Deactivate += (_, _) => Hide();
         FormClosing += OnFormClosing;
@@ -149,9 +161,14 @@ public sealed class UsagePopupForm : Form
     private void ApplyScaledLayout()
     {
         var scale = DpiScale;
+        var provider = GetProvider(selectedProviderKey);
+        var showCodexInsights = !provider.IsClaude;
+        var baseHeight = showCodexInsights
+            ? codexInsightsSection.IsExpanded ? CodexInsightsExpandedHeight : CodexInsightsCollapsedHeight
+            : BaseHeight;
         SuspendLayout();
 
-        ClientSize = new Size(ScaleInt(BaseWidth, scale), ScaleInt(BaseHeight, scale));
+        ClientSize = new Size(ScaleInt(BaseWidth, scale), ScaleInt(baseHeight, scale));
 
         closeButton.Bounds = ScaleRect(374, 14, 30, 30, scale);
         planLabel.Bounds = ScaleRect(24, 54, 330, 24, scale);
@@ -164,10 +181,16 @@ public sealed class UsagePopupForm : Form
             ScaleInt(34, scale));
         fiveHourSection.Bounds = ScaleRect(18, 82, 384, 86, scale);
         weeklySection.Bounds = ScaleRect(18, 178, 384, 86, scale);
-        statusLabel.Bounds = ScaleRect(24, 274, 372, 22, scale);
+        codexInsightsSection.Visible = showCodexInsights;
+        var insightsHeight = codexInsightsSection.IsExpanded ? 370 : 70;
+        codexInsightsSection.Bounds = ScaleRect(18, 274, 384, insightsHeight, scale);
+        statusLabel.Bounds = showCodexInsights
+            ? ScaleRect(24, codexInsightsSection.IsExpanded ? 642 : 344, 372, 16, scale)
+            : ScaleRect(24, 274, 372, 22, scale);
 
         fiveHourSection.ApplyLayoutScale(scale);
         weeklySection.ApplyLayoutScale(scale);
+        codexInsightsSection.ApplyLayoutScale(scale);
 
         ResumeLayout(performLayout: true);
         Invalidate(true);
@@ -216,6 +239,26 @@ public sealed class UsagePopupForm : Form
         }
     }
 
+    public void UpdateCodexInsights(string providerKey, CodexUsageInsightsLookupResult result)
+    {
+        codexInsightsByProvider[providerKey] = result;
+
+        if (providerKey == selectedProviderKey)
+        {
+            RenderSelectedProvider();
+        }
+    }
+
+    public void SetCodexInsightsLoading(string providerKey)
+    {
+        if (providerKey == ClaudeProviderKey || providerKey != selectedProviderKey)
+        {
+            return;
+        }
+
+        codexInsightsSection.SetLoading();
+    }
+
     public void SetLoading(string providerKey)
     {
         var provider = GetProvider(providerKey);
@@ -246,6 +289,7 @@ public sealed class UsagePopupForm : Form
         }
 
         selectedProviderKey = providerKey;
+        ApplyScaledLayout();
         RenderSelectedProvider();
         SelectedProviderChanged?.Invoke(this, providerKey);
     }
@@ -258,6 +302,7 @@ public sealed class UsagePopupForm : Form
         }
 
         var provider = GetProvider(selectedProviderKey);
+        codexInsightsSection.Visible = !provider.IsClaude;
         titleLabel.Text = $"{provider.Name} rate limits";
         var result = GetProviderUsage(selectedProviderKey);
 
@@ -266,6 +311,7 @@ public sealed class UsagePopupForm : Form
             planLabel.Text = $"Waiting for local {provider.Name} usage data";
             fiveHourSection.SetUnavailable("5 hour limit");
             weeklySection.SetUnavailable("Weekly limit");
+            RenderCodexInsights(provider);
             statusLabel.Text = result.Error ?? "No usage data found.";
             return;
         }
@@ -284,7 +330,26 @@ public sealed class UsagePopupForm : Form
             weeklySection.SetUnavailable(snapshot.Primary.WindowMinutes == 10080 ? "5 hour limit" : "Weekly limit");
         }
 
+        RenderCodexInsights(provider);
         statusLabel.Text = string.Empty;
+    }
+
+    private void RenderCodexInsights(ProviderDescriptor provider)
+    {
+        if (provider.IsClaude)
+        {
+            codexInsightsSection.SetUnavailable("Codex history is shown on Codex tabs.");
+            return;
+        }
+
+        var result = GetCodexInsights(selectedProviderKey);
+        if (result.Insights is { } insights)
+        {
+            codexInsightsSection.SetInsights(insights, result.Error);
+            return;
+        }
+
+        codexInsightsSection.SetUnavailable(result.Error ?? "Usage history has not been loaded yet.");
     }
 
     private ProviderUsageLookupResult GetProviderUsage(string providerKey)
@@ -292,6 +357,13 @@ public sealed class UsagePopupForm : Form
         return usageByProvider.TryGetValue(providerKey, out var result)
             ? result
             : new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
+    }
+
+    private CodexUsageInsightsLookupResult GetCodexInsights(string providerKey)
+    {
+        return codexInsightsByProvider.TryGetValue(providerKey, out var result)
+            ? result
+            : new CodexUsageInsightsLookupResult(null, "Usage history has not been loaded yet.");
     }
 
     private ProviderDescriptor GetProvider(string providerKey)
@@ -316,6 +388,13 @@ public sealed class UsagePopupForm : Form
         foreach (var provider in providers)
         {
             usageByProvider.TryAdd(provider.Key, new ProviderUsageLookupResult(null, "Usage has not been loaded yet."));
+            if (!provider.IsClaude)
+            {
+                codexInsightsByProvider.TryAdd(
+                    provider.Key,
+                    new CodexUsageInsightsLookupResult(null, "Usage history has not been loaded yet."));
+            }
+
             var tabButton = new ProviderTabButton(provider.Name, provider.Key, provider.IsClaude)
             {
                 Anchor = AnchorStyles.Top | AnchorStyles.Right,
@@ -434,6 +513,7 @@ public sealed class UsagePopupForm : Form
 
         fiveHourSection.ApplyTheme(theme);
         weeklySection.ApplyTheme(theme);
+        codexInsightsSection.ApplyTheme(theme);
 
         if (IsHandleCreated)
         {
@@ -496,6 +576,733 @@ public sealed class UsagePopupForm : Form
             NativeMethods.ReleaseCapture();
             NativeMethods.SendMessage(Handle, NativeMethods.WmNclButtonDown, NativeMethods.HtCaption, 0);
         };
+    }
+
+    private sealed class CodexInsightsSection : Panel
+    {
+        private readonly Label titleLabel;
+        private readonly ChevronToggleButton toggleLabel;
+        private readonly Label subtitleLabel;
+        private readonly Label todayLabel;
+        private readonly Label monthLabel;
+        private readonly DailyHistoryChart dailyChart;
+        private readonly ModelBreakdownChart modelChart;
+        private ThemePalette theme = ThemePalette.FromWindows();
+        private float layoutScale = 1f;
+        private bool isExpanded = true;
+
+        public event EventHandler? ExpandedChanged;
+
+        public CodexInsightsSection()
+        {
+            BackColor = theme.Card;
+            DoubleBuffered = true;
+            Padding = new Padding(14, 12, 14, 12);
+
+            titleLabel = new Label
+            {
+                AutoSize = false,
+                Cursor = Cursors.Hand,
+                Font = CreateFont("Segoe UI Variable Text", 9.5f, FontStyle.Bold),
+                Text = "Codex history"
+            };
+            titleLabel.Click += (_, _) => ToggleExpanded();
+
+            toggleLabel = new ChevronToggleButton
+            {
+                Cursor = Cursors.Hand,
+                Expanded = true
+            };
+            toggleLabel.Click += (_, _) => ToggleExpanded();
+
+            subtitleLabel = new Label
+            {
+                AutoEllipsis = true,
+                AutoSize = false,
+                Font = CreateFont("Segoe UI Variable Text", 8.25f, FontStyle.Regular),
+                Text = "Local session estimates"
+            };
+
+            todayLabel = MetricLabel();
+            monthLabel = MetricLabel();
+            dailyChart = new DailyHistoryChart();
+            modelChart = new ModelBreakdownChart();
+
+            Controls.Add(titleLabel);
+            Controls.Add(toggleLabel);
+            Controls.Add(subtitleLabel);
+            Controls.Add(todayLabel);
+            Controls.Add(monthLabel);
+            Controls.Add(dailyChart);
+            Controls.Add(modelChart);
+
+            ApplyTheme(theme);
+            UpdateChildLayout();
+        }
+
+        public void EnableDragMove()
+        {
+            if (FindForm() is not UsagePopupForm popup)
+            {
+                HandleCreated += (_, _) =>
+                {
+                    if (FindForm() is UsagePopupForm createdPopup)
+                    {
+                        createdPopup.EnableDragMove(this);
+                        createdPopup.EnableDragMove(subtitleLabel);
+                        createdPopup.EnableDragMove(todayLabel);
+                        createdPopup.EnableDragMove(monthLabel);
+                        createdPopup.EnableDragMove(dailyChart);
+                        createdPopup.EnableDragMove(modelChart);
+                    }
+                };
+                return;
+            }
+
+            popup.EnableDragMove(this);
+            popup.EnableDragMove(subtitleLabel);
+            popup.EnableDragMove(todayLabel);
+            popup.EnableDragMove(monthLabel);
+            popup.EnableDragMove(dailyChart);
+            popup.EnableDragMove(modelChart);
+        }
+
+        public void ApplyTheme(ThemePalette palette)
+        {
+            theme = palette;
+            BackColor = theme.Card;
+            foreach (Control control in Controls)
+            {
+                control.BackColor = theme.Card;
+            }
+
+            titleLabel.ForeColor = theme.TextPrimary;
+            toggleLabel.ApplyTheme(theme);
+            subtitleLabel.ForeColor = theme.TextSecondary;
+            todayLabel.ForeColor = theme.TextPrimary;
+            monthLabel.ForeColor = theme.TextPrimary;
+            dailyChart.ApplyTheme(theme);
+            modelChart.ApplyTheme(theme);
+            Invalidate(true);
+        }
+
+        public bool IsExpanded
+        {
+            get => isExpanded;
+            private set
+            {
+                if (isExpanded == value)
+                {
+                    return;
+                }
+
+                isExpanded = value;
+                ApplyExpandedState();
+                ExpandedChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        public void ApplyLayoutScale(float scale)
+        {
+            layoutScale = Math.Max(1f, scale);
+            dailyChart.LayoutScale = layoutScale;
+            modelChart.LayoutScale = layoutScale;
+            UpdateChildLayout();
+        }
+
+        private void ToggleExpanded()
+        {
+            IsExpanded = !IsExpanded;
+        }
+
+        private void ApplyExpandedState()
+        {
+            toggleLabel.Expanded = IsExpanded;
+            var showDetails = IsExpanded;
+            todayLabel.Visible = showDetails;
+            monthLabel.Visible = showDetails;
+            dailyChart.Visible = showDetails;
+            modelChart.Visible = showDetails;
+            subtitleLabel.Text = showDetails && !string.IsNullOrWhiteSpace(expandedSubtitle)
+                ? expandedSubtitle
+                : showDetails ? subtitleLabel.Text : "History hidden. Click to expand.";
+            UpdateChildLayout();
+            Invalidate(true);
+        }
+
+        private string? expandedSubtitle;
+
+        public void SetLoading()
+        {
+            titleLabel.Text = "Codex history";
+            expandedSubtitle = "Scanning local sessions...";
+            subtitleLabel.Text = IsExpanded ? expandedSubtitle : "History hidden. Click to expand.";
+            todayLabel.Text = "Today\nScanning";
+            monthLabel.Text = "30 days\nScanning";
+            dailyChart.SetData([], "Loading history");
+            modelChart.SetData([], "Loading breakdown");
+        }
+
+        public void SetUnavailable(string message)
+        {
+            titleLabel.Text = "Codex history";
+            expandedSubtitle = message;
+            subtitleLabel.Text = IsExpanded ? expandedSubtitle : "History hidden. Click to expand.";
+            todayLabel.Text = "Today\n--";
+            monthLabel.Text = "30 days\n--";
+            dailyChart.SetData([], "No history yet");
+            modelChart.SetData([], "No model breakdown yet");
+        }
+
+        public void SetInsights(CodexUsageInsights insights, string? warning)
+        {
+            titleLabel.Text = "Codex history";
+            expandedSubtitle = warning ?? $"Local estimates, updated {FormatObservedAt(insights.ObservedAt)}";
+            subtitleLabel.Text = IsExpanded ? expandedSubtitle : "History hidden. Click to expand.";
+            todayLabel.Text = $"Today\n{FormatCurrency(insights.TodayEstimatedCostUsd)} · {FormatTokens(insights.TodayTokens)}";
+            monthLabel.Text = $"30 days\n{FormatCurrency(insights.Last30DaysEstimatedCostUsd)} · {FormatTokens(insights.Last30DaysTokens)}";
+            dailyChart.SetData(insights.Daily, insights.HasUsage ? null : "No token rows found");
+            modelChart.SetData(insights.Models, insights.HasUsage ? null : "No model data found");
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+            var bounds = new Rectangle(0, 0, Width - 1, Height - 1);
+            using var fillBrush = new SolidBrush(theme.Card);
+            using var borderPen = new Pen(theme.CardBorder);
+            using var path = RoundedPath(bounds, 12);
+
+            e.Graphics.FillPath(fillBrush, path);
+            e.Graphics.DrawPath(borderPen, path);
+
+            base.OnPaint(e);
+        }
+
+        protected override void OnSizeChanged(EventArgs e)
+        {
+            base.OnSizeChanged(e);
+            UpdateChildLayout();
+        }
+
+        private void UpdateChildLayout()
+        {
+            var left = ScaleInt(16, layoutScale);
+            var right = ScaleInt(16, layoutScale);
+            titleLabel.Bounds = new Rectangle(left, ScaleInt(12, layoutScale), ScaleInt(170, layoutScale), ScaleInt(22, layoutScale));
+            toggleLabel.Bounds = new Rectangle(Width - right - ScaleInt(24, layoutScale), ScaleInt(10, layoutScale), ScaleInt(24, layoutScale), ScaleInt(24, layoutScale));
+            subtitleLabel.Bounds = new Rectangle(left, ScaleInt(34, layoutScale), Width - left - right, ScaleInt(20, layoutScale));
+            if (!IsExpanded)
+            {
+                return;
+            }
+
+            todayLabel.Bounds = new Rectangle(left, ScaleInt(66, layoutScale), ScaleInt(168, layoutScale), ScaleInt(38, layoutScale));
+            monthLabel.Bounds = new Rectangle(Width - ScaleInt(184, layoutScale), ScaleInt(66, layoutScale), ScaleInt(168, layoutScale), ScaleInt(38, layoutScale));
+            dailyChart.Bounds = new Rectangle(left, ScaleInt(112, layoutScale), Width - left - right, ScaleInt(150, layoutScale));
+            modelChart.Bounds = new Rectangle(left, ScaleInt(278, layoutScale), Width - left - right, ScaleInt(78, layoutScale));
+        }
+
+        private static Label MetricLabel()
+        {
+            return new Label
+            {
+                AutoSize = false,
+                Font = CreateFont("Segoe UI Variable Text", 8.5f, FontStyle.Bold)
+            };
+        }
+
+        private static string FormatCurrency(decimal value)
+        {
+            if (value <= 0)
+            {
+                return "$0.00";
+            }
+
+            return value < 0.01m ? "<$0.01" : $"${value:0.00}";
+        }
+
+        public static string FormatTokens(long tokens)
+        {
+            if (tokens >= 1_000_000)
+            {
+                return $"{tokens / 1_000_000d:0.#}M tok";
+            }
+
+            if (tokens >= 1_000)
+            {
+                return $"{tokens / 1_000d:0.#}K tok";
+            }
+
+            return $"{tokens} tok";
+        }
+    }
+
+    private sealed class ChevronToggleButton : Control
+    {
+        private ThemePalette theme = ThemePalette.FromWindows();
+        private bool hovering;
+        private bool pressing;
+        private bool expanded = true;
+
+        [System.ComponentModel.Browsable(false)]
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public bool Expanded
+        {
+            get => expanded;
+            set
+            {
+                if (expanded == value)
+                {
+                    return;
+                }
+
+                expanded = value;
+                AccessibleName = expanded ? "Collapse Codex history" : "Expand Codex history";
+                Invalidate();
+            }
+        }
+
+        public ChevronToggleButton()
+        {
+            AccessibleName = "Collapse Codex history";
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable | ControlStyles.UserPaint, true);
+        }
+
+        public void ApplyTheme(ThemePalette palette)
+        {
+            theme = palette;
+            BackColor = theme.Card;
+            Invalidate();
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            hovering = true;
+            Invalidate();
+            base.OnMouseEnter(e);
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            hovering = false;
+            pressing = false;
+            Invalidate();
+            base.OnMouseLeave(e);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                pressing = true;
+                Invalidate();
+            }
+
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            pressing = false;
+            Invalidate();
+            base.OnMouseUp(e);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode is Keys.Enter or Keys.Space)
+            {
+                OnClick(EventArgs.Empty);
+                e.Handled = true;
+            }
+
+            base.OnKeyDown(e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            var fill = pressing ? theme.Pressed : hovering ? theme.Hover : theme.Card;
+            using (var fillBrush = new SolidBrush(fill))
+            using (var path = RoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), 7))
+            {
+                e.Graphics.FillPath(fillBrush, path);
+            }
+
+            using var pen = new Pen(theme.TextSecondary, 1.7f)
+            {
+                StartCap = System.Drawing.Drawing2D.LineCap.Round,
+                EndCap = System.Drawing.Drawing2D.LineCap.Round,
+                LineJoin = System.Drawing.Drawing2D.LineJoin.Round
+            };
+
+            var cx = Width / 2f;
+            var cy = Height / 2f;
+            var size = Math.Max(5f, Math.Min(Width, Height) * 0.22f);
+            if (Expanded)
+            {
+                e.Graphics.DrawLine(pen, cx - size, cy - size / 2f, cx, cy + size / 2f);
+                e.Graphics.DrawLine(pen, cx, cy + size / 2f, cx + size, cy - size / 2f);
+            }
+            else
+            {
+                e.Graphics.DrawLine(pen, cx - size / 2f, cy - size, cx + size / 2f, cy);
+                e.Graphics.DrawLine(pen, cx + size / 2f, cy, cx - size / 2f, cy + size);
+            }
+        }
+    }
+
+    private sealed class DailyHistoryChart : Control
+    {
+        private readonly ToolTip toolTip = new() { AutomaticDelay = 120, AutoPopDelay = 8000, ReshowDelay = 80 };
+        private IReadOnlyList<CodexDailyUsage> daily = [];
+        private string? emptyMessage;
+        private ThemePalette theme = ThemePalette.FromWindows();
+        private int hoveredIndex = -1;
+        private string? lastToolTipText;
+
+        [System.ComponentModel.Browsable(false)]
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public float LayoutScale { get; set; } = 1f;
+
+        public DailyHistoryChart()
+        {
+            Cursor = Cursors.Hand;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
+        }
+
+        public void ApplyTheme(ThemePalette palette)
+        {
+            theme = palette;
+            BackColor = theme.Card;
+            Invalidate();
+        }
+
+        public void SetData(IReadOnlyList<CodexDailyUsage> data, string? message)
+        {
+            daily = data;
+            emptyMessage = message;
+            hoveredIndex = -1;
+            lastToolTipText = null;
+            toolTip.SetToolTip(this, null);
+            Invalidate();
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            var index = HitTest(e.Location);
+            if (index == hoveredIndex)
+            {
+                return;
+            }
+
+            hoveredIndex = index;
+            if (index >= 0 && index < daily.Count)
+            {
+                var day = daily[index];
+                var text = $"{day.Day:MMM d}: {FormatUsd(day.EstimatedCostUsd)}\n{CodexInsightsSection.FormatTokens(day.TotalTokens)} total, {CodexInsightsSection.FormatTokens(day.OutputTokens)} output";
+                if (text != lastToolTipText)
+                {
+                    lastToolTipText = text;
+                    toolTip.SetToolTip(this, text);
+                }
+            }
+            else
+            {
+                lastToolTipText = null;
+                toolTip.SetToolTip(this, null);
+            }
+
+            Invalidate();
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            hoveredIndex = -1;
+            lastToolTipText = null;
+            toolTip.SetToolTip(this, null);
+            Invalidate();
+            base.OnMouseLeave(e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            var titleBounds = new Rectangle(0, 0, Width, ScaleInt(16, LayoutScale));
+            using var titleBrush = new SolidBrush(theme.TextSecondary);
+            using var titleFont = CreateFont("Segoe UI Variable Text", 7.5f, FontStyle.Regular);
+            e.Graphics.DrawString("Estimated spend by day", titleFont, titleBrush, titleBounds);
+
+            var chartBounds = ChartBounds;
+            if (daily.Count == 0 || daily.All(day => day.EstimatedCostUsd <= 0))
+            {
+                DrawEmpty(e.Graphics, chartBounds, emptyMessage ?? "No spend data");
+                return;
+            }
+
+            var max = Math.Max(0.01m, daily.Max(day => day.EstimatedCostUsd));
+            var gap = BarGap;
+            var barWidth = BarWidth(chartBounds, gap);
+            var x = chartBounds.Left;
+            using var trackBrush = new SolidBrush(theme.MeterTrack);
+            using var fillBrush = new SolidBrush(theme.Accent);
+            using var hoverBrush = new SolidBrush(ControlPaint.Light(theme.Accent));
+            using var hoverPen = new Pen(theme.TextPrimary, 1f);
+            for (var index = 0; index < daily.Count; index++)
+            {
+                var day = daily[index];
+                var track = new Rectangle(x, chartBounds.Top, barWidth, chartBounds.Height);
+                e.Graphics.FillRectangle(trackBrush, track);
+                var height = (int)Math.Round(chartBounds.Height * (double)(day.EstimatedCostUsd / max));
+                if (height > 0)
+                {
+                    var fill = new Rectangle(x, chartBounds.Bottom - height, barWidth, height);
+                    e.Graphics.FillRectangle(index == hoveredIndex ? hoverBrush : fillBrush, fill);
+                }
+
+                if (index == hoveredIndex)
+                {
+                    e.Graphics.DrawRectangle(hoverPen, track);
+                }
+
+                x += barWidth + gap;
+            }
+
+            DrawDailyAxis(e.Graphics, chartBounds, daily);
+        }
+
+        private Rectangle ChartBounds => new(0, ScaleInt(18, LayoutScale), Width, Math.Max(20, Height - ScaleInt(36, LayoutScale)));
+        private int BarGap => Math.Max(1, ScaleInt(2, LayoutScale));
+
+        private int BarWidth(Rectangle chartBounds, int gap)
+        {
+            return Math.Max(2, (chartBounds.Width - gap * Math.Max(0, daily.Count - 1)) / Math.Max(1, daily.Count));
+        }
+
+        private int HitTest(Point point)
+        {
+            if (daily.Count == 0 || !ChartBounds.Contains(point))
+            {
+                return -1;
+            }
+
+            var gap = BarGap;
+            var step = BarWidth(ChartBounds, gap) + gap;
+            var index = step <= 0 ? -1 : (point.X - ChartBounds.Left) / step;
+            return index >= 0 && index < daily.Count ? index : -1;
+        }
+    }
+
+    private sealed class ModelBreakdownChart : Control
+    {
+        private readonly ToolTip toolTip = new() { AutomaticDelay = 120, AutoPopDelay = 8000, ReshowDelay = 80 };
+        private IReadOnlyList<CodexModelUsage> models = [];
+        private string? emptyMessage;
+        private ThemePalette theme = ThemePalette.FromWindows();
+        private int hoveredIndex = -1;
+        private string? lastToolTipText;
+
+        [System.ComponentModel.Browsable(false)]
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public float LayoutScale { get; set; } = 1f;
+
+        public ModelBreakdownChart()
+        {
+            Cursor = Cursors.Hand;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
+        }
+
+        public void ApplyTheme(ThemePalette palette)
+        {
+            theme = palette;
+            BackColor = theme.Card;
+            Invalidate();
+        }
+
+        public void SetData(IReadOnlyList<CodexModelUsage> data, string? message)
+        {
+            models = data;
+            emptyMessage = message;
+            hoveredIndex = -1;
+            lastToolTipText = null;
+            toolTip.SetToolTip(this, null);
+            Invalidate();
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            var index = HitTest(e.Location);
+            if (index == hoveredIndex)
+            {
+                return;
+            }
+
+            hoveredIndex = index;
+            var top = TopModels;
+            if (index >= 0 && index < top.Length)
+            {
+                var model = top[index];
+                var text = $"{model.Model}\n{CodexInsightsSection.FormatTokens(model.TotalTokens)} total, {CodexInsightsSection.FormatTokens(model.OutputTokens)} output\nEstimated {FormatUsd(model.EstimatedCostUsd)}";
+                if (text != lastToolTipText)
+                {
+                    lastToolTipText = text;
+                    toolTip.SetToolTip(this, text);
+                }
+            }
+            else
+            {
+                lastToolTipText = null;
+                toolTip.SetToolTip(this, null);
+            }
+
+            Invalidate();
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            hoveredIndex = -1;
+            lastToolTipText = null;
+            toolTip.SetToolTip(this, null);
+            Invalidate();
+            base.OnMouseLeave(e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            var titleBounds = new Rectangle(0, 0, Width, ScaleInt(16, LayoutScale));
+            using var titleBrush = new SolidBrush(theme.TextSecondary);
+            using var titleFont = CreateFont("Segoe UI Variable Text", 7.5f, FontStyle.Regular);
+            e.Graphics.DrawString("Usage breakdown by model", titleFont, titleBrush, titleBounds);
+
+            var chartBounds = BarBounds;
+            if (models.Count == 0 || models.All(model => model.TotalTokens <= 0))
+            {
+                DrawEmpty(e.Graphics, new Rectangle(0, ScaleInt(18, LayoutScale), Width, Height - ScaleInt(18, LayoutScale)), emptyMessage ?? "No model data");
+                return;
+            }
+
+            var top = TopModels;
+            var total = Math.Max(1, top.Sum(model => model.TotalTokens));
+            var x = chartBounds.Left;
+            var colors = SegmentColors;
+            for (var index = 0; index < top.Length; index++)
+            {
+                var width = index == top.Length - 1
+                    ? chartBounds.Right - x
+                    : Math.Max(1, (int)Math.Round(chartBounds.Width * (top[index].TotalTokens / (double)total)));
+                var segment = new Rectangle(x, chartBounds.Top, width, chartBounds.Height);
+                using var brush = new SolidBrush(index == hoveredIndex ? ControlPaint.Light(colors[index % colors.Length]) : colors[index % colors.Length]);
+                e.Graphics.FillRectangle(brush, segment);
+                if (index == hoveredIndex)
+                {
+                    using var pen = new Pen(theme.TextPrimary, 1f);
+                    e.Graphics.DrawRectangle(pen, segment);
+                }
+
+                x += width;
+            }
+
+            DrawLegend(e.Graphics, top, colors);
+        }
+
+        private CodexModelUsage[] TopModels => models.Take(4).ToArray();
+
+        private Rectangle BarBounds => new(0, ScaleInt(19, LayoutScale), Width, ScaleInt(10, LayoutScale));
+
+        private Color[] SegmentColors => [theme.Accent, Color.FromArgb(16, 124, 16), theme.Warning, Color.FromArgb(134, 97, 197)];
+
+        private int HitTest(Point point)
+        {
+            var top = TopModels;
+            if (top.Length == 0 || !BarBounds.Contains(point))
+            {
+                return -1;
+            }
+
+            var total = Math.Max(1, top.Sum(model => model.TotalTokens));
+            var x = BarBounds.Left;
+            for (var index = 0; index < top.Length; index++)
+            {
+                var width = index == top.Length - 1
+                    ? BarBounds.Right - x
+                    : Math.Max(1, (int)Math.Round(BarBounds.Width * (top[index].TotalTokens / (double)total)));
+                if (point.X >= x && point.X <= x + width)
+                {
+                    return index;
+                }
+
+                x += width;
+            }
+
+            return -1;
+        }
+
+        private void DrawLegend(Graphics graphics, IReadOnlyList<CodexModelUsage> top, IReadOnlyList<Color> colors)
+        {
+            using var textBrush = new SolidBrush(theme.TextSecondary);
+            using var font = CreateFont("Segoe UI Variable Text", 7.25f, FontStyle.Regular);
+            var y = ScaleInt(36, LayoutScale);
+            var columnWidth = Width / 2;
+            for (var index = 0; index < Math.Min(4, top.Count); index++)
+            {
+                var x = (index % 2) * columnWidth;
+                var rowY = y + (index / 2) * ScaleInt(16, LayoutScale);
+                using var dotBrush = new SolidBrush(colors[index % colors.Count]);
+                graphics.FillEllipse(dotBrush, x, rowY + ScaleInt(4, LayoutScale), ScaleInt(7, LayoutScale), ScaleInt(7, LayoutScale));
+                var label = $"{ShortModel(top[index].Model)} {CodexInsightsSection.FormatTokens(top[index].TotalTokens)}";
+                graphics.DrawString(label, font, textBrush, new RectangleF(x + ScaleInt(11, LayoutScale), rowY, columnWidth - ScaleInt(13, LayoutScale), ScaleInt(16, LayoutScale)));
+            }
+        }
+
+        private static string ShortModel(string model)
+        {
+            if (model.Length <= 13)
+            {
+                return model;
+            }
+
+            return model[..12] + "…";
+        }
+    }
+
+    private static void DrawDailyAxis(Graphics graphics, Rectangle chartBounds, IReadOnlyList<CodexDailyUsage> daily)
+    {
+        if (daily.Count == 0)
+        {
+            return;
+        }
+
+        using var textBrush = new SolidBrush(Color.FromArgb(150, 128, 128, 128));
+        using var font = CreateFont("Segoe UI Variable Text", 7f, FontStyle.Regular);
+        var first = daily.First().Day.ToString("MMM d");
+        var last = daily.Last().Day.ToString("MMM d");
+        graphics.DrawString(first, font, textBrush, new RectangleF(chartBounds.Left, chartBounds.Bottom + 1, chartBounds.Width / 2f, 14));
+        var lastSize = graphics.MeasureString(last, font);
+        graphics.DrawString(last, font, textBrush, new PointF(chartBounds.Right - lastSize.Width, chartBounds.Bottom + 1));
+    }
+
+    private static string FormatUsd(decimal value)
+    {
+        if (value <= 0)
+        {
+            return "$0.00";
+        }
+
+        return value < 0.01m ? "<$0.01" : $"${value:0.00}";
+    }
+
+    private static void DrawEmpty(Graphics graphics, Rectangle bounds, string message)
+    {
+        using var pen = new Pen(Color.FromArgb(90, 128, 128, 128));
+        using var brush = new SolidBrush(Color.FromArgb(150, 128, 128, 128));
+        graphics.DrawLine(pen, bounds.Left, bounds.Bottom - 1, bounds.Right, bounds.Bottom - 1);
+        using var font = CreateFont("Segoe UI Variable Text", 7.5f, FontStyle.Regular);
+        graphics.DrawString(message, font, brush, bounds);
     }
 
     private sealed class UsageSection : Panel

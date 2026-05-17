@@ -14,6 +14,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private ToolStripMenuItem? checkForUpdatesItem;
     private IReadOnlyList<CodexCliEntry> codexCliEntries;
     private readonly Dictionary<string, ProviderUsageLookupResult> latestCodexUsage = [];
+    private readonly Dictionary<string, CodexUsageInsightsLookupResult> latestCodexInsights = [];
     private ProviderUsageLookupResult latestClaudeUsage = new(null, "Usage has not been loaded yet.");
     private CancellationTokenSource? refreshCancellation;
     private int refreshGeneration;
@@ -26,8 +27,9 @@ public sealed class TrayApplicationContext : ApplicationContext
         codexCliEntries = CodexCliSettings.Load();
         foreach (var entry in codexCliEntries)
         {
-            latestCodexUsage[UsagePopupForm.CodexProviderKey(entry.Id)] =
-                new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
+            var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
+            latestCodexUsage[providerKey] = new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
+            latestCodexInsights[providerKey] = new CodexUsageInsightsLookupResult(null, "Usage history has not been loaded yet.");
         }
 
         popup.ConfigureCodexEntries(codexCliEntries);
@@ -41,7 +43,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         notifyIcon.MouseUp += OnTrayMouseUp;
         popup.SelectedProviderChanged += (_, providerKey) =>
         {
-            if (!GetLatestUsage(providerKey).HasSnapshot)
+            if (!GetLatestUsage(providerKey).HasSnapshot ||
+                (providerKey != UsagePopupForm.ClaudeProviderKey && !GetLatestCodexInsights(providerKey).HasInsights))
             {
                 BeginRefresh(showLoading: true);
             }
@@ -126,6 +129,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
             popup.UpdateUsage(providerKey, GetLatestUsage(providerKey));
+            popup.UpdateCodexInsights(providerKey, GetLatestCodexInsights(providerKey));
         }
 
         popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
@@ -142,6 +146,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         if (showLoading)
         {
             popup.SetLoading(popup.SelectedProvider);
+            popup.SetCodexInsightsLoading(popup.SelectedProvider);
         }
 
         refreshCancellation?.Cancel();
@@ -154,6 +159,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         _ = Task.Run(async () =>
         {
             Dictionary<string, ProviderUsageLookupResult> codexResults;
+            CodexUsageInsightsLookupResult codexInsightsResult;
             ProviderUsageLookupResult claudeResult;
 
             try
@@ -182,9 +188,11 @@ public sealed class TrayApplicationContext : ApplicationContext
                     .ToArray();
 
                 var codexTask = Task.WhenAll(codexTasks);
+                var codexInsightsTask = Task.Run(() => new CodexUsageInsightsReader().ReadLatest(), cancellation.Token);
                 var claudeTask = claudeUsageReader.ReadLatestAsync(cancellation.Token);
 
                 codexResults = (await codexTask.ConfigureAwait(false)).ToDictionary(pair => pair.Key, pair => pair.Value);
+                codexInsightsResult = await codexInsightsTask.ConfigureAwait(false);
                 claudeResult = await claudeTask.ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -208,7 +216,9 @@ public sealed class TrayApplicationContext : ApplicationContext
                 foreach (var pair in codexResults)
                 {
                     latestCodexUsage[pair.Key] = pair.Value;
+                    latestCodexInsights[pair.Key] = codexInsightsResult;
                     popup.UpdateUsage(pair.Key, pair.Value);
+                    popup.UpdateCodexInsights(pair.Key, codexInsightsResult);
                 }
 
                 latestClaudeUsage = claudeResult;
@@ -242,7 +252,11 @@ public sealed class TrayApplicationContext : ApplicationContext
                 {
                     var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
                     latestCodexUsage[providerKey] = failed;
+                    latestCodexInsights[providerKey] = new CodexUsageInsightsLookupResult(
+                        null,
+                        $"Could not refresh Codex history: {task.Exception.GetBaseException().Message}");
                     popup.UpdateUsage(providerKey, failed);
+                    popup.UpdateCodexInsights(providerKey, latestCodexInsights[providerKey]);
                 }
 
                 latestClaudeUsage = failed;
@@ -362,14 +376,23 @@ public sealed class TrayApplicationContext : ApplicationContext
             : new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
     }
 
+    private CodexUsageInsightsLookupResult GetLatestCodexInsights(string providerKey)
+    {
+        return latestCodexInsights.TryGetValue(providerKey, out var result)
+            ? result
+            : new CodexUsageInsightsLookupResult(null, "Usage history has not been loaded yet.");
+    }
+
     private void ReloadCodexCliEntries()
     {
         codexCliEntries = CodexCliSettings.Load();
         foreach (var entry in codexCliEntries)
         {
-            latestCodexUsage.TryAdd(
-                UsagePopupForm.CodexProviderKey(entry.Id),
-                new ProviderUsageLookupResult(null, "Usage has not been loaded yet."));
+            var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
+            latestCodexUsage.TryAdd(providerKey, new ProviderUsageLookupResult(null, "Usage has not been loaded yet."));
+            latestCodexInsights.TryAdd(
+                providerKey,
+                new CodexUsageInsightsLookupResult(null, "Usage history has not been loaded yet."));
         }
 
         popup.ConfigureCodexEntries(codexCliEntries);
@@ -377,6 +400,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
             popup.UpdateUsage(providerKey, GetLatestUsage(providerKey));
+            popup.UpdateCodexInsights(providerKey, GetLatestCodexInsights(providerKey));
         }
 
         popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);

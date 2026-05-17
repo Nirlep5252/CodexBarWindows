@@ -2,7 +2,9 @@
 
 A small Windows tray app for checking AI coding assistant usage limits without opening a terminal.
 
-CodexBarWindows stays in the system tray. Left-click the tray icon to open a compact popup near the taskbar with tabs for Codex and Claude usage limits, including percentage used, remaining allowance, and reset time.
+CodexBarWindows stays in the system tray. Left-click the tray icon to open a compact popup near the taskbar with tabs for Codex and Claude usage limits, including percentage used, remaining allowance, reset time, and Codex history charts.
+
+![CodexBarWindows preview](docs/codexbarwindows-preview.png)
 
 ## Features
 
@@ -10,6 +12,7 @@ CodexBarWindows stays in the system tray. Left-click the tray icon to open a com
 - Opens instantly and refreshes usage in the background.
 - Shows loading state while usage limits are fetched.
 - Displays 5 hour and weekly usage windows for one or more Codex CLI accounts.
+- Shows Codex local history charts for estimated 30 day spend and model usage breakdowns from session logs.
 - Displays 5 hour and weekly usage windows for Claude Code when local Claude credentials are available.
 - Follows the Windows light/dark system theme.
 - Draggable popup.
@@ -65,7 +68,7 @@ Installer\bin\Release\CodexBarWindows-<version>-win-x64.msi
 Install it silently:
 
 ```powershell
-msiexec /i .\Installer\bin\Release\CodexBarWindows-0.2.1-win-x64.msi /qn
+msiexec /i .\Installer\bin\Release\CodexBarWindows-0.3.0-win-x64.msi /qn
 ```
 
 ## Uninstall
@@ -118,7 +121,7 @@ The PowerShell scripts are grouped under `Scripts/` because they are the primary
 The app version is defined in [Directory.Build.props](Directory.Build.props):
 
 ```xml
-<VersionPrefix>0.2.1</VersionPrefix>
+<VersionPrefix>0.3.0</VersionPrefix>
 ```
 
 Use semantic versions in the form `major.minor.patch`. MSI upgrades use this version, and the updater compares it against GitHub release tags.
@@ -126,8 +129,8 @@ Use semantic versions in the form `major.minor.patch`. MSI upgrades use this ver
 To publish a new version:
 
 ```powershell
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 The GitHub Actions release workflow builds an MSI and attaches it to a GitHub Release.
@@ -140,8 +143,8 @@ You can also right-click the tray icon and choose `Check for updates`.
 
 Release requirements:
 
-- Tags must look like `v0.2.1`.
-- The release must include an MSI asset, for example `CodexBarWindows-0.2.1-win-x64.msi`.
+- Tags must look like `v0.3.0`.
+- The release must include an MSI asset, for example `CodexBarWindows-0.3.0-win-x64.msi`.
 - The new version must be greater than the installed assembly version.
 
 For private repositories, GitHub release checks require authentication. The app checks these sources in order:
@@ -155,6 +158,8 @@ If the repository is made public later, no token is required.
 ## How Usage Is Read
 
 For Codex, the app first asks the local Codex CLI for rate limits using the CLI app-server RPC endpoint. If live RPC data is unavailable, it falls back to local Codex session data where possible.
+
+Codex history charts are local estimates from `%USERPROFILE%\.codex\sessions` and `%USERPROFILE%\.codex\archived_sessions`, or from `%CODEX_HOME%` when set. They summarize recent token rows into a 30 day spend chart and model usage breakdown. Cost values use built-in API-rate estimates and may differ from billing.
 
 The built-in Codex tab uses `CODEX_BINARY` or `PATH`, matching the existing behavior. Extra Codex accounts can be added from the tray icon's `Settings` window by choosing another `codex.exe`, `codex.cmd`, `.bat`, or wrapper script path. Each configured binary is queried separately and appears as its own Codex tab in the tray popup.
 
