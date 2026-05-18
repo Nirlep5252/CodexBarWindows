@@ -585,11 +585,16 @@ public sealed class UsagePopupForm : Form
         private readonly Label subtitleLabel;
         private readonly Label todayLabel;
         private readonly Label monthLabel;
+        private readonly HistoryMetricLabel todayMetric;
+        private readonly HistoryMetricLabel monthMetric;
         private readonly DailyHistoryChart dailyChart;
         private readonly ModelBreakdownChart modelChart;
+        private readonly System.Windows.Forms.Timer loadingTimer = new();
         private ThemePalette theme = ThemePalette.FromWindows();
         private float layoutScale = 1f;
+        private float loadingPhase;
         private bool isExpanded = true;
+        private bool isLoading;
 
         public event EventHandler? ExpandedChanged;
 
@@ -625,6 +630,8 @@ public sealed class UsagePopupForm : Form
 
             todayLabel = MetricLabel();
             monthLabel = MetricLabel();
+            todayMetric = new HistoryMetricLabel();
+            monthMetric = new HistoryMetricLabel();
             dailyChart = new DailyHistoryChart();
             modelChart = new ModelBreakdownChart();
 
@@ -633,8 +640,13 @@ public sealed class UsagePopupForm : Form
             Controls.Add(subtitleLabel);
             Controls.Add(todayLabel);
             Controls.Add(monthLabel);
+            Controls.Add(todayMetric);
+            Controls.Add(monthMetric);
             Controls.Add(dailyChart);
             Controls.Add(modelChart);
+
+            loadingTimer.Interval = 70;
+            loadingTimer.Tick += (_, _) => AdvanceLoadingAnimation();
 
             ApplyTheme(theme);
             UpdateChildLayout();
@@ -652,6 +664,8 @@ public sealed class UsagePopupForm : Form
                         createdPopup.EnableDragMove(subtitleLabel);
                         createdPopup.EnableDragMove(todayLabel);
                         createdPopup.EnableDragMove(monthLabel);
+                        createdPopup.EnableDragMove(todayMetric);
+                        createdPopup.EnableDragMove(monthMetric);
                         createdPopup.EnableDragMove(dailyChart);
                         createdPopup.EnableDragMove(modelChart);
                     }
@@ -663,6 +677,8 @@ public sealed class UsagePopupForm : Form
             popup.EnableDragMove(subtitleLabel);
             popup.EnableDragMove(todayLabel);
             popup.EnableDragMove(monthLabel);
+            popup.EnableDragMove(todayMetric);
+            popup.EnableDragMove(monthMetric);
             popup.EnableDragMove(dailyChart);
             popup.EnableDragMove(modelChart);
         }
@@ -681,6 +697,8 @@ public sealed class UsagePopupForm : Form
             subtitleLabel.ForeColor = theme.TextSecondary;
             todayLabel.ForeColor = theme.TextPrimary;
             monthLabel.ForeColor = theme.TextPrimary;
+            todayMetric.ApplyTheme(theme);
+            monthMetric.ApplyTheme(theme);
             dailyChart.ApplyTheme(theme);
             modelChart.ApplyTheme(theme);
             Invalidate(true);
@@ -721,6 +739,8 @@ public sealed class UsagePopupForm : Form
             var showDetails = IsExpanded;
             todayLabel.Visible = showDetails;
             monthLabel.Visible = showDetails;
+            todayMetric.Visible = showDetails;
+            monthMetric.Visible = showDetails;
             dailyChart.Visible = showDetails;
             modelChart.Visible = showDetails;
             subtitleLabel.Text = showDetails && !string.IsNullOrWhiteSpace(expandedSubtitle)
@@ -732,35 +752,89 @@ public sealed class UsagePopupForm : Form
 
         private string? expandedSubtitle;
 
+        private void AdvanceLoadingAnimation()
+        {
+            if (!isLoading)
+            {
+                loadingTimer.Stop();
+                return;
+            }
+
+            loadingPhase += 0.035f;
+            if (loadingPhase > 1f)
+            {
+                loadingPhase -= 1f;
+            }
+
+            todayMetric.LoadingPhase = loadingPhase;
+            monthMetric.LoadingPhase = WrapPhase(loadingPhase + 0.18f);
+            dailyChart.LoadingPhase = loadingPhase;
+            modelChart.LoadingPhase = WrapPhase(loadingPhase + 0.28f);
+        }
+
+        private void StartLoadingAnimation()
+        {
+            isLoading = true;
+            if (!loadingTimer.Enabled)
+            {
+                loadingTimer.Start();
+            }
+        }
+
+        private void StopLoadingAnimation()
+        {
+            isLoading = false;
+            loadingTimer.Stop();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                loadingTimer.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+
         public void SetLoading()
         {
+            StartLoadingAnimation();
             titleLabel.Text = "Codex history";
             expandedSubtitle = "Scanning local sessions...";
             subtitleLabel.Text = IsExpanded ? expandedSubtitle : "History hidden. Click to expand.";
-            todayLabel.Text = "Today\nScanning";
-            monthLabel.Text = "30 days\nScanning";
-            dailyChart.SetData([], "Loading history");
-            modelChart.SetData([], "Loading breakdown");
+            todayLabel.Text = "Today";
+            monthLabel.Text = "30 days";
+            todayMetric.SetLoading();
+            monthMetric.SetLoading();
+            dailyChart.SetLoading();
+            modelChart.SetLoading();
         }
 
         public void SetUnavailable(string message)
         {
+            StopLoadingAnimation();
             titleLabel.Text = "Codex history";
             expandedSubtitle = message;
             subtitleLabel.Text = IsExpanded ? expandedSubtitle : "History hidden. Click to expand.";
-            todayLabel.Text = "Today\n--";
-            monthLabel.Text = "30 days\n--";
+            todayLabel.Text = "Today";
+            monthLabel.Text = "30 days";
+            todayMetric.SetText("--");
+            monthMetric.SetText("--");
             dailyChart.SetData([], "No history yet");
             modelChart.SetData([], "No model breakdown yet");
         }
 
         public void SetInsights(CodexUsageInsights insights, string? warning)
         {
+            StopLoadingAnimation();
             titleLabel.Text = "Codex history";
             expandedSubtitle = warning ?? $"Local estimates, updated {FormatObservedAt(insights.ObservedAt)}";
             subtitleLabel.Text = IsExpanded ? expandedSubtitle : "History hidden. Click to expand.";
-            todayLabel.Text = $"Today\n{FormatCurrency(insights.TodayEstimatedCostUsd)} · {FormatTokens(insights.TodayTokens)}";
-            monthLabel.Text = $"30 days\n{FormatCurrency(insights.Last30DaysEstimatedCostUsd)} · {FormatTokens(insights.Last30DaysTokens)}";
+            todayLabel.Text = "Today";
+            monthLabel.Text = "30 days";
+            todayMetric.SetText($"{FormatCurrency(insights.TodayEstimatedCostUsd)} · {FormatTokens(insights.TodayTokens)}");
+            monthMetric.SetText($"{FormatCurrency(insights.Last30DaysEstimatedCostUsd)} · {FormatTokens(insights.Last30DaysTokens)}");
             dailyChart.SetData(insights.Daily, insights.HasUsage ? null : "No token rows found");
             modelChart.SetData(insights.Models, insights.HasUsage ? null : "No model data found");
         }
@@ -798,8 +872,10 @@ public sealed class UsagePopupForm : Form
                 return;
             }
 
-            todayLabel.Bounds = new Rectangle(left, ScaleInt(66, layoutScale), ScaleInt(168, layoutScale), ScaleInt(38, layoutScale));
-            monthLabel.Bounds = new Rectangle(Width - ScaleInt(184, layoutScale), ScaleInt(66, layoutScale), ScaleInt(168, layoutScale), ScaleInt(38, layoutScale));
+            todayLabel.Bounds = new Rectangle(left, ScaleInt(66, layoutScale), ScaleInt(168, layoutScale), ScaleInt(18, layoutScale));
+            monthLabel.Bounds = new Rectangle(Width - ScaleInt(184, layoutScale), ScaleInt(66, layoutScale), ScaleInt(168, layoutScale), ScaleInt(18, layoutScale));
+            todayMetric.Bounds = new Rectangle(left, ScaleInt(86, layoutScale), ScaleInt(168, layoutScale), ScaleInt(18, layoutScale));
+            monthMetric.Bounds = new Rectangle(Width - ScaleInt(184, layoutScale), ScaleInt(86, layoutScale), ScaleInt(168, layoutScale), ScaleInt(18, layoutScale));
             dailyChart.Bounds = new Rectangle(left, ScaleInt(112, layoutScale), Width - left - right, ScaleInt(150, layoutScale));
             modelChart.Bounds = new Rectangle(left, ScaleInt(278, layoutScale), Width - left - right, ScaleInt(78, layoutScale));
         }
@@ -836,6 +912,69 @@ public sealed class UsagePopupForm : Form
             }
 
             return $"{tokens} tok";
+        }
+    }
+
+    private sealed class HistoryMetricLabel : Control
+    {
+        private string text = "--";
+        private bool loading;
+        private float loadingPhase;
+        private ThemePalette theme = ThemePalette.FromWindows();
+
+        public HistoryMetricLabel()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
+        }
+
+        [System.ComponentModel.Browsable(false)]
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public float LoadingPhase
+        {
+            get => loadingPhase;
+            set
+            {
+                loadingPhase = WrapPhase(value);
+                if (loading)
+                {
+                    Invalidate();
+                }
+            }
+        }
+
+        public void ApplyTheme(ThemePalette palette)
+        {
+            theme = palette;
+            BackColor = theme.Card;
+            Invalidate();
+        }
+
+        public void SetLoading()
+        {
+            loading = true;
+            text = string.Empty;
+            Invalidate();
+        }
+
+        public void SetText(string value)
+        {
+            loading = false;
+            text = value;
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            if (loading)
+            {
+                DrawSkeletonPill(e.Graphics, ClientRectangle, theme, loadingPhase);
+                return;
+            }
+
+            using var brush = new SolidBrush(theme.TextPrimary);
+            using var font = CreateFont("Segoe UI Variable Text", 8.5f, FontStyle.Bold);
+            e.Graphics.DrawString(text, font, brush, ClientRectangle);
         }
     }
 
@@ -960,12 +1099,29 @@ public sealed class UsagePopupForm : Form
         private IReadOnlyList<CodexDailyUsage> daily = [];
         private string? emptyMessage;
         private ThemePalette theme = ThemePalette.FromWindows();
+        private bool loading;
+        private float loadingPhase;
         private int hoveredIndex = -1;
         private string? lastToolTipText;
 
         [System.ComponentModel.Browsable(false)]
         [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
         public float LayoutScale { get; set; } = 1f;
+
+        [System.ComponentModel.Browsable(false)]
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public float LoadingPhase
+        {
+            get => loadingPhase;
+            set
+            {
+                loadingPhase = WrapPhase(value);
+                if (loading)
+                {
+                    Invalidate();
+                }
+            }
+        }
 
         public DailyHistoryChart()
         {
@@ -982,8 +1138,20 @@ public sealed class UsagePopupForm : Form
 
         public void SetData(IReadOnlyList<CodexDailyUsage> data, string? message)
         {
+            loading = false;
             daily = data;
             emptyMessage = message;
+            hoveredIndex = -1;
+            lastToolTipText = null;
+            toolTip.SetToolTip(this, null);
+            Invalidate();
+        }
+
+        public void SetLoading()
+        {
+            loading = true;
+            daily = [];
+            emptyMessage = null;
             hoveredIndex = -1;
             lastToolTipText = null;
             toolTip.SetToolTip(this, null);
@@ -1037,6 +1205,12 @@ public sealed class UsagePopupForm : Form
             e.Graphics.DrawString("Estimated spend by day", titleFont, titleBrush, titleBounds);
 
             var chartBounds = ChartBounds;
+            if (loading)
+            {
+                DrawDailyLoading(e.Graphics, chartBounds, theme, LayoutScale, loadingPhase);
+                return;
+            }
+
             if (daily.Count == 0 || daily.All(day => day.EstimatedCostUsd <= 0))
             {
                 DrawEmpty(e.Graphics, chartBounds, emptyMessage ?? "No spend data");
@@ -1102,12 +1276,29 @@ public sealed class UsagePopupForm : Form
         private IReadOnlyList<CodexModelUsage> models = [];
         private string? emptyMessage;
         private ThemePalette theme = ThemePalette.FromWindows();
+        private bool loading;
+        private float loadingPhase;
         private int hoveredIndex = -1;
         private string? lastToolTipText;
 
         [System.ComponentModel.Browsable(false)]
         [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
         public float LayoutScale { get; set; } = 1f;
+
+        [System.ComponentModel.Browsable(false)]
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public float LoadingPhase
+        {
+            get => loadingPhase;
+            set
+            {
+                loadingPhase = WrapPhase(value);
+                if (loading)
+                {
+                    Invalidate();
+                }
+            }
+        }
 
         public ModelBreakdownChart()
         {
@@ -1124,8 +1315,20 @@ public sealed class UsagePopupForm : Form
 
         public void SetData(IReadOnlyList<CodexModelUsage> data, string? message)
         {
+            loading = false;
             models = data;
             emptyMessage = message;
+            hoveredIndex = -1;
+            lastToolTipText = null;
+            toolTip.SetToolTip(this, null);
+            Invalidate();
+        }
+
+        public void SetLoading()
+        {
+            loading = true;
+            models = [];
+            emptyMessage = null;
             hoveredIndex = -1;
             lastToolTipText = null;
             toolTip.SetToolTip(this, null);
@@ -1180,6 +1383,12 @@ public sealed class UsagePopupForm : Form
             e.Graphics.DrawString("Usage breakdown by model", titleFont, titleBrush, titleBounds);
 
             var chartBounds = BarBounds;
+            if (loading)
+            {
+                DrawModelLoading(e.Graphics, chartBounds, Width, theme, LayoutScale, loadingPhase);
+                return;
+            }
+
             if (models.Count == 0 || models.All(model => model.TotalTokens <= 0))
             {
                 DrawEmpty(e.Graphics, new Rectangle(0, ScaleInt(18, LayoutScale), Width, Height - ScaleInt(18, LayoutScale)), emptyMessage ?? "No model data");
@@ -1268,6 +1477,70 @@ public sealed class UsagePopupForm : Form
 
             return model[..12] + "…";
         }
+    }
+
+    private static void DrawDailyLoading(Graphics graphics, Rectangle chartBounds, ThemePalette theme, float scale, float phase)
+    {
+        var inset = ScaleInt(4, scale);
+        var block = Rectangle.Inflate(chartBounds, -inset, -inset);
+        using (var borderPen = new Pen(Color.FromArgb(theme.IsDark ? 42 : 70, theme.TextSecondary)))
+        using (var path = RoundedPath(block, ScaleInt(10, scale)))
+        {
+            graphics.DrawPath(borderPen, path);
+        }
+
+        var top = block.Top + ScaleInt(18, scale);
+        var left = block.Left + ScaleInt(18, scale);
+        var width = block.Width - ScaleInt(36, scale);
+        DrawSkeletonPill(graphics, new Rectangle(left, top, (int)(width * 0.72), ScaleInt(12, scale)), theme, phase);
+        DrawSkeletonPill(graphics, new Rectangle(left, top + ScaleInt(28, scale), (int)(width * 0.88), ScaleInt(12, scale)), theme, WrapPhase(phase + 0.18f));
+        DrawSkeletonPill(graphics, new Rectangle(left, top + ScaleInt(56, scale), (int)(width * 0.54), ScaleInt(12, scale)), theme, WrapPhase(phase + 0.36f));
+
+        using var textBrush = new SolidBrush(theme.TextSecondary);
+        using var font = CreateFont("Segoe UI Variable Text", 7f, FontStyle.Regular);
+        graphics.DrawString("Scanning usage history...", font, textBrush, new RectangleF(chartBounds.Left, chartBounds.Bottom + 1, chartBounds.Width, ScaleInt(14, scale)));
+    }
+
+    private static void DrawModelLoading(Graphics graphics, Rectangle barBounds, int width, ThemePalette theme, float scale, float phase)
+    {
+        DrawSkeletonPill(graphics, barBounds, theme, phase);
+        var y = barBounds.Bottom + ScaleInt(14, scale);
+        var columnWidth = width / 2;
+        DrawSkeletonPill(graphics, new Rectangle(0, y, Math.Max(40, columnWidth - ScaleInt(34, scale)), ScaleInt(9, scale)), theme, WrapPhase(phase + 0.2f));
+        DrawSkeletonPill(graphics, new Rectangle(columnWidth, y, Math.Max(40, columnWidth - ScaleInt(34, scale)), ScaleInt(9, scale)), theme, WrapPhase(phase + 0.38f));
+    }
+
+    private static void DrawSkeletonPill(Graphics graphics, Rectangle bounds, ThemePalette theme, float phase)
+    {
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+        {
+            return;
+        }
+
+        var baseColor = theme.MeterTrack;
+        var highlightColor = Color.FromArgb(
+            theme.IsDark ? 82 : 165,
+            Math.Min(255, theme.Accent.R + 24),
+            Math.Min(255, theme.Accent.G + 24),
+            Math.Min(255, theme.Accent.B + 24));
+        using var brush = new SolidBrush(baseColor);
+        using var highlight = new SolidBrush(highlightColor);
+        using var path = RoundedPath(bounds, Math.Max(4, bounds.Height / 2));
+        graphics.FillPath(brush, path);
+
+        var state = graphics.Save();
+        graphics.SetClip(path);
+        var shineWidth = Math.Max(18, bounds.Width / 3);
+        var travel = bounds.Width + (shineWidth * 2);
+        var x = bounds.Left - shineWidth + (int)Math.Round(travel * WrapPhase(phase));
+        graphics.FillRectangle(highlight, new Rectangle(x, bounds.Top, shineWidth, bounds.Height));
+        graphics.Restore(state);
+    }
+
+    private static float WrapPhase(float phase)
+    {
+        phase %= 1f;
+        return phase < 0 ? phase + 1f : phase;
     }
 
     private static void DrawDailyAxis(Graphics graphics, Rectangle chartBounds, IReadOnlyList<CodexDailyUsage> daily)
