@@ -874,9 +874,9 @@ public sealed class UsagePopupForm : Form
 
             todayLabel.Bounds = new Rectangle(left, ScaleInt(66, layoutScale), ScaleInt(168, layoutScale), ScaleInt(18, layoutScale));
             monthLabel.Bounds = new Rectangle(Width - ScaleInt(184, layoutScale), ScaleInt(66, layoutScale), ScaleInt(168, layoutScale), ScaleInt(18, layoutScale));
-            todayMetric.Bounds = new Rectangle(left, ScaleInt(86, layoutScale), ScaleInt(168, layoutScale), ScaleInt(18, layoutScale));
-            monthMetric.Bounds = new Rectangle(Width - ScaleInt(184, layoutScale), ScaleInt(86, layoutScale), ScaleInt(168, layoutScale), ScaleInt(18, layoutScale));
-            dailyChart.Bounds = new Rectangle(left, ScaleInt(112, layoutScale), Width - left - right, ScaleInt(150, layoutScale));
+            todayMetric.Bounds = new Rectangle(left, ScaleInt(84, layoutScale), ScaleInt(168, layoutScale), ScaleInt(34, layoutScale));
+            monthMetric.Bounds = new Rectangle(Width - ScaleInt(184, layoutScale), ScaleInt(84, layoutScale), ScaleInt(168, layoutScale), ScaleInt(34, layoutScale));
+            dailyChart.Bounds = new Rectangle(left, ScaleInt(124, layoutScale), Width - left - right, ScaleInt(138, layoutScale));
             modelChart.Bounds = new Rectangle(left, ScaleInt(278, layoutScale), Width - left - right, ScaleInt(78, layoutScale));
         }
 
@@ -892,7 +892,7 @@ public sealed class UsagePopupForm : Form
         private static string FormatMetric(decimal totalCost, decimal fastCost, long tokens)
         {
             var text = $"{FormatCurrency(totalCost)} · {FormatTokens(tokens)}";
-            return fastCost > 0 ? $"{text} · fast {FormatCurrency(fastCost)}" : text;
+            return fastCost > 0 ? $"{text}\nfast {FormatCurrency(fastCost)}" : text;
         }
 
         private static string FormatCurrency(decimal value)
@@ -907,6 +907,11 @@ public sealed class UsagePopupForm : Form
 
         public static string FormatTokens(long tokens)
         {
+            if (tokens >= 1_000_000_000)
+            {
+                return $"{tokens / 1_000_000_000d:0.##}B tok";
+            }
+
             if (tokens >= 1_000_000)
             {
                 return $"{tokens / 1_000_000d:0.#}M tok";
@@ -979,8 +984,14 @@ public sealed class UsagePopupForm : Form
             }
 
             using var brush = new SolidBrush(theme.TextPrimary);
-            using var font = CreateFont("Segoe UI Variable Text", 8.5f, FontStyle.Bold);
-            e.Graphics.DrawString(text, font, brush, ClientRectangle);
+            using var font = CreateFont("Segoe UI Variable Text", 8.25f, FontStyle.Bold);
+            using var format = new StringFormat(StringFormatFlags.NoWrap)
+            {
+                Trimming = StringTrimming.None,
+                LineAlignment = StringAlignment.Near,
+                Alignment = StringAlignment.Near
+            };
+            e.Graphics.DrawString(text, font, brush, ClientRectangle, format);
         }
     }
 
