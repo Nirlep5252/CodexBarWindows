@@ -121,7 +121,7 @@ The PowerShell scripts are grouped under `Scripts/` because they are the primary
 The app version is defined in [Directory.Build.props](Directory.Build.props):
 
 ```xml
-<VersionPrefix>0.3.2</VersionPrefix>
+<VersionPrefix>0.3.3</VersionPrefix>
 ```
 
 Use semantic versions in the form `major.minor.patch`. MSI upgrades use this version, and the updater compares it against GitHub release tags.
@@ -129,8 +129,8 @@ Use semantic versions in the form `major.minor.patch`. MSI upgrades use this ver
 To publish a new version:
 
 ```powershell
-git tag v0.3.2
-git push origin v0.3.2
+git tag v0.3.3
+git push origin v0.3.3
 ```
 
 The GitHub Actions release workflow builds an MSI and attaches it to a GitHub Release.
@@ -143,8 +143,8 @@ You can also right-click the tray icon and choose `Check for updates`.
 
 Release requirements:
 
-- Tags must look like `v0.3.2`.
-- The release must include an MSI asset, for example `CodexBarWindows-0.3.2-win-x64.msi`.
+- Tags must look like `v0.3.3`.
+- The release must include an MSI asset, for example `CodexBarWindows-0.3.3-win-x64.msi`.
 - The new version must be greater than the installed assembly version.
 
 For private repositories, GitHub release checks require authentication. The app checks these sources in order:

@@ -833,8 +833,8 @@ public sealed class UsagePopupForm : Form
             subtitleLabel.Text = IsExpanded ? expandedSubtitle : "History hidden. Click to expand.";
             todayLabel.Text = "Today";
             monthLabel.Text = "30 days";
-            todayMetric.SetText($"{FormatCurrency(insights.TodayEstimatedCostUsd)} · {FormatTokens(insights.TodayTokens)}");
-            monthMetric.SetText($"{FormatCurrency(insights.Last30DaysEstimatedCostUsd)} · {FormatTokens(insights.Last30DaysTokens)}");
+            todayMetric.SetText(FormatMetric(insights.TodayEstimatedCostUsd, insights.TodayFastEstimatedCostUsd, insights.TodayTokens));
+            monthMetric.SetText(FormatMetric(insights.Last30DaysEstimatedCostUsd, insights.Last30DaysFastEstimatedCostUsd, insights.Last30DaysTokens));
             dailyChart.SetData(insights.Daily, insights.HasUsage ? null : "No token rows found");
             modelChart.SetData(insights.Models, insights.HasUsage ? null : "No model data found");
         }
@@ -887,6 +887,12 @@ public sealed class UsagePopupForm : Form
                 AutoSize = false,
                 Font = CreateFont("Segoe UI Variable Text", 8.5f, FontStyle.Bold)
             };
+        }
+
+        private static string FormatMetric(decimal totalCost, decimal fastCost, long tokens)
+        {
+            var text = $"{FormatCurrency(totalCost)} · {FormatTokens(tokens)}";
+            return fastCost > 0 ? $"{text} · fast {FormatCurrency(fastCost)}" : text;
         }
 
         private static string FormatCurrency(decimal value)
@@ -1171,7 +1177,13 @@ public sealed class UsagePopupForm : Form
             if (index >= 0 && index < daily.Count)
             {
                 var day = daily[index];
-                var text = $"{day.Day:MMM d}: {FormatUsd(day.EstimatedCostUsd)}\n{CodexInsightsSection.FormatTokens(day.TotalTokens)} total, {CodexInsightsSection.FormatTokens(day.OutputTokens)} output";
+                var categoryLines = DailySpendCategories(day).Count == 0
+                    ? string.Empty
+                    : "\n" + string.Join("\n", DailySpendCategories(day)
+                        .OrderByDescending(category => category.EstimatedCostUsd)
+                        .Take(4)
+                        .Select(category => $"{ShortSpendLabel(category.Label)} {FormatUsd(category.EstimatedCostUsd)}"));
+                var text = $"{day.Day:MMM d}: {FormatUsd(day.EstimatedCostUsd)}{categoryLines}\n{CodexInsightsSection.FormatTokens(day.TotalTokens)} total, {CodexInsightsSection.FormatTokens(day.OutputTokens)} output";
                 if (text != lastToolTipText)
                 {
                     lastToolTipText = text;
@@ -1203,6 +1215,7 @@ public sealed class UsagePopupForm : Form
             using var titleBrush = new SolidBrush(theme.TextSecondary);
             using var titleFont = CreateFont("Segoe UI Variable Text", 7.5f, FontStyle.Regular);
             e.Graphics.DrawString("Estimated spend by day", titleFont, titleBrush, titleBounds);
+            DrawSpendCategoryLegend(e.Graphics, new Rectangle(Width - ScaleInt(150, LayoutScale), 0, ScaleInt(150, LayoutScale), ScaleInt(16, LayoutScale)), TopSpendCategories(daily), theme, LayoutScale);
 
             var chartBounds = ChartBounds;
             if (loading)
@@ -1222,19 +1235,35 @@ public sealed class UsagePopupForm : Form
             var barWidth = BarWidth(chartBounds, gap);
             var x = chartBounds.Left;
             using var trackBrush = new SolidBrush(theme.MeterTrack);
-            using var fillBrush = new SolidBrush(theme.Accent);
-            using var hoverBrush = new SolidBrush(ControlPaint.Light(theme.Accent));
             using var hoverPen = new Pen(theme.TextPrimary, 1f);
             for (var index = 0; index < daily.Count; index++)
             {
                 var day = daily[index];
                 var track = new Rectangle(x, chartBounds.Top, barWidth, chartBounds.Height);
                 e.Graphics.FillRectangle(trackBrush, track);
-                var height = (int)Math.Round(chartBounds.Height * (double)(day.EstimatedCostUsd / max));
-                if (height > 0)
+                var totalHeight = (int)Math.Round(chartBounds.Height * (double)(day.EstimatedCostUsd / max));
+                var categories = DailySpendCategories(day).Where(category => category.EstimatedCostUsd > 0).ToArray();
+                if (totalHeight > 0 && categories.Length > 0)
                 {
-                    var fill = new Rectangle(x, chartBounds.Bottom - height, barWidth, height);
-                    e.Graphics.FillRectangle(index == hoveredIndex ? hoverBrush : fillBrush, fill);
+                    var paintedHeight = 0;
+                    for (var categoryIndex = 0; categoryIndex < categories.Length; categoryIndex++)
+                    {
+                        var category = categories[categoryIndex];
+                        var height = categoryIndex == categories.Length - 1
+                            ? totalHeight - paintedHeight
+                            : (int)Math.Round(totalHeight * (double)(category.EstimatedCostUsd / day.EstimatedCostUsd));
+                        height = Math.Clamp(height, 0, totalHeight - paintedHeight);
+                        if (height <= 0)
+                        {
+                            continue;
+                        }
+
+                        var color = SpendCategoryColor(category.Label, theme);
+                        using var brush = new SolidBrush(index == hoveredIndex ? ControlPaint.Light(color) : color);
+                        var fill = new Rectangle(x, chartBounds.Bottom - paintedHeight - height, barWidth, height);
+                        e.Graphics.FillRectangle(brush, fill);
+                        paintedHeight += height;
+                    }
                 }
 
                 if (index == hoveredIndex)
@@ -1349,7 +1378,8 @@ public sealed class UsagePopupForm : Form
             if (index >= 0 && index < top.Length)
             {
                 var model = top[index];
-                var text = $"{model.Model}\n{CodexInsightsSection.FormatTokens(model.TotalTokens)} total, {CodexInsightsSection.FormatTokens(model.OutputTokens)} output\nEstimated {FormatUsd(model.EstimatedCostUsd)}";
+                var fastLine = model.FastEstimatedCostUsd > 0 ? $"\nFast {FormatUsd(model.FastEstimatedCostUsd)}, regular {FormatUsd(model.RegularEstimatedCostUsd)}" : string.Empty;
+                var text = $"{model.Model}\nEstimated {FormatUsd(model.EstimatedCostUsd)}{fastLine}\n{CodexInsightsSection.FormatTokens(model.TotalTokens)} total, {CodexInsightsSection.FormatTokens(model.OutputTokens)} output";
                 if (text != lastToolTipText)
                 {
                     lastToolTipText = text;
@@ -1380,7 +1410,7 @@ public sealed class UsagePopupForm : Form
             var titleBounds = new Rectangle(0, 0, Width, ScaleInt(16, LayoutScale));
             using var titleBrush = new SolidBrush(theme.TextSecondary);
             using var titleFont = CreateFont("Segoe UI Variable Text", 7.5f, FontStyle.Regular);
-            e.Graphics.DrawString("Usage breakdown by model", titleFont, titleBrush, titleBounds);
+            e.Graphics.DrawString("Estimated spend by model", titleFont, titleBrush, titleBounds);
 
             var chartBounds = BarBounds;
             if (loading)
@@ -1389,23 +1419,23 @@ public sealed class UsagePopupForm : Form
                 return;
             }
 
-            if (models.Count == 0 || models.All(model => model.TotalTokens <= 0))
+            if (models.Count == 0 || models.All(model => model.EstimatedCostUsd <= 0))
             {
                 DrawEmpty(e.Graphics, new Rectangle(0, ScaleInt(18, LayoutScale), Width, Height - ScaleInt(18, LayoutScale)), emptyMessage ?? "No model data");
                 return;
             }
 
             var top = TopModels;
-            var total = Math.Max(1, top.Sum(model => model.TotalTokens));
+            var total = Math.Max(0.01m, top.Sum(model => model.EstimatedCostUsd));
             var x = chartBounds.Left;
-            var colors = SegmentColors;
             for (var index = 0; index < top.Length; index++)
             {
                 var width = index == top.Length - 1
                     ? chartBounds.Right - x
-                    : Math.Max(1, (int)Math.Round(chartBounds.Width * (top[index].TotalTokens / (double)total)));
+                    : Math.Max(1, (int)Math.Round(chartBounds.Width * (double)(top[index].EstimatedCostUsd / total)));
                 var segment = new Rectangle(x, chartBounds.Top, width, chartBounds.Height);
-                using var brush = new SolidBrush(index == hoveredIndex ? ControlPaint.Light(colors[index % colors.Length]) : colors[index % colors.Length]);
+                var color = SegmentColor(top[index]);
+                using var brush = new SolidBrush(index == hoveredIndex ? ControlPaint.Light(color) : color);
                 e.Graphics.FillRectangle(brush, segment);
                 if (index == hoveredIndex)
                 {
@@ -1416,14 +1446,17 @@ public sealed class UsagePopupForm : Form
                 x += width;
             }
 
-            DrawLegend(e.Graphics, top, colors);
+            DrawLegend(e.Graphics, top);
         }
 
         private CodexModelUsage[] TopModels => models.Take(4).ToArray();
 
         private Rectangle BarBounds => new(0, ScaleInt(19, LayoutScale), Width, ScaleInt(10, LayoutScale));
 
-        private Color[] SegmentColors => [theme.Accent, Color.FromArgb(16, 124, 16), theme.Warning, Color.FromArgb(134, 97, 197)];
+        private Color SegmentColor(CodexModelUsage model)
+        {
+            return SpendCategoryColor(model.Model, theme);
+        }
 
         private int HitTest(Point point)
         {
@@ -1433,13 +1466,13 @@ public sealed class UsagePopupForm : Form
                 return -1;
             }
 
-            var total = Math.Max(1, top.Sum(model => model.TotalTokens));
+            var total = Math.Max(0.01m, top.Sum(model => model.EstimatedCostUsd));
             var x = BarBounds.Left;
             for (var index = 0; index < top.Length; index++)
             {
                 var width = index == top.Length - 1
                     ? BarBounds.Right - x
-                    : Math.Max(1, (int)Math.Round(BarBounds.Width * (top[index].TotalTokens / (double)total)));
+                    : Math.Max(1, (int)Math.Round(BarBounds.Width * (double)(top[index].EstimatedCostUsd / total)));
                 if (point.X >= x && point.X <= x + width)
                 {
                     return index;
@@ -1451,7 +1484,7 @@ public sealed class UsagePopupForm : Form
             return -1;
         }
 
-        private void DrawLegend(Graphics graphics, IReadOnlyList<CodexModelUsage> top, IReadOnlyList<Color> colors)
+        private void DrawLegend(Graphics graphics, IReadOnlyList<CodexModelUsage> top)
         {
             using var textBrush = new SolidBrush(theme.TextSecondary);
             using var font = CreateFont("Segoe UI Variable Text", 7.25f, FontStyle.Regular);
@@ -1461,9 +1494,9 @@ public sealed class UsagePopupForm : Form
             {
                 var x = (index % 2) * columnWidth;
                 var rowY = y + (index / 2) * ScaleInt(16, LayoutScale);
-                using var dotBrush = new SolidBrush(colors[index % colors.Count]);
+                using var dotBrush = new SolidBrush(SegmentColor(top[index]));
                 graphics.FillEllipse(dotBrush, x, rowY + ScaleInt(4, LayoutScale), ScaleInt(7, LayoutScale), ScaleInt(7, LayoutScale));
-                var label = $"{ShortModel(top[index].Model)} {CodexInsightsSection.FormatTokens(top[index].TotalTokens)}";
+                var label = $"{ShortModel(top[index].Model)} {FormatUsd(top[index].EstimatedCostUsd)}";
                 graphics.DrawString(label, font, textBrush, new RectangleF(x + ScaleInt(11, LayoutScale), rowY, columnWidth - ScaleInt(13, LayoutScale), ScaleInt(16, LayoutScale)));
             }
         }
@@ -1557,6 +1590,119 @@ public sealed class UsagePopupForm : Form
         graphics.DrawString(first, font, textBrush, new RectangleF(chartBounds.Left, chartBounds.Bottom + 1, chartBounds.Width / 2f, 14));
         var lastSize = graphics.MeasureString(last, font);
         graphics.DrawString(last, font, textBrush, new PointF(chartBounds.Right - lastSize.Width, chartBounds.Bottom + 1));
+    }
+
+    private static void DrawSpendCategoryLegend(Graphics graphics, Rectangle bounds, IReadOnlyList<CodexSpendCategory> categories, ThemePalette theme, float scale)
+    {
+        if (categories.Count == 0)
+        {
+            return;
+        }
+
+        using var textBrush = new SolidBrush(theme.TextSecondary);
+        using var font = CreateFont("Segoe UI Variable Text", 7f, FontStyle.Regular);
+        var dot = ScaleInt(6, scale);
+        var y = bounds.Top + ScaleInt(5, scale);
+        var x = bounds.Left + ScaleInt(4, scale);
+        foreach (var category in categories.Take(3))
+        {
+            using var dotBrush = new SolidBrush(SpendCategoryColor(category.Label, theme));
+            graphics.FillEllipse(dotBrush, x, y, dot, dot);
+            var label = ShortSpendLabel(category.Label);
+            graphics.DrawString(label, font, textBrush, x + dot + ScaleInt(3, scale), bounds.Top);
+            x += ScaleInt(label.Contains("fast", StringComparison.OrdinalIgnoreCase) ? 52 : 44, scale);
+        }
+    }
+
+    private static IReadOnlyList<CodexSpendCategory> TopSpendCategories(IReadOnlyList<CodexDailyUsage> daily)
+    {
+        return daily
+            .SelectMany(DailySpendCategories)
+            .GroupBy(category => category.Label, StringComparer.OrdinalIgnoreCase)
+            .Select(group => new CodexSpendCategory(group.Key, group.Sum(category => category.EstimatedCostUsd)))
+            .OrderByDescending(category => category.EstimatedCostUsd)
+            .Take(3)
+            .ToArray();
+    }
+
+    private static IReadOnlyList<CodexSpendCategory> DailySpendCategories(CodexDailyUsage day)
+    {
+        if (day.Categories.Count > 0)
+        {
+            return day.Categories
+                .Where(category => category.EstimatedCostUsd > 0)
+                .OrderBy(category => category.Label.Contains(" fast", StringComparison.OrdinalIgnoreCase) ? 1 : 0)
+                .ThenBy(category => category.Label, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+
+        var categories = new List<CodexSpendCategory>();
+        if (day.RegularEstimatedCostUsd > 0)
+        {
+            categories.Add(new CodexSpendCategory("regular", day.RegularEstimatedCostUsd));
+        }
+        if (day.FastEstimatedCostUsd > 0)
+        {
+            categories.Add(new CodexSpendCategory("fast", day.FastEstimatedCostUsd));
+        }
+        return categories;
+    }
+
+    private static Color SpendCategoryColor(string label, ThemePalette theme)
+    {
+        var normalized = label.Replace(" fast", string.Empty, StringComparison.OrdinalIgnoreCase).ToLowerInvariant();
+        if (label.Contains("fast", StringComparison.OrdinalIgnoreCase))
+        {
+            return theme.Warning;
+        }
+
+        if (normalized.Contains("gpt-5.5", StringComparison.OrdinalIgnoreCase))
+        {
+            return theme.Accent;
+        }
+
+        if (normalized.Contains("gpt-5.4", StringComparison.OrdinalIgnoreCase) || normalized == "regular")
+        {
+            return Color.FromArgb(134, 97, 197);
+        }
+
+        if (normalized.Contains("gpt-5.3", StringComparison.OrdinalIgnoreCase))
+        {
+            return Color.FromArgb(16, 124, 16);
+        }
+
+        if (normalized.Contains("gpt-5.2", StringComparison.OrdinalIgnoreCase))
+        {
+            return theme.Danger;
+        }
+
+        return ModelPalette[StableColorIndex(normalized, ModelPalette.Length)];
+    }
+
+    private static string ShortSpendLabel(string label)
+    {
+        var normalized = label.Replace("gpt-", string.Empty, StringComparison.OrdinalIgnoreCase);
+        normalized = normalized.Replace("-codex", string.Empty, StringComparison.OrdinalIgnoreCase);
+        return normalized.Length <= 8 ? normalized : normalized[..7] + "…";
+    }
+
+    private static Color[] ModelPalette =>
+    [
+        Color.FromArgb(0, 95, 184),
+        Color.FromArgb(16, 124, 16),
+        Color.FromArgb(134, 97, 197),
+        Color.FromArgb(196, 86, 9),
+    ];
+
+    private static int StableColorIndex(string value, int length)
+    {
+        var hash = 17;
+        foreach (var character in value)
+        {
+            hash = unchecked((hash * 31) + character);
+        }
+
+        return (hash & int.MaxValue) % Math.Max(1, length);
     }
 
     private static string FormatUsd(decimal value)

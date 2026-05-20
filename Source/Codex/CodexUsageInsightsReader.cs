@@ -88,7 +88,9 @@ public sealed class CodexUsageInsightsReader
                 todayUsage.TotalTokens,
                 todayUsage.EstimatedCostUsd,
                 dailyRows.Sum(row => row.TotalTokens),
-                dailyRows.Sum(row => row.EstimatedCostUsd));
+                dailyRows.Sum(row => row.EstimatedCostUsd),
+                todayUsage.FastEstimatedCostUsd,
+                dailyRows.Sum(row => row.FastEstimatedCostUsd));
 
             var error = result.HasUsage ? null : "No token usage entries were found in recent Codex or pi session logs.";
             return new CodexUsageInsightsLookupResult(result, error);
@@ -243,7 +245,7 @@ public sealed class CodexUsageInsightsReader
                     continue;
                 }
 
-                Add(daily, day.Value, model, delta);
+                Add(daily, day.Value, model, delta, categoryLabel: ModelBreakdownLabel(model, isFastMode: false));
                 Add(models, NormalizeModelName(model), model, delta);
             }
             catch
@@ -325,15 +327,18 @@ public sealed class CodexUsageInsightsReader
                 var cacheWrite = ReadLong(usage, "cacheWrite", "cacheWriteTokens", "cache_write", "cache_write_tokens", "cacheCreationTokens", "cache_creation_tokens", "cacheCreationInputTokens", "cache_creation_input_tokens");
                 var output = ReadLong(usage, "output", "outputTokens", "output_tokens", "completionTokens", "completion_tokens");
                 var directTotal = ReadLong(usage, "totalTokens", "total_tokens", "tokenCount", "token_count", "tokens");
-                if (input == 0 && cacheRead == 0 && cacheWrite == 0 && output == 0 && directTotal == 0)
+                var exactCost = ReadUsageCostUsd(usage);
+                if (input == 0 && cacheRead == 0 && cacheWrite == 0 && output == 0 && directTotal == 0 && exactCost is null)
                 {
                     continue;
                 }
 
                 var effectiveInput = Math.Max(input + cacheRead + cacheWrite, Math.Max(0, directTotal - output));
                 var tokens = new TokenTotals(effectiveInput, Math.Min(cacheRead, effectiveInput), output);
-                Add(daily, day.Value, model, tokens);
-                Add(models, NormalizeModelName(model), model, tokens);
+                var isFastMode = IsFastMode(root, message, usage, model, tokens, exactCost);
+                var categoryLabel = ModelBreakdownLabel(model, isFastMode);
+                Add(daily, day.Value, model, tokens, isFastMode, exactCost, categoryLabel);
+                Add(models, ModelBreakdownKey(model, isFastMode), model, tokens, isFastMode, exactCost, categoryLabel);
             }
             catch
             {
@@ -418,6 +423,67 @@ public sealed class CodexUsageInsightsReader
         return 0;
     }
 
+    private static decimal? ReadUsageCostUsd(JsonElement usage)
+    {
+        if (!usage.TryGetProperty("cost", out var cost))
+        {
+            return null;
+        }
+
+        if (cost.ValueKind is JsonValueKind.Number or JsonValueKind.String)
+        {
+            return ReadDecimal(cost);
+        }
+
+        if (cost.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        foreach (var propertyName in new[] { "total", "totalUsd", "totalUSD", "usd", "costUsd", "costUSD" })
+        {
+            if (cost.TryGetProperty(propertyName, out var value) && ReadDecimal(value) is { } amount)
+            {
+                return amount;
+            }
+        }
+
+        var input = ReadCostPart(cost, "input");
+        var output = ReadCostPart(cost, "output");
+        var cacheRead = ReadCostPart(cost, "cacheRead", "cache_read");
+        var cacheWrite = ReadCostPart(cost, "cacheWrite", "cache_write", "cacheCreation", "cache_creation");
+        var sum = input + output + cacheRead + cacheWrite;
+        return sum > 0 ? sum : null;
+    }
+
+    private static decimal ReadCostPart(JsonElement cost, params string[] propertyNames)
+    {
+        foreach (var propertyName in propertyNames)
+        {
+            if (cost.TryGetProperty(propertyName, out var value) && ReadDecimal(value) is { } amount)
+            {
+                return amount;
+            }
+        }
+
+        return 0;
+    }
+
+    private static decimal? ReadDecimal(JsonElement value)
+    {
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetDecimal(out var number))
+        {
+            return Math.Max(0, number);
+        }
+
+        if (value.ValueKind == JsonValueKind.String && decimal.TryParse(value.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
+        {
+            return Math.Max(0, parsed);
+        }
+
+        return null;
+    }
+
     private static string? ReadModel(JsonElement element)
     {
         if (element.TryGetProperty("model", out var modelElement) && modelElement.ValueKind == JsonValueKind.String)
@@ -480,6 +546,66 @@ public sealed class CodexUsageInsightsReader
         return string.Equals(provider, "openai-codex", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsFastMode(JsonElement root, JsonElement message, JsonElement usage, string model, TokenTotals tokens, decimal? exactCostUsd)
+    {
+        if (HasFastModeMarker(message) || HasFastModeMarker(root) || HasFastModeMarker(usage))
+        {
+            return true;
+        }
+
+        if (exactCostUsd is not { } actualCost || actualCost <= 0)
+        {
+            return false;
+        }
+
+        if (EstimatePriorityCost(model, tokens) is not { } priorityCost)
+        {
+            return false;
+        }
+
+        var normalCost = EstimateCost(model, tokens);
+        return actualCost > normalCost * 1.2m && CostsAreClose(actualCost, priorityCost);
+    }
+
+    private static bool HasFastModeMarker(JsonElement element)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        foreach (var propertyName in new[] { "mode", "tier", "serviceTier", "service_tier", "priority", "fast" })
+        {
+            if (!element.TryGetProperty(propertyName, out var value))
+            {
+                continue;
+            }
+
+            if (value.ValueKind == JsonValueKind.True)
+            {
+                return propertyName.Contains("priority", StringComparison.OrdinalIgnoreCase) || propertyName.Contains("fast", StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (value.ValueKind == JsonValueKind.String)
+            {
+                var text = value.GetString();
+                if (text is not null &&
+                    (text.Contains("fast", StringComparison.OrdinalIgnoreCase) || text.Contains("priority", StringComparison.OrdinalIgnoreCase)))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool CostsAreClose(decimal left, decimal right)
+    {
+        var tolerance = Math.Max(0.000001m, Math.Abs(right) * 0.01m);
+        return Math.Abs(left - right) <= tolerance;
+    }
+
     private static DateOnly? DayFromText(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -493,7 +619,7 @@ public sealed class CodexUsageInsightsReader
             : null;
     }
 
-    private static void Add(IDictionary<DateOnly, MutableUsage> daily, DateOnly day, string model, TokenTotals tokens)
+    private static void Add(IDictionary<DateOnly, MutableUsage> daily, DateOnly day, string model, TokenTotals tokens, bool isFastMode = false, decimal? exactCostUsd = null, string? categoryLabel = null)
     {
         if (!daily.TryGetValue(day, out var usage))
         {
@@ -501,10 +627,10 @@ public sealed class CodexUsageInsightsReader
             daily[day] = usage;
         }
 
-        usage.Add(model, tokens);
+        usage.Add(model, tokens, isFastMode, exactCostUsd, categoryLabel: categoryLabel ?? ModelBreakdownLabel(model, isFastMode));
     }
 
-    private static void Add(IDictionary<string, MutableUsage> models, string key, string model, TokenTotals tokens)
+    private static void Add(IDictionary<string, MutableUsage> models, string key, string model, TokenTotals tokens, bool isFastMode = false, decimal? exactCostUsd = null, string? displayName = null)
     {
         if (!models.TryGetValue(key, out var usage))
         {
@@ -512,22 +638,34 @@ public sealed class CodexUsageInsightsReader
             models[key] = usage;
         }
 
-        usage.Add(model, tokens);
+        usage.Add(model, tokens, isFastMode, exactCostUsd, displayName: displayName ?? model);
     }
 
     private static CodexDailyUsage ToDaily(DateOnly day, MutableUsage usage)
     {
-        return new CodexDailyUsage(day, usage.InputTokens, usage.CachedInputTokens, usage.OutputTokens, usage.EstimatedCostUsd);
+        return new CodexDailyUsage(day, usage.InputTokens, usage.CachedInputTokens, usage.OutputTokens, usage.EstimatedCostUsd, usage.FastEstimatedCostUsd, usage.SpendCategories);
     }
 
     private static CodexModelUsage ToModel(string model, MutableUsage usage)
     {
-        return new CodexModelUsage(model, usage.InputTokens, usage.CachedInputTokens, usage.OutputTokens, usage.EstimatedCostUsd);
+        return new CodexModelUsage(usage.DisplayName ?? model, usage.InputTokens, usage.CachedInputTokens, usage.OutputTokens, usage.EstimatedCostUsd, usage.FastEstimatedCostUsd);
     }
 
     private static string NormalizeModelName(string model)
     {
         return string.IsNullOrWhiteSpace(model) ? "Codex model" : model.Trim().ToLowerInvariant();
+    }
+
+    private static string ModelBreakdownKey(string model, bool isFastMode)
+    {
+        var normalized = NormalizePricingModelName(model);
+        return isFastMode ? normalized + "|fast" : normalized;
+    }
+
+    private static string ModelBreakdownLabel(string model, bool isFastMode)
+    {
+        var label = string.IsNullOrWhiteSpace(model) ? "Codex model" : NormalizePricingModelName(model);
+        return isFastMode ? label + " fast" : label;
     }
 
     private static string ResolveCodexHome()
@@ -582,31 +720,84 @@ public sealed class CodexUsageInsightsReader
         public long CachedInputTokens { get; private set; }
         public long OutputTokens { get; private set; }
         public decimal EstimatedCostUsd { get; private set; }
+        public decimal FastEstimatedCostUsd { get; private set; }
+        public string? DisplayName { get; private set; }
+        private readonly Dictionary<string, decimal> spendCategories = new(StringComparer.OrdinalIgnoreCase);
 
-        public void Add(string model, TokenTotals tokens)
+        public IReadOnlyList<CodexSpendCategory> SpendCategories => spendCategories
+            .Select(pair => new CodexSpendCategory(pair.Key, pair.Value))
+            .OrderBy(category => category.Label.Contains(" fast", StringComparison.OrdinalIgnoreCase) ? 1 : 0)
+            .ThenBy(category => category.Label, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        public void Add(string model, TokenTotals tokens, bool isFastMode = false, decimal? exactCostUsd = null, string? displayName = null, string? categoryLabel = null)
         {
+            DisplayName ??= displayName;
             InputTokens += tokens.InputTokens;
             CachedInputTokens += tokens.CachedInputTokens;
             OutputTokens += tokens.OutputTokens;
-            EstimatedCostUsd += EstimateCost(model, tokens);
+
+            var cost = exactCostUsd ?? (isFastMode ? EstimatePriorityCost(model, tokens) ?? EstimateCost(model, tokens) : EstimateCost(model, tokens));
+            EstimatedCostUsd += cost;
+            if (isFastMode)
+            {
+                FastEstimatedCostUsd += cost;
+            }
+
+            if (cost > 0)
+            {
+                var label = categoryLabel ?? ModelBreakdownLabel(model, isFastMode);
+                spendCategories[label] = spendCategories.TryGetValue(label, out var existing) ? existing + cost : cost;
+            }
         }
     }
 
     private static decimal EstimateCost(string model, TokenTotals tokens)
     {
         var pricing = PricingFor(model);
-        var billableInput = Math.Max(0, tokens.InputTokens - tokens.CachedInputTokens);
-        return ((decimal)billableInput / 1_000_000m * pricing.InputPerMillion) +
-               ((decimal)tokens.CachedInputTokens / 1_000_000m * pricing.CachedInputPerMillion) +
-               ((decimal)tokens.OutputTokens / 1_000_000m * pricing.OutputPerMillion);
+        return EstimateCost(pricing, tokens, usePriorityRates: false);
     }
+
+    private static decimal? EstimatePriorityCost(string model, TokenTotals tokens)
+    {
+        var pricing = PricingFor(model);
+        if (tokens.InputTokens > PriorityInputTokenLimit ||
+            pricing.PriorityInputPerMillion is null ||
+            pricing.PriorityOutputPerMillion is null)
+        {
+            return null;
+        }
+
+        return EstimateCost(pricing, tokens, usePriorityRates: true);
+    }
+
+    private static decimal EstimateCost(ModelPricing pricing, TokenTotals tokens, bool usePriorityRates)
+    {
+        var billableInput = Math.Max(0, tokens.InputTokens - tokens.CachedInputTokens);
+        var usesLongContextRates = !usePriorityRates && pricing.ThresholdTokens is { } threshold && tokens.InputTokens > threshold;
+        var inputPerMillion = usePriorityRates
+            ? pricing.PriorityInputPerMillion ?? pricing.InputPerMillion
+            : usesLongContextRates ? pricing.InputPerMillionAboveThreshold ?? pricing.InputPerMillion : pricing.InputPerMillion;
+        var cachedInputPerMillion = usePriorityRates
+            ? pricing.PriorityCachedInputPerMillion ?? pricing.CachedInputPerMillion
+            : usesLongContextRates ? pricing.CachedInputPerMillionAboveThreshold ?? pricing.CachedInputPerMillion : pricing.CachedInputPerMillion;
+        var outputPerMillion = usePriorityRates
+            ? pricing.PriorityOutputPerMillion ?? pricing.OutputPerMillion
+            : usesLongContextRates ? pricing.OutputPerMillionAboveThreshold ?? pricing.OutputPerMillion : pricing.OutputPerMillion;
+
+        return ((decimal)billableInput / 1_000_000m * inputPerMillion) +
+               ((decimal)tokens.CachedInputTokens / 1_000_000m * cachedInputPerMillion) +
+               ((decimal)tokens.OutputTokens / 1_000_000m * outputPerMillion);
+    }
+
+    private const int PriorityInputTokenLimit = 272_000;
 
     private static ModelPricing PricingFor(string model)
     {
-        var normalized = model.ToLowerInvariant();
-        if (normalized.Contains("gpt-5", StringComparison.OrdinalIgnoreCase))
+        var normalized = NormalizePricingModelName(model);
+        if (CodexPricing.TryGetValue(normalized, out var pricing))
         {
-            return new ModelPricing(1.25m, 0.125m, 10.00m);
+            return pricing;
         }
 
         if (normalized.Contains("gpt-4.1", StringComparison.OrdinalIgnoreCase))
@@ -624,8 +815,69 @@ public sealed class CodexUsageInsightsReader
             return new ModelPricing(2.00m, 0.50m, 8.00m);
         }
 
-        return new ModelPricing(1.25m, 0.125m, 10.00m);
+        return CodexPricing["gpt-5"];
     }
 
-    private readonly record struct ModelPricing(decimal InputPerMillion, decimal CachedInputPerMillion, decimal OutputPerMillion);
+    private static string NormalizePricingModelName(string model)
+    {
+        var normalized = model.Trim().ToLowerInvariant();
+        const string openAiPrefix = "openai/";
+        if (normalized.StartsWith(openAiPrefix, StringComparison.Ordinal))
+        {
+            normalized = normalized[openAiPrefix.Length..];
+        }
+
+        if (CodexPricing.ContainsKey(normalized))
+        {
+            return normalized;
+        }
+
+        var datedSuffix = System.Text.RegularExpressions.Regex.Match(normalized, "-\\d{4}-\\d{2}-\\d{2}$");
+        if (datedSuffix.Success)
+        {
+            var withoutDate = normalized[..datedSuffix.Index];
+            if (CodexPricing.ContainsKey(withoutDate))
+            {
+                return withoutDate;
+            }
+        }
+
+        return normalized;
+    }
+
+    private static readonly IReadOnlyDictionary<string, ModelPricing> CodexPricing = new Dictionary<string, ModelPricing>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["gpt-5"] = new(1.25m, 0.125m, 10.00m),
+        ["gpt-5-codex"] = new(1.25m, 0.125m, 10.00m),
+        ["gpt-5-mini"] = new(0.25m, 0.025m, 2.00m),
+        ["gpt-5-nano"] = new(0.05m, 0.005m, 0.40m),
+        ["gpt-5-pro"] = new(15.00m, 15.00m, 120.00m),
+        ["gpt-5.1"] = new(1.25m, 0.125m, 10.00m),
+        ["gpt-5.1-codex"] = new(1.25m, 0.125m, 10.00m),
+        ["gpt-5.1-codex-max"] = new(1.25m, 0.125m, 10.00m),
+        ["gpt-5.1-codex-mini"] = new(0.25m, 0.025m, 2.00m),
+        ["gpt-5.2"] = new(1.75m, 0.175m, 14.00m),
+        ["gpt-5.2-codex"] = new(1.75m, 0.175m, 14.00m),
+        ["gpt-5.2-pro"] = new(21.00m, 21.00m, 168.00m),
+        ["gpt-5.3-codex"] = new(1.75m, 0.175m, 14.00m),
+        ["gpt-5.3-codex-spark"] = new(0.00m, 0.00m, 0.00m),
+        ["gpt-5.4"] = new(2.50m, 0.25m, 15.00m, ThresholdTokens: 272_000, InputPerMillionAboveThreshold: 5.00m, CachedInputPerMillionAboveThreshold: 0.50m, OutputPerMillionAboveThreshold: 22.50m, PriorityInputPerMillion: 5.00m, PriorityCachedInputPerMillion: 0.50m, PriorityOutputPerMillion: 30.00m),
+        ["gpt-5.4-mini"] = new(0.75m, 0.075m, 4.50m, PriorityInputPerMillion: 1.50m, PriorityCachedInputPerMillion: 0.15m, PriorityOutputPerMillion: 9.00m),
+        ["gpt-5.4-nano"] = new(0.20m, 0.020m, 1.25m),
+        ["gpt-5.4-pro"] = new(30.00m, 30.00m, 180.00m),
+        ["gpt-5.5"] = new(5.00m, 0.50m, 30.00m, ThresholdTokens: 272_000, InputPerMillionAboveThreshold: 10.00m, CachedInputPerMillionAboveThreshold: 1.00m, OutputPerMillionAboveThreshold: 45.00m, PriorityInputPerMillion: 12.50m, PriorityCachedInputPerMillion: 1.25m, PriorityOutputPerMillion: 75.00m),
+        ["gpt-5.5-pro"] = new(30.00m, 30.00m, 180.00m),
+    };
+
+    private readonly record struct ModelPricing(
+        decimal InputPerMillion,
+        decimal CachedInputPerMillion,
+        decimal OutputPerMillion,
+        int? ThresholdTokens = null,
+        decimal? InputPerMillionAboveThreshold = null,
+        decimal? CachedInputPerMillionAboveThreshold = null,
+        decimal? OutputPerMillionAboveThreshold = null,
+        decimal? PriorityInputPerMillion = null,
+        decimal? PriorityCachedInputPerMillion = null,
+        decimal? PriorityOutputPerMillion = null);
 }
