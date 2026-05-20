@@ -4,7 +4,7 @@ A small Windows tray app for checking AI coding assistant usage limits without o
 
 CodexBarWindows stays in the system tray. Left-click the tray icon to open a compact popup near the taskbar with tabs for Codex and Claude usage limits, including percentage used, remaining allowance, reset time, and Codex history charts.
 
-![CodexBarWindows preview](docs/codexbarwindows-preview.png)
+![CodexBarWindows Codex history preview](docs/codexbarwindows-preview.png)
 
 ## Features
 
