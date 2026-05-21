@@ -10,6 +10,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="Tests\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Content Include="Assets\CodexBarWindows.ico">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>

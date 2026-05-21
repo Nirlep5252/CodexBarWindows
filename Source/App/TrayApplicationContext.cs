@@ -14,7 +14,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private ToolStripMenuItem? checkForUpdatesItem;
     private IReadOnlyList<CodexCliEntry> codexCliEntries;
     private readonly Dictionary<string, ProviderUsageLookupResult> latestCodexUsage = [];
-    private readonly Dictionary<string, CodexUsageInsightsLookupResult> latestCodexInsights = [];
+    private readonly Dictionary<string, ProviderUsageInsightsLookupResult> latestHistory = [];
     private ProviderUsageLookupResult latestClaudeUsage = new(null, "Usage has not been loaded yet.");
     private CancellationTokenSource? refreshCancellation;
     private int refreshGeneration;
@@ -29,9 +29,10 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
             latestCodexUsage[providerKey] = new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
-            latestCodexInsights[providerKey] = new CodexUsageInsightsLookupResult(null, "Usage history has not been loaded yet.");
+            latestHistory[providerKey] = new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet.");
         }
 
+        latestHistory[UsagePopupForm.ClaudeProviderKey] = new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet.");
         popup.ConfigureCodexEntries(codexCliEntries);
         notifyIcon = new NotifyIcon
         {
@@ -43,8 +44,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         notifyIcon.MouseUp += OnTrayMouseUp;
         popup.SelectedProviderChanged += (_, providerKey) =>
         {
-            if (!GetLatestUsage(providerKey).HasSnapshot ||
-                (providerKey != UsagePopupForm.ClaudeProviderKey && !GetLatestCodexInsights(providerKey).HasInsights))
+            if (!GetLatestUsage(providerKey).HasSnapshot || !GetLatestHistory(providerKey).HasInsights)
             {
                 BeginRefresh(showLoading: true);
             }
@@ -129,10 +129,11 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
             popup.UpdateUsage(providerKey, GetLatestUsage(providerKey));
-            popup.UpdateCodexInsights(providerKey, GetLatestCodexInsights(providerKey));
+            popup.UpdateProviderHistory(providerKey, GetLatestHistory(providerKey));
         }
 
         popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
+        popup.UpdateProviderHistory(UsagePopupForm.ClaudeProviderKey, GetLatestHistory(UsagePopupForm.ClaudeProviderKey));
         popup.ShowNear(anchor);
 
         if (refresh)
@@ -146,7 +147,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         if (showLoading)
         {
             popup.SetLoading(popup.SelectedProvider);
-            popup.SetCodexInsightsLoading(popup.SelectedProvider);
+            popup.SetProviderHistoryLoading(popup.SelectedProvider);
         }
 
         refreshCancellation?.Cancel();
@@ -158,11 +159,20 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         _ = Task.Run(async () =>
         {
-            Dictionary<string, ProviderUsageLookupResult> codexResults;
-            CodexUsageInsightsLookupResult codexInsightsResult;
-            ProviderUsageLookupResult claudeResult;
+            void PostIfCurrent(Action update)
+            {
+                uiContext.Post(_ =>
+                {
+                    if (disposed || cancellation.IsCancellationRequested || generation != refreshGeneration)
+                    {
+                        return;
+                    }
 
-            try
+                    update();
+                }, null);
+            }
+
+            async Task RefreshCodexLimitsAsync()
             {
                 var codexTasks = codexCliEntries
                     .Select(entry => Task.Run(
@@ -186,23 +196,94 @@ public sealed class TrayApplicationContext : ApplicationContext
                         },
                         cancellation.Token))
                     .ToArray();
+                var codexResults = (await Task.WhenAll(codexTasks).ConfigureAwait(false))
+                    .ToDictionary(pair => pair.Key, pair => pair.Value);
+                PostIfCurrent(() =>
+                {
+                    foreach (var pair in codexResults)
+                    {
+                        latestCodexUsage[pair.Key] = pair.Value;
+                        popup.UpdateUsage(pair.Key, pair.Value);
+                    }
 
-                var codexTask = Task.WhenAll(codexTasks);
-                var codexInsightsTask = Task.Run(() => new CodexUsageInsightsReader().ReadLatest(), cancellation.Token);
-                var claudeTask = claudeUsageReader.ReadLatestAsync(cancellation.Token);
+                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage);
+                });
+            }
 
-                codexResults = (await codexTask.ConfigureAwait(false)).ToDictionary(pair => pair.Key, pair => pair.Value);
-                codexInsightsResult = await codexInsightsTask.ConfigureAwait(false);
-                claudeResult = await claudeTask.ConfigureAwait(false);
+            async Task RefreshCodexHistoryAsync()
+            {
+                var codexHistory = await Task.Run(() => new CodexUsageInsightsReader().ReadLatest(), cancellation.Token)
+                    .ConfigureAwait(false);
+                PostIfCurrent(() =>
+                {
+                    foreach (var entry in codexCliEntries)
+                    {
+                        var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
+                        latestHistory[providerKey] = codexHistory;
+                        popup.UpdateProviderHistory(providerKey, codexHistory);
+                    }
+                });
+            }
+
+            async Task RefreshClaudeLimitsAsync()
+            {
+                var claudeResult = await claudeUsageReader.ReadLatestAsync(cancellation.Token).ConfigureAwait(false);
+                PostIfCurrent(() =>
+                {
+                    latestClaudeUsage = claudeResult;
+                    popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
+                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage);
+                });
+            }
+
+            async Task RefreshClaudeHistoryAsync()
+            {
+                var claudeHistory = await Task.Run(() => new ClaudeUsageInsightsReader().ReadLatest(), cancellation.Token)
+                    .ConfigureAwait(false);
+                PostIfCurrent(() =>
+                {
+                    latestHistory[UsagePopupForm.ClaudeProviderKey] = claudeHistory;
+                    popup.UpdateProviderHistory(UsagePopupForm.ClaudeProviderKey, claudeHistory);
+                });
+            }
+
+            var refreshTasks = new[]
+            {
+                RefreshCodexLimitsAsync(),
+                RefreshCodexHistoryAsync(),
+                RefreshClaudeLimitsAsync(),
+                RefreshClaudeHistoryAsync(),
+            };
+
+            try
+            {
+                await Task.WhenAll(refreshTasks).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
-                return;
             }
-
-            uiContext.Post(_ =>
+            catch (Exception exception)
             {
-                if (disposed || cancellation.IsCancellationRequested || generation != refreshGeneration)
+                PostIfCurrent(() =>
+                {
+                    var failed = new ProviderUsageLookupResult(
+                        null,
+                        $"Could not refresh usage limits: {exception.Message}");
+                    foreach (var entry in codexCliEntries)
+                    {
+                        var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
+                        latestCodexUsage[providerKey] = failed;
+                        popup.UpdateUsage(providerKey, failed);
+                    }
+
+                    latestClaudeUsage = failed;
+                    popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
+                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage);
+                });
+            }
+            finally
+            {
+                uiContext.Post(_ =>
                 {
                     if (ReferenceEquals(refreshCancellation, cancellation))
                     {
@@ -210,65 +291,8 @@ public sealed class TrayApplicationContext : ApplicationContext
                     }
 
                     cancellation.Dispose();
-                    return;
-                }
-
-                foreach (var pair in codexResults)
-                {
-                    latestCodexUsage[pair.Key] = pair.Value;
-                    latestCodexInsights[pair.Key] = codexInsightsResult;
-                    popup.UpdateUsage(pair.Key, pair.Value);
-                    popup.UpdateCodexInsights(pair.Key, codexInsightsResult);
-                }
-
-                latestClaudeUsage = claudeResult;
-                popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
-                notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage);
-                if (ReferenceEquals(refreshCancellation, cancellation))
-                {
-                    refreshCancellation = null;
-                }
-
-                cancellation.Dispose();
-            }, null);
-        }, CancellationToken.None).ContinueWith(task =>
-        {
-            if (task.Exception is null)
-            {
-                return;
+                }, null);
             }
-
-            uiContext.Post(_ =>
-            {
-                if (disposed || cancellation.IsCancellationRequested || generation != refreshGeneration)
-                {
-                    return;
-                }
-
-                var failed = new ProviderUsageLookupResult(
-                    null,
-                    $"Could not refresh usage limits: {task.Exception.GetBaseException().Message}");
-                foreach (var entry in codexCliEntries)
-                {
-                    var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
-                    latestCodexUsage[providerKey] = failed;
-                    latestCodexInsights[providerKey] = new CodexUsageInsightsLookupResult(
-                        null,
-                        $"Could not refresh Codex history: {task.Exception.GetBaseException().Message}");
-                    popup.UpdateUsage(providerKey, failed);
-                    popup.UpdateCodexInsights(providerKey, latestCodexInsights[providerKey]);
-                }
-
-                latestClaudeUsage = failed;
-                popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
-                notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage);
-                if (ReferenceEquals(refreshCancellation, cancellation))
-                {
-                    refreshCancellation = null;
-                }
-
-                cancellation.Dispose();
-            }, null);
         }, CancellationToken.None);
     }
 
@@ -376,11 +400,11 @@ public sealed class TrayApplicationContext : ApplicationContext
             : new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
     }
 
-    private CodexUsageInsightsLookupResult GetLatestCodexInsights(string providerKey)
+    private ProviderUsageInsightsLookupResult GetLatestHistory(string providerKey)
     {
-        return latestCodexInsights.TryGetValue(providerKey, out var result)
+        return latestHistory.TryGetValue(providerKey, out var result)
             ? result
-            : new CodexUsageInsightsLookupResult(null, "Usage history has not been loaded yet.");
+            : new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet.");
     }
 
     private void ReloadCodexCliEntries()
@@ -390,9 +414,9 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
             latestCodexUsage.TryAdd(providerKey, new ProviderUsageLookupResult(null, "Usage has not been loaded yet."));
-            latestCodexInsights.TryAdd(
+            latestHistory.TryAdd(
                 providerKey,
-                new CodexUsageInsightsLookupResult(null, "Usage history has not been loaded yet."));
+                new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet."));
         }
 
         popup.ConfigureCodexEntries(codexCliEntries);
@@ -400,10 +424,12 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
             popup.UpdateUsage(providerKey, GetLatestUsage(providerKey));
-            popup.UpdateCodexInsights(providerKey, GetLatestCodexInsights(providerKey));
+            popup.UpdateProviderHistory(providerKey, GetLatestHistory(providerKey));
         }
 
+        latestHistory.TryAdd(UsagePopupForm.ClaudeProviderKey, new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet."));
         popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
+        popup.UpdateProviderHistory(UsagePopupForm.ClaudeProviderKey, GetLatestHistory(UsagePopupForm.ClaudeProviderKey));
         BeginRefresh(showLoading: false);
     }
 

@@ -6,18 +6,18 @@ public sealed class UsagePopupForm : Form
 {
     private const int BaseWidth = 420;
     private const int BaseHeight = 304;
-    private const int CodexInsightsExpandedHeight = 660;
-    private const int CodexInsightsCollapsedHeight = 360;
+    private const int HistoryExpandedHeight = 660;
+    private const int HistoryCollapsedHeight = 360;
     private readonly Label titleLabel;
     private readonly List<ProviderTabButton> tabButtons = [];
     private readonly List<ProviderDescriptor> providers = [];
     private readonly Dictionary<string, ProviderUsageLookupResult> usageByProvider = [];
-    private readonly Dictionary<string, CodexUsageInsightsLookupResult> codexInsightsByProvider = [];
+    private readonly Dictionary<string, ProviderUsageInsightsLookupResult> historyByProvider = [];
     private readonly Label planLabel;
     private readonly Label statusLabel;
     private readonly UsageSection fiveHourSection;
     private readonly UsageSection weeklySection;
-    private readonly CodexInsightsSection codexInsightsSection;
+    private readonly ProviderHistorySection providerHistorySection;
     private readonly CloseGlyphButton closeButton;
     private ThemePalette theme = ThemePalette.FromWindows();
     private string selectedProviderKey = CodexProviderKey("default");
@@ -65,8 +65,8 @@ public sealed class UsagePopupForm : Form
         fiveHourSection = new UsageSection("5 hour limit");
 
         weeklySection = new UsageSection("Weekly limit");
-        codexInsightsSection = new CodexInsightsSection();
-        codexInsightsSection.ExpandedChanged += (_, _) =>
+        providerHistorySection = new ProviderHistorySection();
+        providerHistorySection.ExpandedChanged += (_, _) =>
         {
             ApplyScaledLayout();
             RenderSelectedProvider();
@@ -83,7 +83,7 @@ public sealed class UsagePopupForm : Form
         Controls.Add(planLabel);
         Controls.Add(fiveHourSection);
         Controls.Add(weeklySection);
-        Controls.Add(codexInsightsSection);
+        Controls.Add(providerHistorySection);
         Controls.Add(statusLabel);
         Controls.Add(closeButton);
 
@@ -93,7 +93,7 @@ public sealed class UsagePopupForm : Form
         EnableDragMove(statusLabel);
         fiveHourSection.EnableDragMove();
         weeklySection.EnableDragMove();
-        codexInsightsSection.EnableDragMove();
+        providerHistorySection.EnableDragMove();
 
         Deactivate += (_, _) => Hide();
         FormClosing += OnFormClosing;
@@ -161,11 +161,7 @@ public sealed class UsagePopupForm : Form
     private void ApplyScaledLayout()
     {
         var scale = DpiScale;
-        var provider = GetProvider(selectedProviderKey);
-        var showCodexInsights = !provider.IsClaude;
-        var baseHeight = showCodexInsights
-            ? codexInsightsSection.IsExpanded ? CodexInsightsExpandedHeight : CodexInsightsCollapsedHeight
-            : BaseHeight;
+        var baseHeight = providerHistorySection.IsExpanded ? HistoryExpandedHeight : HistoryCollapsedHeight;
         SuspendLayout();
 
         ClientSize = new Size(ScaleInt(BaseWidth, scale), ScaleInt(baseHeight, scale));
@@ -181,16 +177,14 @@ public sealed class UsagePopupForm : Form
             ScaleInt(34, scale));
         fiveHourSection.Bounds = ScaleRect(18, 82, 384, 86, scale);
         weeklySection.Bounds = ScaleRect(18, 178, 384, 86, scale);
-        codexInsightsSection.Visible = showCodexInsights;
-        var insightsHeight = codexInsightsSection.IsExpanded ? 370 : 70;
-        codexInsightsSection.Bounds = ScaleRect(18, 274, 384, insightsHeight, scale);
-        statusLabel.Bounds = showCodexInsights
-            ? ScaleRect(24, codexInsightsSection.IsExpanded ? 642 : 344, 372, 16, scale)
-            : ScaleRect(24, 274, 372, 22, scale);
+        providerHistorySection.Visible = true;
+        var insightsHeight = providerHistorySection.IsExpanded ? 370 : 70;
+        providerHistorySection.Bounds = ScaleRect(18, 274, 384, insightsHeight, scale);
+        statusLabel.Bounds = ScaleRect(24, providerHistorySection.IsExpanded ? 642 : 344, 372, 16, scale);
 
         fiveHourSection.ApplyLayoutScale(scale);
         weeklySection.ApplyLayoutScale(scale);
-        codexInsightsSection.ApplyLayoutScale(scale);
+        providerHistorySection.ApplyLayoutScale(scale);
 
         ResumeLayout(performLayout: true);
         Invalidate(true);
@@ -239,9 +233,9 @@ public sealed class UsagePopupForm : Form
         }
     }
 
-    public void UpdateCodexInsights(string providerKey, CodexUsageInsightsLookupResult result)
+    public void UpdateProviderHistory(string providerKey, ProviderUsageInsightsLookupResult result)
     {
-        codexInsightsByProvider[providerKey] = result;
+        historyByProvider[providerKey] = result;
 
         if (providerKey == selectedProviderKey)
         {
@@ -249,14 +243,12 @@ public sealed class UsagePopupForm : Form
         }
     }
 
-    public void SetCodexInsightsLoading(string providerKey)
+    public void SetProviderHistoryLoading(string providerKey)
     {
-        if (providerKey == ClaudeProviderKey || providerKey != selectedProviderKey)
+        if (providerKey == selectedProviderKey)
         {
-            return;
+            providerHistorySection.SetLoading();
         }
-
-        codexInsightsSection.SetLoading();
     }
 
     public void SetLoading(string providerKey)
@@ -302,7 +294,7 @@ public sealed class UsagePopupForm : Form
         }
 
         var provider = GetProvider(selectedProviderKey);
-        codexInsightsSection.Visible = !provider.IsClaude;
+        providerHistorySection.Visible = true;
         titleLabel.Text = $"{provider.Name} rate limits";
         var result = GetProviderUsage(selectedProviderKey);
 
@@ -311,7 +303,7 @@ public sealed class UsagePopupForm : Form
             planLabel.Text = $"Waiting for local {provider.Name} usage data";
             fiveHourSection.SetUnavailable("5 hour limit");
             weeklySection.SetUnavailable("Weekly limit");
-            RenderCodexInsights(provider);
+            RenderProviderHistory(provider);
             statusLabel.Text = result.Error ?? "No usage data found.";
             return;
         }
@@ -330,26 +322,20 @@ public sealed class UsagePopupForm : Form
             weeklySection.SetUnavailable(snapshot.Primary.WindowMinutes == 10080 ? "5 hour limit" : "Weekly limit");
         }
 
-        RenderCodexInsights(provider);
+        RenderProviderHistory(provider);
         statusLabel.Text = string.Empty;
     }
 
-    private void RenderCodexInsights(ProviderDescriptor provider)
+    private void RenderProviderHistory(ProviderDescriptor provider)
     {
-        if (provider.IsClaude)
-        {
-            codexInsightsSection.SetUnavailable("Codex history is shown on Codex tabs.");
-            return;
-        }
-
-        var result = GetCodexInsights(selectedProviderKey);
+        var result = GetProviderHistory(selectedProviderKey);
         if (result.Insights is { } insights)
         {
-            codexInsightsSection.SetInsights(insights, result.Error);
+            providerHistorySection.SetInsights(insights, result.Error);
             return;
         }
 
-        codexInsightsSection.SetUnavailable(result.Error ?? "Usage history has not been loaded yet.");
+        providerHistorySection.SetUnavailable(result.Error ?? "Usage history has not been loaded yet.");
     }
 
     private ProviderUsageLookupResult GetProviderUsage(string providerKey)
@@ -359,11 +345,11 @@ public sealed class UsagePopupForm : Form
             : new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
     }
 
-    private CodexUsageInsightsLookupResult GetCodexInsights(string providerKey)
+    private ProviderUsageInsightsLookupResult GetProviderHistory(string providerKey)
     {
-        return codexInsightsByProvider.TryGetValue(providerKey, out var result)
+        return historyByProvider.TryGetValue(providerKey, out var result)
             ? result
-            : new CodexUsageInsightsLookupResult(null, "Usage history has not been loaded yet.");
+            : new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet.");
     }
 
     private ProviderDescriptor GetProvider(string providerKey)
@@ -388,12 +374,9 @@ public sealed class UsagePopupForm : Form
         foreach (var provider in providers)
         {
             usageByProvider.TryAdd(provider.Key, new ProviderUsageLookupResult(null, "Usage has not been loaded yet."));
-            if (!provider.IsClaude)
-            {
-                codexInsightsByProvider.TryAdd(
-                    provider.Key,
-                    new CodexUsageInsightsLookupResult(null, "Usage history has not been loaded yet."));
-            }
+            historyByProvider.TryAdd(
+                provider.Key,
+                new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet."));
 
             var tabButton = new ProviderTabButton(provider.Name, provider.Key, provider.IsClaude)
             {
@@ -513,7 +496,7 @@ public sealed class UsagePopupForm : Form
 
         fiveHourSection.ApplyTheme(theme);
         weeklySection.ApplyTheme(theme);
-        codexInsightsSection.ApplyTheme(theme);
+        providerHistorySection.ApplyTheme(theme);
 
         if (IsHandleCreated)
         {
@@ -578,7 +561,7 @@ public sealed class UsagePopupForm : Form
         };
     }
 
-    private sealed class CodexInsightsSection : Panel
+    private sealed class ProviderHistorySection : Panel
     {
         private readonly Label titleLabel;
         private readonly ChevronToggleButton toggleLabel;
@@ -598,7 +581,7 @@ public sealed class UsagePopupForm : Form
 
         public event EventHandler? ExpandedChanged;
 
-        public CodexInsightsSection()
+        public ProviderHistorySection()
         {
             BackColor = theme.Card;
             DoubleBuffered = true;
@@ -609,7 +592,7 @@ public sealed class UsagePopupForm : Form
                 AutoSize = false,
                 Cursor = Cursors.Hand,
                 Font = CreateFont("Segoe UI Variable Text", 9.5f, FontStyle.Bold),
-                Text = "Codex history"
+                Text = "Usage history"
             };
             titleLabel.Click += (_, _) => ToggleExpanded();
 
@@ -800,7 +783,7 @@ public sealed class UsagePopupForm : Form
         public void SetLoading()
         {
             StartLoadingAnimation();
-            titleLabel.Text = "Codex history";
+            titleLabel.Text = "Usage history";
             expandedSubtitle = "Scanning local sessions...";
             subtitleLabel.Text = IsExpanded ? expandedSubtitle : "History hidden. Click to expand.";
             todayLabel.Text = "Today";
@@ -814,7 +797,7 @@ public sealed class UsagePopupForm : Form
         public void SetUnavailable(string message)
         {
             StopLoadingAnimation();
-            titleLabel.Text = "Codex history";
+            titleLabel.Text = "Usage history";
             expandedSubtitle = message;
             subtitleLabel.Text = IsExpanded ? expandedSubtitle : "History hidden. Click to expand.";
             todayLabel.Text = "Today";
@@ -825,11 +808,14 @@ public sealed class UsagePopupForm : Form
             modelChart.SetData([], "No model breakdown yet");
         }
 
-        public void SetInsights(CodexUsageInsights insights, string? warning)
+        public void SetInsights(ProviderUsageInsights insights, string? warning)
         {
             StopLoadingAnimation();
-            titleLabel.Text = "Codex history";
-            expandedSubtitle = warning ?? $"Local estimates, updated {FormatObservedAt(insights.ObservedAt)}";
+            titleLabel.Text = "Usage history";
+            var source = string.IsNullOrWhiteSpace(insights.Source) ? "Local estimates" : insights.Source;
+            expandedSubtitle = warning is null
+                ? $"{source}, updated {FormatObservedAt(insights.ObservedAt)}"
+                : $"{warning} · {source}";
             subtitleLabel.Text = IsExpanded ? expandedSubtitle : "History hidden. Click to expand.";
             todayLabel.Text = "Today";
             monthLabel.Text = "30 days";
@@ -1015,14 +1001,14 @@ public sealed class UsagePopupForm : Form
                 }
 
                 expanded = value;
-                AccessibleName = expanded ? "Collapse Codex history" : "Expand Codex history";
+                AccessibleName = expanded ? "Collapse Usage history" : "Expand Usage history";
                 Invalidate();
             }
         }
 
         public ChevronToggleButton()
         {
-            AccessibleName = "Collapse Codex history";
+            AccessibleName = "Collapse Usage history";
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable | ControlStyles.UserPaint, true);
         }
 
@@ -1113,7 +1099,7 @@ public sealed class UsagePopupForm : Form
     private sealed class DailyHistoryChart : Control
     {
         private readonly ToolTip toolTip = new() { AutomaticDelay = 120, AutoPopDelay = 8000, ReshowDelay = 80 };
-        private IReadOnlyList<CodexDailyUsage> daily = [];
+        private IReadOnlyList<ProviderDailyUsage> daily = [];
         private string? emptyMessage;
         private ThemePalette theme = ThemePalette.FromWindows();
         private bool loading;
@@ -1153,7 +1139,7 @@ public sealed class UsagePopupForm : Form
             Invalidate();
         }
 
-        public void SetData(IReadOnlyList<CodexDailyUsage> data, string? message)
+        public void SetData(IReadOnlyList<ProviderDailyUsage> data, string? message)
         {
             loading = false;
             daily = data;
@@ -1194,7 +1180,8 @@ public sealed class UsagePopupForm : Form
                         .OrderByDescending(category => category.EstimatedCostUsd)
                         .Take(4)
                         .Select(category => $"{ShortSpendLabel(category.Label)} {FormatUsd(category.EstimatedCostUsd)}"));
-                var text = $"{day.Day:MMM d}: {FormatUsd(day.EstimatedCostUsd)}{categoryLines}\n{CodexInsightsSection.FormatTokens(day.TotalTokens)} total, {CodexInsightsSection.FormatTokens(day.OutputTokens)} output";
+                var cacheCreateLine = day.CacheCreationTokens > 0 ? $", {ProviderHistorySection.FormatTokens(day.CacheCreationTokens)} cache create" : string.Empty;
+                var text = $"{day.Day:MMM d}: {FormatUsd(day.EstimatedCostUsd)}{categoryLines}\n{ProviderHistorySection.FormatTokens(day.TotalTokens)} total, {ProviderHistorySection.FormatTokens(day.OutputTokens)} output{cacheCreateLine}";
                 if (text != lastToolTipText)
                 {
                     lastToolTipText = text;
@@ -1226,7 +1213,7 @@ public sealed class UsagePopupForm : Form
             using var titleBrush = new SolidBrush(theme.TextSecondary);
             using var titleFont = CreateFont("Segoe UI Variable Text", 7.5f, FontStyle.Regular);
             e.Graphics.DrawString("Estimated spend by day", titleFont, titleBrush, titleBounds);
-            DrawSpendCategoryLegend(e.Graphics, new Rectangle(Width - ScaleInt(150, LayoutScale), 0, ScaleInt(150, LayoutScale), ScaleInt(16, LayoutScale)), TopSpendCategories(daily), theme, LayoutScale);
+            DrawSpendCategoryLegend(e.Graphics, new Rectangle(Width - ScaleInt(220, LayoutScale), 0, ScaleInt(220, LayoutScale), ScaleInt(16, LayoutScale)), TopSpendCategories(daily), theme, LayoutScale);
 
             var chartBounds = ChartBounds;
             if (loading)
@@ -1313,7 +1300,7 @@ public sealed class UsagePopupForm : Form
     private sealed class ModelBreakdownChart : Control
     {
         private readonly ToolTip toolTip = new() { AutomaticDelay = 120, AutoPopDelay = 8000, ReshowDelay = 80 };
-        private IReadOnlyList<CodexModelUsage> models = [];
+        private IReadOnlyList<ProviderModelUsage> models = [];
         private string? emptyMessage;
         private ThemePalette theme = ThemePalette.FromWindows();
         private bool loading;
@@ -1353,7 +1340,7 @@ public sealed class UsagePopupForm : Form
             Invalidate();
         }
 
-        public void SetData(IReadOnlyList<CodexModelUsage> data, string? message)
+        public void SetData(IReadOnlyList<ProviderModelUsage> data, string? message)
         {
             loading = false;
             models = data;
@@ -1390,7 +1377,8 @@ public sealed class UsagePopupForm : Form
             {
                 var model = top[index];
                 var fastLine = model.FastEstimatedCostUsd > 0 ? $"\nFast {FormatUsd(model.FastEstimatedCostUsd)}, regular {FormatUsd(model.RegularEstimatedCostUsd)}" : string.Empty;
-                var text = $"{model.Model}\nEstimated {FormatUsd(model.EstimatedCostUsd)}{fastLine}\n{CodexInsightsSection.FormatTokens(model.TotalTokens)} total, {CodexInsightsSection.FormatTokens(model.OutputTokens)} output";
+                var cacheCreateLine = model.CacheCreationTokens > 0 ? $", {ProviderHistorySection.FormatTokens(model.CacheCreationTokens)} cache create" : string.Empty;
+                var text = $"{model.Model}\nEstimated {FormatUsd(model.EstimatedCostUsd)}{fastLine}\n{ProviderHistorySection.FormatTokens(model.TotalTokens)} total, {ProviderHistorySection.FormatTokens(model.OutputTokens)} output{cacheCreateLine}";
                 if (text != lastToolTipText)
                 {
                     lastToolTipText = text;
@@ -1460,11 +1448,11 @@ public sealed class UsagePopupForm : Form
             DrawLegend(e.Graphics, top);
         }
 
-        private CodexModelUsage[] TopModels => models.Take(4).ToArray();
+        private ProviderModelUsage[] TopModels => models.Take(4).ToArray();
 
         private Rectangle BarBounds => new(0, ScaleInt(19, LayoutScale), Width, ScaleInt(10, LayoutScale));
 
-        private Color SegmentColor(CodexModelUsage model)
+        private Color SegmentColor(ProviderModelUsage model)
         {
             return SpendCategoryColor(model.Model, theme);
         }
@@ -1495,7 +1483,7 @@ public sealed class UsagePopupForm : Form
             return -1;
         }
 
-        private void DrawLegend(Graphics graphics, IReadOnlyList<CodexModelUsage> top)
+        private void DrawLegend(Graphics graphics, IReadOnlyList<ProviderModelUsage> top)
         {
             using var textBrush = new SolidBrush(theme.TextSecondary);
             using var font = CreateFont("Segoe UI Variable Text", 7.25f, FontStyle.Regular);
@@ -1514,12 +1502,13 @@ public sealed class UsagePopupForm : Form
 
         private static string ShortModel(string model)
         {
-            if (model.Length <= 13)
+            var label = FriendlyModelLabel(model);
+            if (label.Length <= 13)
             {
-                return model;
+                return label;
             }
 
-            return model[..12] + "…";
+            return label[..12] + "…";
         }
     }
 
@@ -1587,7 +1576,7 @@ public sealed class UsagePopupForm : Form
         return phase < 0 ? phase + 1f : phase;
     }
 
-    private static void DrawDailyAxis(Graphics graphics, Rectangle chartBounds, IReadOnlyList<CodexDailyUsage> daily)
+    private static void DrawDailyAxis(Graphics graphics, Rectangle chartBounds, IReadOnlyList<ProviderDailyUsage> daily)
     {
         if (daily.Count == 0)
         {
@@ -1603,7 +1592,7 @@ public sealed class UsagePopupForm : Form
         graphics.DrawString(last, font, textBrush, new PointF(chartBounds.Right - lastSize.Width, chartBounds.Bottom + 1));
     }
 
-    private static void DrawSpendCategoryLegend(Graphics graphics, Rectangle bounds, IReadOnlyList<CodexSpendCategory> categories, ThemePalette theme, float scale)
+    private static void DrawSpendCategoryLegend(Graphics graphics, Rectangle bounds, IReadOnlyList<ProviderSpendCategory> categories, ThemePalette theme, float scale)
     {
         if (categories.Count == 0)
         {
@@ -1615,28 +1604,36 @@ public sealed class UsagePopupForm : Form
         var dot = ScaleInt(6, scale);
         var y = bounds.Top + ScaleInt(5, scale);
         var x = bounds.Left + ScaleInt(4, scale);
+        var gap = ScaleInt(10, scale);
         foreach (var category in categories.Take(3))
         {
+            var label = ShortSpendLabel(category.Label);
+            var textWidth = (int)Math.Ceiling(graphics.MeasureString(label, font).Width);
+            var itemWidth = dot + ScaleInt(3, scale) + textWidth;
+            if (x + itemWidth > bounds.Right)
+            {
+                break;
+            }
+
             using var dotBrush = new SolidBrush(SpendCategoryColor(category.Label, theme));
             graphics.FillEllipse(dotBrush, x, y, dot, dot);
-            var label = ShortSpendLabel(category.Label);
             graphics.DrawString(label, font, textBrush, x + dot + ScaleInt(3, scale), bounds.Top);
-            x += ScaleInt(label.Contains("fast", StringComparison.OrdinalIgnoreCase) ? 52 : 44, scale);
+            x += itemWidth + gap;
         }
     }
 
-    private static IReadOnlyList<CodexSpendCategory> TopSpendCategories(IReadOnlyList<CodexDailyUsage> daily)
+    private static IReadOnlyList<ProviderSpendCategory> TopSpendCategories(IReadOnlyList<ProviderDailyUsage> daily)
     {
         return daily
             .SelectMany(DailySpendCategories)
             .GroupBy(category => category.Label, StringComparer.OrdinalIgnoreCase)
-            .Select(group => new CodexSpendCategory(group.Key, group.Sum(category => category.EstimatedCostUsd)))
+            .Select(group => new ProviderSpendCategory(group.Key, group.Sum(category => category.EstimatedCostUsd)))
             .OrderByDescending(category => category.EstimatedCostUsd)
             .Take(3)
             .ToArray();
     }
 
-    private static IReadOnlyList<CodexSpendCategory> DailySpendCategories(CodexDailyUsage day)
+    private static IReadOnlyList<ProviderSpendCategory> DailySpendCategories(ProviderDailyUsage day)
     {
         if (day.Categories.Count > 0)
         {
@@ -1647,14 +1644,14 @@ public sealed class UsagePopupForm : Form
                 .ToArray();
         }
 
-        var categories = new List<CodexSpendCategory>();
+        var categories = new List<ProviderSpendCategory>();
         if (day.RegularEstimatedCostUsd > 0)
         {
-            categories.Add(new CodexSpendCategory("regular", day.RegularEstimatedCostUsd));
+            categories.Add(new ProviderSpendCategory("regular", day.RegularEstimatedCostUsd));
         }
         if (day.FastEstimatedCostUsd > 0)
         {
-            categories.Add(new CodexSpendCategory("fast", day.FastEstimatedCostUsd));
+            categories.Add(new ProviderSpendCategory("fast", day.FastEstimatedCostUsd));
         }
         return categories;
     }
@@ -1667,17 +1664,17 @@ public sealed class UsagePopupForm : Form
             return theme.Warning;
         }
 
-        if (normalized.Contains("gpt-5.5", StringComparison.OrdinalIgnoreCase))
+        if (normalized.Contains("gpt-5.5", StringComparison.OrdinalIgnoreCase) || normalized.Contains("claude-opus", StringComparison.OrdinalIgnoreCase))
         {
             return theme.Accent;
         }
 
-        if (normalized.Contains("gpt-5.4", StringComparison.OrdinalIgnoreCase) || normalized == "regular")
+        if (normalized.Contains("gpt-5.4", StringComparison.OrdinalIgnoreCase) || normalized.Contains("claude-sonnet", StringComparison.OrdinalIgnoreCase) || normalized == "regular")
         {
             return Color.FromArgb(134, 97, 197);
         }
 
-        if (normalized.Contains("gpt-5.3", StringComparison.OrdinalIgnoreCase))
+        if (normalized.Contains("gpt-5.3", StringComparison.OrdinalIgnoreCase) || normalized.Contains("claude-haiku", StringComparison.OrdinalIgnoreCase))
         {
             return Color.FromArgb(16, 124, 16);
         }
@@ -1692,9 +1689,17 @@ public sealed class UsagePopupForm : Form
 
     private static string ShortSpendLabel(string label)
     {
-        var normalized = label.Replace("gpt-", string.Empty, StringComparison.OrdinalIgnoreCase);
+        var normalized = FriendlyModelLabel(label);
+        return normalized.Length <= 14 ? normalized : normalized[..13] + "…";
+    }
+
+    private static string FriendlyModelLabel(string label)
+    {
+        var normalized = label.Replace(" fast", string.Empty, StringComparison.OrdinalIgnoreCase);
+        normalized = normalized.Replace("gpt-", string.Empty, StringComparison.OrdinalIgnoreCase);
+        normalized = normalized.Replace("claude-", string.Empty, StringComparison.OrdinalIgnoreCase);
         normalized = normalized.Replace("-codex", string.Empty, StringComparison.OrdinalIgnoreCase);
-        return normalized.Length <= 8 ? normalized : normalized[..7] + "…";
+        return normalized;
     }
 
     private static Color[] ModelPalette =>

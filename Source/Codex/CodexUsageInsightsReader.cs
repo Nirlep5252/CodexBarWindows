@@ -20,7 +20,7 @@ public sealed class CodexUsageInsightsReader
         this.codexHome = codexHome;
     }
 
-    public CodexUsageInsightsLookupResult ReadLatest()
+    public ProviderUsageInsightsLookupResult ReadLatest()
     {
         try
         {
@@ -41,7 +41,7 @@ public sealed class CodexUsageInsightsReader
 
             if (codexFiles.Length == 0 && piFiles.Length == 0)
             {
-                return new CodexUsageInsightsLookupResult(
+                return new ProviderUsageInsightsLookupResult(
                     EmptyInsights(now, firstReportDay),
                     $"No Codex or pi session logs were found under {codexHome} or {piSessionsRoot}.");
             }
@@ -78,9 +78,9 @@ public sealed class CodexUsageInsightsReader
                 .ToArray();
 
             var todayUsage = dailyRows.FirstOrDefault(row => row.Day == today)
-                ?? new CodexDailyUsage(today, 0, 0, 0, 0);
+                ?? new ProviderDailyUsage(today, 0, 0, 0, 0, 0);
 
-            var result = new CodexUsageInsights(
+            var result = new ProviderUsageInsights(
                 now,
                 $"Local Codex + pi sessions ({codexHome}; {piSessionsRoot})",
                 dailyRows,
@@ -93,21 +93,21 @@ public sealed class CodexUsageInsightsReader
                 dailyRows.Sum(row => row.FastEstimatedCostUsd));
 
             var error = result.HasUsage ? null : "No token usage entries were found in recent Codex or pi session logs.";
-            return new CodexUsageInsightsLookupResult(result, error);
+            return new ProviderUsageInsightsLookupResult(result, error);
         }
         catch (Exception exception)
         {
-            return new CodexUsageInsightsLookupResult(null, $"Could not read Codex usage history: {exception.Message}");
+            return new ProviderUsageInsightsLookupResult(null, $"Could not read Codex usage history: {exception.Message}");
         }
     }
 
-    private static CodexUsageInsights EmptyInsights(DateTimeOffset observedAt, DateOnly firstReportDay)
+    private static ProviderUsageInsights EmptyInsights(DateTimeOffset observedAt, DateOnly firstReportDay)
     {
         var daily = Enumerable.Range(0, DaysToReport)
-            .Select(offset => new CodexDailyUsage(firstReportDay.AddDays(offset), 0, 0, 0, 0))
+            .Select(offset => new ProviderDailyUsage(firstReportDay.AddDays(offset), 0, 0, 0, 0, 0))
             .ToArray();
 
-        return new CodexUsageInsights(observedAt, "Local Codex + pi sessions", daily, [], 0, 0, 0, 0);
+        return new ProviderUsageInsights(observedAt, "Local Codex + pi sessions", daily, [], 0, 0, 0, 0);
     }
 
     private IEnumerable<string> EnumerateCodexJsonlFiles(DateOnly firstScanDay)
@@ -641,14 +641,14 @@ public sealed class CodexUsageInsightsReader
         usage.Add(model, tokens, isFastMode, exactCostUsd, displayName: displayName ?? model);
     }
 
-    private static CodexDailyUsage ToDaily(DateOnly day, MutableUsage usage)
+    private static ProviderDailyUsage ToDaily(DateOnly day, MutableUsage usage)
     {
-        return new CodexDailyUsage(day, usage.InputTokens, usage.CachedInputTokens, usage.OutputTokens, usage.EstimatedCostUsd, usage.FastEstimatedCostUsd, usage.SpendCategories);
+        return new ProviderDailyUsage(day, usage.InputTokens, usage.CachedInputTokens, 0, usage.OutputTokens, usage.EstimatedCostUsd, usage.FastEstimatedCostUsd, usage.SpendCategories);
     }
 
-    private static CodexModelUsage ToModel(string model, MutableUsage usage)
+    private static ProviderModelUsage ToModel(string model, MutableUsage usage)
     {
-        return new CodexModelUsage(usage.DisplayName ?? model, usage.InputTokens, usage.CachedInputTokens, usage.OutputTokens, usage.EstimatedCostUsd, usage.FastEstimatedCostUsd);
+        return new ProviderModelUsage(usage.DisplayName ?? model, usage.InputTokens, usage.CachedInputTokens, 0, usage.OutputTokens, usage.EstimatedCostUsd, usage.FastEstimatedCostUsd);
     }
 
     private static string NormalizeModelName(string model)
@@ -724,8 +724,8 @@ public sealed class CodexUsageInsightsReader
         public string? DisplayName { get; private set; }
         private readonly Dictionary<string, decimal> spendCategories = new(StringComparer.OrdinalIgnoreCase);
 
-        public IReadOnlyList<CodexSpendCategory> SpendCategories => spendCategories
-            .Select(pair => new CodexSpendCategory(pair.Key, pair.Value))
+        public IReadOnlyList<ProviderSpendCategory> SpendCategories => spendCategories
+            .Select(pair => new ProviderSpendCategory(pair.Key, pair.Value))
             .OrderBy(category => category.Label.Contains(" fast", StringComparison.OrdinalIgnoreCase) ? 1 : 0)
             .ThenBy(category => category.Label, StringComparer.OrdinalIgnoreCase)
             .ToArray();
