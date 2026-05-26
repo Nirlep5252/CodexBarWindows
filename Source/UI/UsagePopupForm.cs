@@ -1695,11 +1695,12 @@ public sealed class UsagePopupForm : Form
 
     private static string FriendlyModelLabel(string label)
     {
-        var normalized = label.Replace(" fast", string.Empty, StringComparison.OrdinalIgnoreCase);
+        var isFast = label.EndsWith(" fast", StringComparison.OrdinalIgnoreCase);
+        var normalized = isFast ? label[..^5] : label;
         normalized = normalized.Replace("gpt-", string.Empty, StringComparison.OrdinalIgnoreCase);
         normalized = normalized.Replace("claude-", string.Empty, StringComparison.OrdinalIgnoreCase);
         normalized = normalized.Replace("-codex", string.Empty, StringComparison.OrdinalIgnoreCase);
-        return normalized;
+        return isFast ? normalized + " fast" : normalized;
     }
 
     private static Color[] ModelPalette =>

@@ -196,6 +196,7 @@ public sealed class CodexUsageInsightsReader
         IDictionary<string, MutableUsage> models)
     {
         string? currentModel = null;
+        var currentIsFastMode = false;
         TokenTotals previousTotals = default;
         var hasPreviousTotals = false;
 
@@ -221,6 +222,7 @@ public sealed class CodexUsageInsightsReader
                 if (string.Equals(type, "turn_context", StringComparison.OrdinalIgnoreCase))
                 {
                     currentModel = ReadModel(root) ?? currentModel;
+                    currentIsFastMode = IsFastMode(currentModel ?? "Codex model", default, null, root);
                     continue;
                 }
 
@@ -245,8 +247,13 @@ public sealed class CodexUsageInsightsReader
                     continue;
                 }
 
-                Add(daily, day.Value, model, delta, categoryLabel: ModelBreakdownLabel(model, isFastMode: false));
-                Add(models, NormalizeModelName(model), model, delta);
+                var rowIsFastMode = payload.TryGetProperty("rate_limits", out var rateLimits)
+                    ? IsFastMode(model, delta, null, root, payload, rateLimits)
+                    : IsFastMode(model, delta, null, root, payload);
+                var isFastMode = currentIsFastMode || rowIsFastMode;
+                var categoryLabel = ModelBreakdownLabel(model, isFastMode);
+                Add(daily, day.Value, model, delta, isFastMode, categoryLabel: categoryLabel);
+                Add(models, ModelBreakdownKey(model, isFastMode), model, delta, isFastMode, displayName: categoryLabel);
             }
             catch
             {
@@ -335,7 +342,7 @@ public sealed class CodexUsageInsightsReader
 
                 var effectiveInput = Math.Max(input + cacheRead + cacheWrite, Math.Max(0, directTotal - output));
                 var tokens = new TokenTotals(effectiveInput, Math.Min(cacheRead, effectiveInput), output);
-                var isFastMode = IsFastMode(root, message, usage, model, tokens, exactCost);
+                var isFastMode = IsFastMode(model, tokens, exactCost, root, message, usage);
                 var categoryLabel = ModelBreakdownLabel(model, isFastMode);
                 Add(daily, day.Value, model, tokens, isFastMode, exactCost, categoryLabel);
                 Add(models, ModelBreakdownKey(model, isFastMode), model, tokens, isFastMode, exactCost, categoryLabel);
@@ -546,9 +553,9 @@ public sealed class CodexUsageInsightsReader
         return string.Equals(provider, "openai-codex", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool IsFastMode(JsonElement root, JsonElement message, JsonElement usage, string model, TokenTotals tokens, decimal? exactCostUsd)
+    private static bool IsFastMode(string model, TokenTotals tokens, decimal? exactCostUsd, params JsonElement[] elements)
     {
-        if (HasFastModeMarker(message) || HasFastModeMarker(root) || HasFastModeMarker(usage))
+        if (elements.Any(HasFastModeMarker))
         {
             return true;
         }
@@ -574,7 +581,7 @@ public sealed class CodexUsageInsightsReader
             return false;
         }
 
-        foreach (var propertyName in new[] { "mode", "tier", "serviceTier", "service_tier", "priority", "fast" })
+        foreach (var propertyName in new[] { "mode", "tier", "serviceTier", "service_tier", "speedTier", "speed_tier", "plan_type", "priority", "fast", "limit_id", "limit_name" })
         {
             if (!element.TryGetProperty(propertyName, out var value))
             {
@@ -589,15 +596,40 @@ public sealed class CodexUsageInsightsReader
             if (value.ValueKind == JsonValueKind.String)
             {
                 var text = value.GetString();
-                if (text is not null &&
-                    (text.Contains("fast", StringComparison.OrdinalIgnoreCase) || text.Contains("priority", StringComparison.OrdinalIgnoreCase)))
+                if (text is not null && IsFastMarkerText(propertyName, text))
                 {
                     return true;
                 }
             }
         }
 
+        foreach (var propertyName in new[] { "payload", "rate_limits", "collaboration_mode", "settings" })
+        {
+            if (element.TryGetProperty(propertyName, out var value) && HasFastModeMarker(value))
+            {
+                return true;
+            }
+        }
+
         return false;
+    }
+
+    private static bool IsFastMarkerText(string propertyName, string text)
+    {
+        if (text.Contains("fast", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("priority", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (propertyName.Contains("limit", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(text, "premium", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return string.Equals(propertyName, "plan_type", StringComparison.OrdinalIgnoreCase) &&
+               string.Equals(text, "prolite", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool CostsAreClose(decimal left, decimal right)
