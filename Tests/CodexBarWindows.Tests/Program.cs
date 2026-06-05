@@ -2,6 +2,27 @@ using System.Globalization;
 using System.Text.Json;
 using CodexBarWindows;
 
+if (args.Contains("--scan-real-codex", StringComparer.OrdinalIgnoreCase))
+{
+    var result = new CodexUsageInsightsReader().ReadLatest();
+    Console.WriteLine($"error={result.Error ?? "<none>"}");
+    Console.WriteLine($"hasInsights={result.HasInsights}");
+    if (result.Insights is { } insights)
+    {
+        Console.WriteLine($"source={insights.Source}");
+        Console.WriteLine($"todayTokens={insights.TodayTokens}");
+        Console.WriteLine($"todayCost={insights.TodayEstimatedCostUsd}");
+        Console.WriteLine($"todayFastCost={insights.TodayFastEstimatedCostUsd}");
+        Console.WriteLine($"last30Tokens={insights.Last30DaysTokens}");
+        Console.WriteLine($"last30Cost={insights.Last30DaysEstimatedCostUsd}");
+        Console.WriteLine($"last30FastCost={insights.Last30DaysFastEstimatedCostUsd}");
+        Console.WriteLine($"models={string.Join(", ", insights.Models.Select(m => $"{m.Model}:{m.TotalTokens}:fast={m.FastEstimatedCostUsd}"))}");
+        Console.WriteLine($"nonzeroDays={string.Join(", ", insights.Daily.Where(d => d.TotalTokens > 0).Select(d => $"{d.Day}:{d.TotalTokens}:cost={d.EstimatedCostUsd}:fast={d.FastEstimatedCostUsd}"))}");
+    }
+
+    return;
+}
+
 if (args.Contains("--scan-real-claude", StringComparer.OrdinalIgnoreCase))
 {
     var result = new ClaudeUsageInsightsReader(null, refreshModelsDevPricing: false).ReadLatest();
@@ -24,7 +45,11 @@ var tests = new (string Name, Action Run)[]
 {
     ("Codex history aggregates token_count rows", CodexHistoryAggregatesTokenCountRows),
     ("Codex history counts premium token_count rows as fast", CodexHistoryCountsPremiumTokenCountRowsAsFast),
-    ("Codex history counts prolite token_count rows as fast", CodexHistoryCountsProliteTokenCountRowsAsFast),
+    ("Codex history treats prolite token_count rows as regular", CodexHistoryTreatsProliteTokenCountRowsAsRegular),
+    ("Codex history counts priority service tier turns as fast", CodexHistoryCountsPriorityServiceTierTurnsAsFast),
+    ("Codex history counts priority client metadata turns as fast", CodexHistoryCountsPriorityClientMetadataTurnsAsFast),
+    ("Codex history treats primary limit increase as regular", CodexHistoryTreatsPrimaryLimitIncreaseAsRegular),
+    ("Codex history ignores stale primary limit for regular turns", CodexHistoryIgnoresStalePrimaryLimitForRegularTurns),
     ("Usage labels preserve fast suffix", UsageLabelsPreserveFastSuffix),
     ("Claude history aggregates tokens and cost", ClaudeHistoryAggregatesTokensAndCost),
     ("Claude history dedupes streaming and subagent rows", ClaudeHistoryDedupesRows),
@@ -95,7 +120,7 @@ static void CodexHistoryCountsPremiumTokenCountRowsAsFast()
         "fast codex spend category should be labeled as fast");
 }
 
-static void CodexHistoryCountsProliteTokenCountRowsAsFast()
+static void CodexHistoryTreatsProliteTokenCountRowsAsRegular()
 {
     using var fixture = new CodexFixture();
     fixture.WriteSessionLog(
@@ -113,11 +138,143 @@ static void CodexHistoryCountsProliteTokenCountRowsAsFast()
     var today = Today(result);
 
     AssertEqual(1020L, today.TotalTokens, "prolite codex tokens should be included in history totals");
-    AssertClose(0.00515m, today.EstimatedCostUsd, "prolite codex total cost should use priority rates");
-    AssertClose(0.00515m, today.FastEstimatedCostUsd, "prolite codex cost should be tracked separately");
+    AssertClose(0.002575m, today.EstimatedCostUsd, "prolite codex total cost should use regular rates");
+    AssertEqual(0m, today.FastEstimatedCostUsd, "prolite codex cost should not be tracked as fast");
+    Assert(
+        result.Insights!.Models.Any(model => string.Equals(model.Model, "gpt-5.4", StringComparison.OrdinalIgnoreCase)),
+        "prolite codex model row should keep the regular model label");
+    Assert(
+        result.Insights!.Models.All(model => !string.Equals(model.Model, "gpt-5.4 fast", StringComparison.OrdinalIgnoreCase)),
+        "prolite codex model row should not be labeled as fast");
+}
+
+static void CodexHistoryCountsPriorityServiceTierTurnsAsFast()
+{
+    using var fixture = new CodexFixture();
+    var turnId = Guid.NewGuid().ToString();
+    fixture.WriteSessionLog(
+        "session.jsonl",
+        CodexTurnContextLine("gpt-5.4", turnId),
+        CodexTokenCountLine(
+            model: null,
+            input: 1000,
+            cacheRead: 100,
+            output: 20,
+            limitId: "codex",
+            planType: "prolite"));
+    fixture.WriteCodexLog(
+        "logs_2.sqlite",
+        $"session_task.turn thread.id={Guid.NewGuid()} turn.id={turnId} model=gpt-5.4 request {{\"service_tier\":\"priority\"}}");
+
+    var result = fixture.Read();
+    var today = Today(result);
+
+    AssertClose(0.00515m, today.EstimatedCostUsd, "priority service tier total cost should use fast rates");
+    AssertClose(0.00515m, today.FastEstimatedCostUsd, "priority service tier cost should be tracked as fast");
     Assert(
         result.Insights!.Models.Any(model => string.Equals(model.Model, "gpt-5.4 fast", StringComparison.OrdinalIgnoreCase)),
-        "prolite codex model row should be labeled as fast");
+        "priority service tier model row should be labeled as fast");
+}
+
+static void CodexHistoryCountsPriorityClientMetadataTurnsAsFast()
+{
+    using var fixture = new CodexFixture();
+    var sessionId = Guid.NewGuid().ToString();
+    var turnId = Guid.NewGuid().ToString();
+    var turnMetadata = JsonSerializer.Serialize(new
+    {
+        session_id = sessionId,
+        thread_id = sessionId,
+        turn_id = turnId
+    });
+
+    fixture.WriteSessionLog(
+        "session.jsonl",
+        CodexTurnContextLine("gpt-5.4", turnId),
+        CodexTokenCountLine(
+            model: null,
+            input: 1000,
+            cacheRead: 100,
+            output: 20,
+            limitId: "codex",
+            planType: "prolite"));
+    fixture.WriteCodexLog(
+        "logs_2.sqlite",
+        $"responses_websocket request {{\"service_tier\":\"priority\",\"client_metadata\":{{\"x-codex-turn-metadata\":{JsonSerializer.Serialize(turnMetadata)}}}}}");
+
+    var result = fixture.Read();
+    var today = Today(result);
+
+    AssertClose(0.00515m, today.EstimatedCostUsd, "priority client metadata total cost should use fast rates");
+    AssertClose(0.00515m, today.FastEstimatedCostUsd, "priority client metadata cost should be tracked as fast");
+    Assert(
+        result.Insights!.Models.Any(model => string.Equals(model.Model, "gpt-5.4 fast", StringComparison.OrdinalIgnoreCase)),
+        "priority client metadata model row should be labeled as fast");
+}
+
+static void CodexHistoryTreatsPrimaryLimitIncreaseAsRegular()
+{
+    using var fixture = new CodexFixture();
+    var firstTurnId = Guid.NewGuid().ToString();
+    var secondTurnId = Guid.NewGuid().ToString();
+    fixture.WriteSessionLog(
+        "session.jsonl",
+        CodexTurnContextLine("gpt-5.4", firstTurnId),
+        CodexTokenCountLine(
+            model: null,
+            input: 1000,
+            cacheRead: 100,
+            output: 20,
+            limitId: "codex",
+            planType: "prolite",
+            primaryUsedPercent: 0m),
+        CodexTurnContextLine("gpt-5.4", secondTurnId),
+        CodexTokenCountLine(
+            model: null,
+            input: 2000,
+            cacheRead: 200,
+            output: 40,
+            limitId: "codex",
+            planType: "prolite",
+            primaryUsedPercent: 3m));
+
+    var result = fixture.Read();
+    var today = Today(result);
+
+    AssertClose(0.00515m, today.EstimatedCostUsd, "primary limit increase should keep both deltas at regular rates");
+    AssertClose(0m, today.FastEstimatedCostUsd, "primary limit increase should not count as fast usage");
+}
+
+static void CodexHistoryIgnoresStalePrimaryLimitForRegularTurns()
+{
+    using var fixture = new CodexFixture();
+    var fastTurnId = Guid.NewGuid().ToString();
+    var regularTurnId = Guid.NewGuid().ToString();
+    fixture.WriteSessionLog(
+        "session.jsonl",
+        CodexTurnContextLine("gpt-5.4", fastTurnId),
+        CodexTokenCountLine(
+            model: null,
+            input: 1000,
+            cacheRead: 100,
+            output: 20,
+            limitId: "premium",
+            primaryUsedPercent: 3m),
+        CodexTurnContextLine("gpt-5.4", regularTurnId),
+        CodexTokenCountLine(
+            model: null,
+            input: 2000,
+            cacheRead: 200,
+            output: 40,
+            limitId: "codex",
+            planType: "prolite",
+            primaryUsedPercent: 3m));
+
+    var result = fixture.Read();
+    var today = Today(result);
+
+    AssertClose(0.007725m, today.EstimatedCostUsd, "stale primary limit should keep the second delta regular");
+    AssertClose(0.00515m, today.FastEstimatedCostUsd, "stale primary limit should not count the second delta as fast");
 }
 
 static void UsageLabelsPreserveFastSuffix()
@@ -236,7 +393,7 @@ static string AssistantLine(string model, string messageId, string requestId, lo
     return JsonSerializer.Serialize(payload);
 }
 
-static string CodexTurnContextLine(string model)
+static string CodexTurnContextLine(string model, string? turnId = null)
 {
     var payload = new
     {
@@ -244,6 +401,7 @@ static string CodexTurnContextLine(string model)
         type = "turn_context",
         payload = new
         {
+            turn_id = turnId,
             model
         }
     };
@@ -251,7 +409,14 @@ static string CodexTurnContextLine(string model)
     return JsonSerializer.Serialize(payload);
 }
 
-static string CodexTokenCountLine(string? model, long input, long cacheRead, long output, string limitId, string planType = "plus")
+static string CodexTokenCountLine(
+    string? model,
+    long input,
+    long cacheRead,
+    long output,
+    string limitId,
+    string planType = "plus",
+    decimal primaryUsedPercent = 0m)
 {
     var payload = new
     {
@@ -274,6 +439,12 @@ static string CodexTokenCountLine(string? model, long input, long cacheRead, lon
             rate_limits = new
             {
                 limit_id = limitId,
+                primary = new
+                {
+                    used_percent = primaryUsedPercent,
+                    window_minutes = 300,
+                    resets_at = DateTimeOffset.Now.AddHours(5).ToUnixTimeSeconds()
+                },
                 plan_type = planType
             }
         }
@@ -323,6 +494,13 @@ sealed class CodexFixture : IDisposable
         Directory.CreateDirectory(dir);
         Directory.CreateDirectory(Path.Combine(root, "pi", "agent", "sessions"));
         var file = Path.Combine(dir, fileName);
+        File.WriteAllLines(file, lines);
+        File.SetLastWriteTime(file, DateTime.Now);
+    }
+
+    public void WriteCodexLog(string fileName, params string[] lines)
+    {
+        var file = Path.Combine(root, "codex", fileName);
         File.WriteAllLines(file, lines);
         File.SetLastWriteTime(file, DateTime.Now);
     }

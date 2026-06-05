@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 
 namespace CodexBarWindows;
@@ -48,10 +49,11 @@ public sealed class CodexUsageInsightsReader
 
             var daily = new Dictionary<DateOnly, MutableUsage>();
             var models = new Dictionary<string, MutableUsage>(StringComparer.OrdinalIgnoreCase);
+            var fastTurnIds = ReadFastTurnIdsFromCodexLogs(codexHome);
 
             foreach (var file in codexFiles)
             {
-                ScanCodexFile(file, firstScanDay, daily, models);
+                ScanCodexFile(file, firstScanDay, daily, models, fastTurnIds);
             }
 
             foreach (var file in piFiles)
@@ -193,9 +195,11 @@ public sealed class CodexUsageInsightsReader
         string file,
         DateOnly firstScanDay,
         IDictionary<DateOnly, MutableUsage> daily,
-        IDictionary<string, MutableUsage> models)
+        IDictionary<string, MutableUsage> models,
+        IReadOnlySet<string> fastTurnIds)
     {
         string? currentModel = null;
+        string? currentTurnId = null;
         var currentIsFastMode = false;
         TokenTotals previousTotals = default;
         var hasPreviousTotals = false;
@@ -222,7 +226,9 @@ public sealed class CodexUsageInsightsReader
                 if (string.Equals(type, "turn_context", StringComparison.OrdinalIgnoreCase))
                 {
                     currentModel = ReadModel(root) ?? currentModel;
-                    currentIsFastMode = IsFastMode(currentModel ?? "Codex model", default, null, root);
+                    currentTurnId = ReadTurnId(root);
+                    currentIsFastMode = IsFastMode(currentModel ?? "Codex model", default, null, root) ||
+                        (currentTurnId is not null && fastTurnIds.Contains(currentTurnId));
                     continue;
                 }
 
@@ -553,6 +559,198 @@ public sealed class CodexUsageInsightsReader
         return string.Equals(provider, "openai-codex", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static string? ReadTurnId(JsonElement element)
+    {
+        if (element.TryGetProperty("turn_id", out var turnId) && turnId.ValueKind == JsonValueKind.String)
+        {
+            return turnId.GetString();
+        }
+
+        if (element.TryGetProperty("payload", out var payload))
+        {
+            return ReadTurnId(payload);
+        }
+
+        return null;
+    }
+
+    private static IReadOnlySet<string> ReadFastTurnIdsFromCodexLogs(string codexHome)
+    {
+        var files = EnumerateCodexLogFiles(codexHome).ToArray();
+        var signature = string.Join(
+            "|",
+            files.Select(file =>
+            {
+                try
+                {
+                    var info = new FileInfo(file);
+                    return string.Create(CultureInfo.InvariantCulture, $"{info.FullName}:{info.Length}:{info.LastWriteTimeUtc.Ticks}");
+                }
+                catch
+                {
+                    return file;
+                }
+            }));
+
+        lock (FastTurnIdsCacheLock)
+        {
+            if (string.Equals(signature, cachedFastTurnIdsSignature, StringComparison.Ordinal))
+            {
+                return cachedFastTurnIds;
+            }
+        }
+
+        var turnIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in files)
+        {
+            AddFastTurnIdsFromCodexLog(file, turnIds);
+        }
+
+        lock (FastTurnIdsCacheLock)
+        {
+            cachedFastTurnIdsSignature = signature;
+            cachedFastTurnIds = turnIds;
+            return cachedFastTurnIds;
+        }
+    }
+
+    private static IEnumerable<string> EnumerateCodexLogFiles(string codexHome)
+    {
+        if (!Directory.Exists(codexHome))
+        {
+            yield break;
+        }
+
+        IEnumerable<string> files;
+        try
+        {
+            files = Directory.EnumerateFiles(codexHome, "logs_*.sqlite*", SearchOption.TopDirectoryOnly);
+        }
+        catch
+        {
+            yield break;
+        }
+
+        foreach (var file in files)
+        {
+            if (file.EndsWith(".sqlite", StringComparison.OrdinalIgnoreCase) ||
+                file.EndsWith(".sqlite-wal", StringComparison.OrdinalIgnoreCase))
+            {
+                yield return file;
+            }
+        }
+    }
+
+    private static void AddFastTurnIdsFromCodexLog(string file, ISet<string> turnIds)
+    {
+        try
+        {
+            using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            stream.Position = Math.Max(0, stream.Length - MaxCodexLogScanBytes);
+
+            var buffer = new byte[CodexLogChunkBytes];
+            var carry = string.Empty;
+            int read;
+            while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                var text = carry + Encoding.UTF8.GetString(buffer, 0, read);
+                AddFastTurnIdsFromText(text, turnIds);
+                carry = text.Length > CodexLogOverlapChars ? text[^CodexLogOverlapChars..] : text;
+            }
+        }
+        catch
+        {
+            // Codex log databases are best-effort enrichment. Session token rows remain usable without them.
+        }
+    }
+
+    private static void AddFastTurnIdsFromText(string text, ISet<string> turnIds)
+    {
+        var searchIndex = 0;
+        while (TryFindFastServiceTierMarker(text, searchIndex, out var markerIndex))
+        {
+            searchIndex = markerIndex + 1;
+            AddPreviousFastTurnId(text, markerIndex, turnIds);
+            AddMetadataFastTurnIds(text, markerIndex, turnIds);
+        }
+    }
+
+    private static void AddPreviousFastTurnId(string text, int markerIndex, ISet<string> turnIds)
+    {
+        var searchStart = Math.Max(0, markerIndex - CodexLogTurnIdBacktrackChars);
+        var searchLength = markerIndex - searchStart;
+        var turnMarkerIndex = text.LastIndexOf("turn.id=", markerIndex, searchLength, StringComparison.OrdinalIgnoreCase);
+        if (turnMarkerIndex < 0)
+        {
+            return;
+        }
+
+        var turnIdStart = turnMarkerIndex + "turn.id=".Length;
+        if (TryReadTurnId(text, turnIdStart, out var turnId))
+        {
+            turnIds.Add(turnId);
+        }
+    }
+
+    private static void AddMetadataFastTurnIds(string text, int markerIndex, ISet<string> turnIds)
+    {
+        var searchEnd = Math.Min(text.Length, markerIndex + CodexLogTurnMetadataForwardChars);
+        foreach (var marker in TurnIdValueMarkers)
+        {
+            var searchIndex = markerIndex;
+            while (searchIndex < searchEnd)
+            {
+                var turnMarkerIndex = text.IndexOf(marker, searchIndex, StringComparison.OrdinalIgnoreCase);
+                if (turnMarkerIndex < 0 || turnMarkerIndex >= searchEnd)
+                {
+                    break;
+                }
+
+                var turnIdStart = turnMarkerIndex + marker.Length;
+                if (TryReadTurnId(text, turnIdStart, out var turnId))
+                {
+                    turnIds.Add(turnId);
+                }
+
+                searchIndex = turnMarkerIndex + marker.Length;
+            }
+        }
+    }
+
+    private static bool TryFindFastServiceTierMarker(string text, int startIndex, out int markerIndex)
+    {
+        markerIndex = -1;
+        foreach (var marker in FastServiceTierMarkers)
+        {
+            var candidate = text.IndexOf(marker, startIndex, StringComparison.OrdinalIgnoreCase);
+            if (candidate >= 0 && (markerIndex < 0 || candidate < markerIndex))
+            {
+                markerIndex = candidate;
+            }
+        }
+
+        return markerIndex >= 0;
+    }
+
+    private static bool TryReadTurnId(string text, int startIndex, out string turnId)
+    {
+        turnId = string.Empty;
+        const int turnIdLength = 36;
+        if (startIndex < 0 || startIndex + turnIdLength > text.Length)
+        {
+            return false;
+        }
+
+        var candidate = text.Substring(startIndex, turnIdLength);
+        if (!Guid.TryParse(candidate, out _))
+        {
+            return false;
+        }
+
+        turnId = candidate;
+        return true;
+    }
+
     private static bool IsFastMode(string model, TokenTotals tokens, decimal? exactCostUsd, params JsonElement[] elements)
     {
         if (elements.Any(HasFastModeMarker))
@@ -628,8 +826,7 @@ public sealed class CodexUsageInsightsReader
             return true;
         }
 
-        return string.Equals(propertyName, "plan_type", StringComparison.OrdinalIgnoreCase) &&
-               string.Equals(text, "prolite", StringComparison.OrdinalIgnoreCase);
+        return false;
     }
 
     private static bool CostsAreClose(decimal left, decimal right)
@@ -823,6 +1020,16 @@ public sealed class CodexUsageInsightsReader
     }
 
     private const int PriorityInputTokenLimit = 272_000;
+    private const int MaxCodexLogScanBytes = 64 * 1024 * 1024;
+    private const int CodexLogChunkBytes = 1024 * 1024;
+    private const int CodexLogTurnIdBacktrackChars = 1_200_000;
+    private const int CodexLogTurnMetadataForwardChars = 80_000;
+    private const int CodexLogOverlapChars = CodexLogTurnIdBacktrackChars;
+    private static readonly string[] FastServiceTierMarkers = ["\"service_tier\":\"priority\"", "\"service_tier\":\"fast\""];
+    private static readonly string[] TurnIdValueMarkers = ["\"turn_id\":\"", "\\\"turn_id\\\":\\\"", "\\u0022turn_id\\u0022:\\u0022"];
+    private static readonly object FastTurnIdsCacheLock = new();
+    private static string? cachedFastTurnIdsSignature;
+    private static IReadOnlySet<string> cachedFastTurnIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
     private static ModelPricing PricingFor(string model)
     {
