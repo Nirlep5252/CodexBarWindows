@@ -55,6 +55,10 @@ var tests = new (string Name, Action Run)[]
     ("Claude history dedupes streaming and subagent rows", ClaudeHistoryDedupesRows),
     ("Claude history reports incomplete cost for unknown models", ClaudeHistoryReportsIncompleteCost),
     ("Claude history is usable without Claude credentials", ClaudeHistoryDoesNotRequireCredentials),
+    ("Cursor usage keeps fractional percent fields", CursorUsageKeepsFractionalPercents),
+    ("Cursor enterprise overall drives headline", CursorEnterpriseOverallDrivesHeadline),
+    ("Cursor legacy request usage drives primary", CursorLegacyRequestsDrivePrimary),
+    ("Cursor cookie header normalization trims prefix", CursorCookieHeaderNormalizationTrimsPrefix),
 };
 
 var failures = new List<string>();
@@ -360,6 +364,100 @@ static void ClaudeHistoryDoesNotRequireCredentials()
     var result = fixture.Read();
     Assert(result.Insights is not null, "history should be read from files only");
     AssertEqual(15L, Today(result).TotalTokens, "local tokens");
+}
+
+static void CursorUsageKeepsFractionalPercents()
+{
+    var snapshot = CursorUsageReader.MapUsage(new CursorUsageSummaryResponse(
+        BillingCycleStart: "2026-03-18T20:45:42.000Z",
+        BillingCycleEnd: "2026-04-18T20:45:42.000Z",
+        MembershipType: "pro",
+        LimitType: "user",
+        IsUnlimited: false,
+        AutoModelSelectedDisplayMessage: null,
+        NamedModelSelectedDisplayMessage: null,
+        IndividualUsage: new CursorIndividualUsageResponse(
+            Plan: new CursorPlanUsageResponse(
+                Enabled: true,
+                Used: 86,
+                Limit: 2000,
+                Remaining: 1914,
+                Breakdown: new CursorPlanBreakdownResponse(86, 0, 86),
+                AutoPercentUsed: 0.36,
+                ApiPercentUsed: 0.7111111111111111,
+                TotalPercentUsed: 0.441025641025641),
+            OnDemand: new CursorOnDemandUsageResponse(false, 0, null, null),
+            Overall: null),
+        TeamUsage: null));
+
+    AssertClose(0.441025641025641m, (decimal)snapshot.Primary.UsedPercent, "cursor total percent");
+    AssertClose(0.36m, (decimal)snapshot.Secondary!.UsedPercent, "cursor auto percent");
+    AssertClose(0.7111111111111111m, (decimal)snapshot.Tertiary!.UsedPercent, "cursor api percent");
+    AssertEqual("Cursor Pro", snapshot.PlanType!, "cursor plan label");
+    AssertEqual(44640, snapshot.Primary.WindowMinutes, "cursor billing-cycle minutes");
+}
+
+static void CursorEnterpriseOverallDrivesHeadline()
+{
+    var snapshot = CursorUsageReader.MapUsage(new CursorUsageSummaryResponse(
+        BillingCycleStart: "2026-04-01T00:00:00.000Z",
+        BillingCycleEnd: "2026-05-01T00:00:00.000Z",
+        MembershipType: "enterprise",
+        LimitType: "team",
+        IsUnlimited: false,
+        AutoModelSelectedDisplayMessage: null,
+        NamedModelSelectedDisplayMessage: null,
+        IndividualUsage: new CursorIndividualUsageResponse(
+            Plan: null,
+            OnDemand: null,
+            Overall: new CursorOverallUsageResponse(true, 7384, 10000, 2616)),
+        TeamUsage: new CursorTeamUsageResponse(
+            OnDemand: new CursorOnDemandUsageResponse(true, 0, null, null),
+            Pooled: new CursorPooledUsageResponse(true, 12_725_135, 28_122_000, 15_396_865))));
+
+    AssertClose(73.84m, (decimal)snapshot.Primary.UsedPercent, "enterprise personal cap percent");
+    AssertEqual("Cursor Enterprise", snapshot.PlanType!, "enterprise plan label");
+}
+
+static void CursorLegacyRequestsDrivePrimary()
+{
+    var snapshot = CursorUsageReader.MapUsage(
+        new CursorUsageSummaryResponse(
+            BillingCycleStart: null,
+            BillingCycleEnd: null,
+            MembershipType: "enterprise",
+            LimitType: null,
+            IsUnlimited: null,
+            AutoModelSelectedDisplayMessage: null,
+            NamedModelSelectedDisplayMessage: null,
+            IndividualUsage: null,
+            TeamUsage: null),
+        requestUsage: new CursorUsageResponse(
+            Gpt4: new CursorModelUsageResponse(
+                NumRequests: 120,
+                NumRequestsTotal: 240,
+                NumTokens: null,
+                MaxRequestUsage: 500,
+                MaxTokenUsage: null),
+            StartOfMonth: null));
+
+    AssertEqual("Requests", snapshot.Primary.Title, "legacy primary title");
+    AssertClose(48m, (decimal)snapshot.Primary.UsedPercent, "legacy request percent");
+}
+
+static void CursorCookieHeaderNormalizationTrimsPrefix()
+{
+    var normalized = CursorUsageReader.NormalizeCookieHeader("  Cookie: WorkosCursorSessionToken=abc; foo=bar  ");
+    AssertEqual("WorkosCursorSessionToken=abc; foo=bar", normalized, "normalized cursor cookie header");
+
+    var bare = CursorUsageReader.NormalizeCookieHeader("abc123");
+    AssertEqual("WorkosCursorSessionToken=abc123", bare, "bare cursor token should become a Cookie header");
+
+    var lower = CursorUsageReader.NormalizeCookieHeader("workoscursorsessiontoken=abc; next-auth.session-token=def");
+    AssertEqual(
+        "WorkosCursorSessionToken=abc; next-auth.session-token=def",
+        lower,
+        "known cursor cookie names should use canonical casing");
 }
 
 static ProviderDailyUsage Today(ProviderUsageInsightsLookupResult result)

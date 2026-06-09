@@ -3,6 +3,7 @@ namespace CodexBarWindows;
 public sealed class TrayApplicationContext : ApplicationContext
 {
     private readonly ClaudeUsageReader claudeUsageReader = new();
+    private readonly CursorUsageReader cursorUsageReader = new();
     private readonly GitHubReleaseUpdater releaseUpdater = new();
     private readonly Icon trayIcon = TrayIconFactory.Create();
     private readonly NotifyIcon notifyIcon;
@@ -16,6 +17,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly Dictionary<string, ProviderUsageLookupResult> latestCodexUsage = [];
     private readonly Dictionary<string, ProviderUsageInsightsLookupResult> latestHistory = [];
     private ProviderUsageLookupResult latestClaudeUsage = new(null, "Usage has not been loaded yet.");
+    private ProviderUsageLookupResult latestCursorUsage = new(null, "Usage has not been loaded yet.");
     private CancellationTokenSource? refreshCancellation;
     private int refreshGeneration;
     private int updateCheckInProgress;
@@ -44,7 +46,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         notifyIcon.MouseUp += OnTrayMouseUp;
         popup.SelectedProviderChanged += (_, providerKey) =>
         {
-            if (!GetLatestUsage(providerKey).HasSnapshot || !GetLatestHistory(providerKey).HasInsights)
+            var needsHistory = providerKey != UsagePopupForm.CursorProviderKey;
+            if (!GetLatestUsage(providerKey).HasSnapshot || (needsHistory && !GetLatestHistory(providerKey).HasInsights))
             {
                 BeginRefresh(showLoading: true);
             }
@@ -134,6 +137,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
         popup.UpdateProviderHistory(UsagePopupForm.ClaudeProviderKey, GetLatestHistory(UsagePopupForm.ClaudeProviderKey));
+        popup.UpdateUsage(UsagePopupForm.CursorProviderKey, latestCursorUsage);
         popup.ShowNear(anchor);
 
         if (refresh)
@@ -206,7 +210,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                         popup.UpdateUsage(pair.Key, pair.Value);
                     }
 
-                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage);
+                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage);
                 });
             }
 
@@ -232,7 +236,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 {
                     latestClaudeUsage = claudeResult;
                     popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
-                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage);
+                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage);
                 });
             }
 
@@ -247,12 +251,24 @@ public sealed class TrayApplicationContext : ApplicationContext
                 });
             }
 
+            async Task RefreshCursorLimitsAsync()
+            {
+                var cursorResult = await cursorUsageReader.ReadLatestAsync(cancellation.Token).ConfigureAwait(false);
+                PostIfCurrent(() =>
+                {
+                    latestCursorUsage = cursorResult;
+                    popup.UpdateUsage(UsagePopupForm.CursorProviderKey, latestCursorUsage);
+                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage);
+                });
+            }
+
             var refreshTasks = new[]
             {
                 RefreshCodexLimitsAsync(),
                 RefreshCodexHistoryAsync(),
                 RefreshClaudeLimitsAsync(),
                 RefreshClaudeHistoryAsync(),
+                RefreshCursorLimitsAsync(),
             };
 
             try
@@ -278,7 +294,9 @@ public sealed class TrayApplicationContext : ApplicationContext
 
                     latestClaudeUsage = failed;
                     popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
-                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage);
+                    latestCursorUsage = failed;
+                    popup.UpdateUsage(UsagePopupForm.CursorProviderKey, latestCursorUsage);
+                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage);
                 });
             }
             finally
@@ -307,6 +325,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         settingsForm = new SettingsForm();
         settingsForm.CodexCliEntriesChanged += (_, _) => ReloadCodexCliEntries();
+        settingsForm.CursorSettingsChanged += (_, _) => BeginRefresh(showLoading: true);
         settingsForm.FormClosed += (_, _) => settingsForm = null;
         settingsForm.Show();
         settingsForm.Activate();
@@ -395,6 +414,11 @@ public sealed class TrayApplicationContext : ApplicationContext
             return latestClaudeUsage;
         }
 
+        if (providerKey == UsagePopupForm.CursorProviderKey)
+        {
+            return latestCursorUsage;
+        }
+
         return latestCodexUsage.TryGetValue(providerKey, out var result)
             ? result
             : new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
@@ -430,15 +454,17 @@ public sealed class TrayApplicationContext : ApplicationContext
         latestHistory.TryAdd(UsagePopupForm.ClaudeProviderKey, new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet."));
         popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
         popup.UpdateProviderHistory(UsagePopupForm.ClaudeProviderKey, GetLatestHistory(UsagePopupForm.ClaudeProviderKey));
+        popup.UpdateUsage(UsagePopupForm.CursorProviderKey, latestCursorUsage);
         BeginRefresh(showLoading: false);
     }
 
     private static string BuildTooltip(
         IReadOnlyList<CodexCliEntry> codexEntries,
         IReadOnlyDictionary<string, ProviderUsageLookupResult> codexUsage,
-        ProviderUsageLookupResult claudeUsage)
+        ProviderUsageLookupResult claudeUsage,
+        ProviderUsageLookupResult cursorUsage)
     {
-        if (codexUsage.Values.All(result => result.Snapshot is null) && claudeUsage.Snapshot is null)
+        if (codexUsage.Values.All(result => result.Snapshot is null) && claudeUsage.Snapshot is null && cursorUsage.Snapshot is null)
         {
             return TrimTooltip("CodexBarWindows: no usage data found");
         }
@@ -457,8 +483,11 @@ public sealed class TrayApplicationContext : ApplicationContext
         var claudeText = claudeUsage.Snapshot is { } claude
             ? $"Claude {claude.Primary.UsedPercent:0.#}%"
             : "Claude --";
+        var cursorText = cursorUsage.Snapshot is { } cursor
+            ? $"Cursor {cursor.Primary.UsedPercent:0.#}%"
+            : "Cursor --";
 
-        return TrimTooltip($"{codexText} 5h used, {claudeText} 5h used");
+        return TrimTooltip($"{codexText} 5h, {claudeText} 5h, {cursorText}");
     }
 
     private static string TrimTooltip(string value)

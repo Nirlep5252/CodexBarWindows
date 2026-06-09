@@ -10,6 +10,7 @@ public sealed class SettingsForm : Form
     private readonly Label subtitleLabel;
     private readonly CardPanel generalCard;
     private readonly CardPanel accountsCard;
+    private readonly CardPanel cursorCard;
     private readonly Label generalTitleLabel;
     private readonly Label generalDescriptionLabel;
     private readonly Label startupTitleLabel;
@@ -17,6 +18,12 @@ public sealed class SettingsForm : Form
     private readonly ToggleSwitch startWithWindowsToggle;
     private readonly Label accountsTitleLabel;
     private readonly Label accountsDescriptionLabel;
+    private readonly Label cursorTitleLabel;
+    private readonly Label cursorDescriptionLabel;
+    private readonly Label cursorCookieLabel;
+    private readonly ModernTextField cursorCookieTextBox;
+    private readonly ModernButton saveCursorCookieButton;
+    private readonly ModernButton clearCursorCookieButton;
     private readonly AccountListBox accountListBox;
     private readonly Label accountNameLabel;
     private readonly Label binaryPathLabel;
@@ -31,6 +38,7 @@ public sealed class SettingsForm : Form
     private readonly List<CodexCliEntry> codexCliEntries;
 
     public event EventHandler? CodexCliEntriesChanged;
+    public event EventHandler? CursorSettingsChanged;
 
     public SettingsForm()
     {
@@ -39,7 +47,7 @@ public sealed class SettingsForm : Form
         AutoScaleMode = AutoScaleMode.Dpi;
         AutoScroll = true;
         BackColor = theme.Window;
-        ClientSize = new Size(620, 735);
+        ClientSize = new Size(620, 890);
         Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         Icon = TrayIconFactory.Create();
@@ -98,9 +106,53 @@ public sealed class SettingsForm : Form
             startWithWindowsToggle
         ]);
 
-        accountsCard = new CardPanel(theme)
+        cursorCard = new CardPanel(theme)
         {
             Location = new Point(28, 310),
+            Size = new Size(564, 154)
+        };
+
+        cursorTitleLabel = CardTitle("Cursor", new Point(20, 18), new Size(220, 28));
+        cursorDescriptionLabel = CardDescription(
+            "Paste a Cookie header from a cursor.com request to show Cursor usage.",
+            new Point(20, 48),
+            new Size(508, 24));
+        cursorCookieLabel = FieldLabel("Cookie header", new Point(20, 82), new Size(140, 18));
+        cursorCookieTextBox = new ModernTextField(theme)
+        {
+            Location = new Point(20, 103),
+            Size = new Size(346, 34),
+            PlaceholderText = "Cookie: WorkosCursorSessionToken=..."
+        };
+
+        saveCursorCookieButton = new ModernButton(theme, ButtonKind.Primary)
+        {
+            Location = new Point(378, 103),
+            Size = new Size(72, 34),
+            Text = "Save"
+        };
+        saveCursorCookieButton.Click += (_, _) => SaveCursorCookieHeader();
+
+        clearCursorCookieButton = new ModernButton(theme, ButtonKind.Secondary)
+        {
+            Location = new Point(458, 103),
+            Size = new Size(72, 34),
+            Text = "Clear"
+        };
+        clearCursorCookieButton.Click += (_, _) => ClearCursorCookieHeader();
+
+        cursorCard.Controls.AddRange([
+            cursorTitleLabel,
+            cursorDescriptionLabel,
+            cursorCookieLabel,
+            cursorCookieTextBox,
+            saveCursorCookieButton,
+            clearCursorCookieButton
+        ]);
+
+        accountsCard = new CardPanel(theme)
+        {
+            Location = new Point(28, 500),
             Size = new Size(564, 260)
         };
 
@@ -183,14 +235,14 @@ public sealed class SettingsForm : Form
         {
             AutoSize = false,
             Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular),
-            Location = new Point(30, 696),
+            Location = new Point(30, 846),
             Size = new Size(360, 24),
             Text = $"Version {AppInfo.VersionText}"
         };
 
         closeButton = new ModernButton(theme, ButtonKind.Secondary)
         {
-            Location = new Point(488, 688),
+            Location = new Point(488, 838),
             Size = new Size(104, 34),
             Text = "Close"
         };
@@ -200,11 +252,13 @@ public sealed class SettingsForm : Form
             headingLabel,
             subtitleLabel,
             generalCard,
+            cursorCard,
             accountsCard,
             versionLabel,
             closeButton
         ]);
 
+        cursorCookieTextBox.Text = CursorSettings.LoadCookieHeader();
         RefreshCodexCliList();
         ApplyTheme();
     }
@@ -228,6 +282,7 @@ public sealed class SettingsForm : Form
                  {
                      generalTitleLabel,
                      startupTitleLabel,
+                     cursorTitleLabel,
                      accountsTitleLabel
                  })
         {
@@ -239,6 +294,8 @@ public sealed class SettingsForm : Form
                  {
                      generalDescriptionLabel,
                      startupDescriptionLabel,
+                     cursorDescriptionLabel,
+                     cursorCookieLabel,
                      accountsDescriptionLabel,
                      accountNameLabel,
                      binaryPathLabel
@@ -250,6 +307,7 @@ public sealed class SettingsForm : Form
 
         accountNameTextBox.ApplyTheme(theme);
         binaryPathTextBox.ApplyTheme(theme);
+        cursorCookieTextBox.ApplyTheme(theme);
     }
 
     private void RefreshCodexCliList()
@@ -378,6 +436,32 @@ public sealed class SettingsForm : Form
     {
         CodexCliSettings.SaveAdditional(codexCliEntries);
         CodexCliEntriesChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void SaveCursorCookieHeader()
+    {
+        var normalized = CursorUsageReader.NormalizeCookieHeader(cursorCookieTextBox.Text);
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            MessageBox.Show(
+                this,
+                "Paste a Cookie header from a cursor.com request, or use Clear to remove the current header.",
+                "Cursor Cookie header",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        CursorSettings.SaveCookieHeader(normalized);
+        cursorCookieTextBox.Text = normalized;
+        CursorSettingsChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void ClearCursorCookieHeader()
+    {
+        CursorSettings.SaveCookieHeader(string.Empty);
+        cursorCookieTextBox.Text = string.Empty;
+        CursorSettingsChanged?.Invoke(this, EventArgs.Empty);
     }
 
     private static Label CardTitle(string text, Point location, Size size)

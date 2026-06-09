@@ -6,6 +6,7 @@ public sealed class UsagePopupForm : Form
 {
     private const int BaseWidth = 420;
     private const int BaseHeight = 304;
+    private const int CursorBaseHeight = 400;
     private const int HistoryExpandedHeight = 660;
     private const int HistoryCollapsedHeight = 360;
     private readonly Label titleLabel;
@@ -17,6 +18,7 @@ public sealed class UsagePopupForm : Form
     private readonly Label statusLabel;
     private readonly UsageSection fiveHourSection;
     private readonly UsageSection weeklySection;
+    private readonly UsageSection tertiarySection;
     private readonly ProviderHistorySection providerHistorySection;
     private readonly CloseGlyphButton closeButton;
     private ThemePalette theme = ThemePalette.FromWindows();
@@ -97,7 +99,11 @@ public sealed class UsagePopupForm : Form
 
         Deactivate += (_, _) => Hide();
         FormClosing += OnFormClosing;
-        ConfigureProviders([new ProviderDescriptor(CodexProviderKey("default"), "Codex", false), ClaudeProvider]);
+        tertiarySection = new UsageSection("API");
+        Controls.Add(tertiarySection);
+        tertiarySection.EnableDragMove();
+
+        ConfigureProviders([new ProviderDescriptor(CodexProviderKey("default"), "Codex", UsageProvider.Codex), ClaudeProvider, CursorProvider]);
         ApplyScaledLayout();
         ApplyTheme();
         RenderSelectedProvider();
@@ -161,7 +167,10 @@ public sealed class UsagePopupForm : Form
     private void ApplyScaledLayout()
     {
         var scale = DpiScale;
-        var baseHeight = providerHistorySection.IsExpanded ? HistoryExpandedHeight : HistoryCollapsedHeight;
+        var selectedProvider = GetProvider(selectedProviderKey);
+        var baseHeight = selectedProvider.IsCursor
+            ? CursorBaseHeight
+            : providerHistorySection.IsExpanded ? HistoryExpandedHeight : HistoryCollapsedHeight;
         SuspendLayout();
 
         ClientSize = new Size(ScaleInt(BaseWidth, scale), ScaleInt(baseHeight, scale));
@@ -177,13 +186,24 @@ public sealed class UsagePopupForm : Form
             ScaleInt(34, scale));
         fiveHourSection.Bounds = ScaleRect(18, 82, 384, 86, scale);
         weeklySection.Bounds = ScaleRect(18, 178, 384, 86, scale);
-        providerHistorySection.Visible = true;
-        var insightsHeight = providerHistorySection.IsExpanded ? 370 : 70;
-        providerHistorySection.Bounds = ScaleRect(18, 274, 384, insightsHeight, scale);
-        statusLabel.Bounds = ScaleRect(24, providerHistorySection.IsExpanded ? 642 : 344, 372, 16, scale);
+        tertiarySection.Visible = selectedProvider.IsCursor;
+        if (selectedProvider.IsCursor)
+        {
+            tertiarySection.Bounds = ScaleRect(18, 274, 384, 86, scale);
+            providerHistorySection.Visible = false;
+            statusLabel.Bounds = ScaleRect(24, 374, 372, 16, scale);
+        }
+        else
+        {
+            providerHistorySection.Visible = true;
+            var insightsHeight = providerHistorySection.IsExpanded ? 370 : 70;
+            providerHistorySection.Bounds = ScaleRect(18, 274, 384, insightsHeight, scale);
+            statusLabel.Bounds = ScaleRect(24, providerHistorySection.IsExpanded ? 642 : 344, 372, 16, scale);
+        }
 
         fiveHourSection.ApplyLayoutScale(scale);
         weeklySection.ApplyLayoutScale(scale);
+        tertiarySection.ApplyLayoutScale(scale);
         providerHistorySection.ApplyLayoutScale(scale);
 
         ResumeLayout(performLayout: true);
@@ -216,8 +236,9 @@ public sealed class UsagePopupForm : Form
     public void ConfigureCodexEntries(IReadOnlyList<CodexCliEntry> codexEntries)
     {
         var descriptors = codexEntries
-            .Select(entry => new ProviderDescriptor(CodexProviderKey(entry.Id), entry.Name, false))
+            .Select(entry => new ProviderDescriptor(CodexProviderKey(entry.Id), entry.Name, UsageProvider.Codex))
             .Append(ClaudeProvider)
+            .Append(CursorProvider)
             .ToList();
 
         ConfigureProviders(descriptors);
@@ -245,6 +266,11 @@ public sealed class UsagePopupForm : Form
 
     public void SetProviderHistoryLoading(string providerKey)
     {
+        if (GetProvider(providerKey).IsCursor)
+        {
+            return;
+        }
+
         if (providerKey == selectedProviderKey)
         {
             providerHistorySection.SetLoading();
@@ -265,11 +291,15 @@ public sealed class UsagePopupForm : Form
         if (providerKey == selectedProviderKey)
         {
             planLabel.Text = $"Fetching {provider.Name} limits...";
-            fiveHourSection.SetLoading("5 hour limit");
-            weeklySection.SetLoading("Weekly limit");
+            fiveHourSection.SetLoading(provider.IsCursor ? "Total" : "5 hour limit");
+            weeklySection.SetLoading(provider.IsCursor ? "Auto" : "Weekly limit");
+            tertiarySection.SetLoading("API");
+            tertiarySection.Visible = provider.IsCursor;
             statusLabel.Text = provider.IsClaude
                 ? "Reading from Claude Code OAuth..."
-                : "Reading from Codex CLI...";
+                : provider.IsCursor
+                    ? "Reading from cursor.com..."
+                    : "Reading from Codex CLI...";
         }
     }
 
@@ -294,23 +324,29 @@ public sealed class UsagePopupForm : Form
         }
 
         var provider = GetProvider(selectedProviderKey);
-        providerHistorySection.Visible = true;
+        providerHistorySection.Visible = !provider.IsCursor;
+        tertiarySection.Visible = provider.IsCursor;
         titleLabel.Text = $"{provider.Name} rate limits";
         var result = GetProviderUsage(selectedProviderKey);
 
         if (result.Snapshot is not { } snapshot)
         {
-            planLabel.Text = $"Waiting for local {provider.Name} usage data";
-            fiveHourSection.SetUnavailable("5 hour limit");
-            weeklySection.SetUnavailable("Weekly limit");
+            planLabel.Text = provider.IsCursor
+                ? "Waiting for Cursor usage data"
+                : $"Waiting for local {provider.Name} usage data";
+            fiveHourSection.SetUnavailable(provider.IsCursor ? "Total" : "5 hour limit");
+            weeklySection.SetUnavailable(provider.IsCursor ? "Auto" : "Weekly limit");
+            tertiarySection.SetUnavailable("API");
             RenderProviderHistory(provider);
             statusLabel.Text = result.Error ?? "No usage data found.";
             return;
         }
 
-        planLabel.Text = string.IsNullOrWhiteSpace(snapshot.PlanType)
-            ? provider.IsClaude ? "Claude Code usage data" : "Local Codex session data"
-            : $"{ToTitleCase(snapshot.PlanType)} plan";
+        planLabel.Text = provider.IsCursor
+            ? CursorPlanText(snapshot)
+            : string.IsNullOrWhiteSpace(snapshot.PlanType)
+                ? provider.IsClaude ? "Claude Code usage data" : "Local Codex session data"
+                : $"{ToTitleCase(snapshot.PlanType)} plan";
 
         fiveHourSection.SetUsage(snapshot.Primary);
         if (snapshot.Secondary is { } secondary)
@@ -319,15 +355,32 @@ public sealed class UsagePopupForm : Form
         }
         else
         {
-            weeklySection.SetUnavailable(snapshot.Primary.WindowMinutes == 10080 ? "5 hour limit" : "Weekly limit");
+            weeklySection.SetUnavailable(provider.IsCursor ? "Auto" : snapshot.Primary.WindowMinutes == 10080 ? "5 hour limit" : "Weekly limit");
+        }
+
+        if (provider.IsCursor)
+        {
+            if (snapshot.Tertiary is { } tertiary)
+            {
+                tertiarySection.SetUsage(tertiary);
+            }
+            else
+            {
+                tertiarySection.SetUnavailable("API");
+            }
         }
 
         RenderProviderHistory(provider);
-        statusLabel.Text = string.Empty;
+        statusLabel.Text = provider.IsCursor ? CursorStatusText(snapshot) : string.Empty;
     }
 
     private void RenderProviderHistory(ProviderDescriptor provider)
     {
+        if (provider.IsCursor)
+        {
+            return;
+        }
+
         var result = GetProviderHistory(selectedProviderKey);
         if (result.Insights is { } insights)
         {
@@ -356,7 +409,7 @@ public sealed class UsagePopupForm : Form
     {
         return providers.FirstOrDefault(provider => provider.Key == providerKey)
             ?? providers.FirstOrDefault()
-            ?? new ProviderDescriptor(CodexProviderKey("default"), "Codex", false);
+            ?? new ProviderDescriptor(CodexProviderKey("default"), "Codex", UsageProvider.Codex);
     }
 
     private void ConfigureProviders(IReadOnlyList<ProviderDescriptor> descriptors)
@@ -378,7 +431,7 @@ public sealed class UsagePopupForm : Form
                 provider.Key,
                 new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet."));
 
-            var tabButton = new ProviderTabButton(provider.Name, provider.Key, provider.IsClaude)
+            var tabButton = new ProviderTabButton(provider.Name, provider.Key, provider.Provider)
             {
                 Anchor = AnchorStyles.Top | AnchorStyles.Right,
                 AccessibleName = provider.Name
@@ -422,8 +475,14 @@ public sealed class UsagePopupForm : Form
     }
 
     public const string ClaudeProviderKey = "claude";
-    private static readonly ProviderDescriptor ClaudeProvider = new(ClaudeProviderKey, "Claude", true);
-    private sealed record ProviderDescriptor(string Key, string Name, bool IsClaude);
+    public const string CursorProviderKey = "cursor";
+    private static readonly ProviderDescriptor ClaudeProvider = new(ClaudeProviderKey, "Claude", UsageProvider.Claude);
+    private static readonly ProviderDescriptor CursorProvider = new(CursorProviderKey, "Cursor", UsageProvider.Cursor);
+    private sealed record ProviderDescriptor(string Key, string Name, UsageProvider Provider)
+    {
+        public bool IsClaude => Provider == UsageProvider.Claude;
+        public bool IsCursor => Provider == UsageProvider.Cursor;
+    }
 
     private Point CalculateLocation(Point anchor)
     {
@@ -466,6 +525,38 @@ public sealed class UsagePopupForm : Form
         return char.ToUpperInvariant(value[0]) + value[1..].ToLowerInvariant();
     }
 
+    private static string CursorPlanText(ProviderUsageSnapshot snapshot)
+    {
+        var plan = string.IsNullOrWhiteSpace(snapshot.PlanType) ? "Cursor usage data" : snapshot.PlanType;
+        return string.IsNullOrWhiteSpace(snapshot.AccountEmail)
+            ? plan
+            : $"{plan} · {snapshot.AccountEmail}";
+    }
+
+    private static string CursorStatusText(ProviderUsageSnapshot snapshot)
+    {
+        if (snapshot.Cost is not { } cost)
+        {
+            return $"Updated {FormatObservedAt(snapshot.ObservedAt)}";
+        }
+
+        var used = FormatCurrency(cost.Used, cost.CurrencyCode);
+        var budget = cost.Limit is { } limit && limit > 0
+            ? $" / {FormatCurrency(limit, cost.CurrencyCode)}"
+            : string.Empty;
+        return $"On-demand {used}{budget} · updated {FormatObservedAt(snapshot.ObservedAt)}";
+    }
+
+    private static string FormatCurrency(decimal value, string currencyCode)
+    {
+        if (!string.Equals(currencyCode, "USD", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"{value:0.##} {currencyCode}";
+        }
+
+        return value <= 0 ? "$0.00" : value < 0.01m ? "<$0.01" : $"${value:0.00}";
+    }
+
     private void RefreshTheme()
     {
         var updated = ThemePalette.FromWindows();
@@ -496,6 +587,7 @@ public sealed class UsagePopupForm : Form
 
         fiveHourSection.ApplyTheme(theme);
         weeklySection.ApplyTheme(theme);
+        tertiarySection.ApplyTheme(theme);
         providerHistorySection.ApplyTheme(theme);
 
         if (IsHandleCreated)
@@ -2041,6 +2133,8 @@ public sealed class UsagePopupForm : Form
     {
         private const string ClaudeSymbolPathData =
             "m19.6 66.5 19.7-11 .3-1-.3-.5h-1l-3.3-.2-11.2-.3L14 53l-9.5-.5-2.4-.5L0 49l.2-1.5 2-1.3 2.9.2 6.3.5 9.5.6 6.9.4L38 49.1h1.6l.2-.7-.5-.4-.4-.4L29 41l-10.6-7-5.6-4.1-3-2-1.5-2-.6-4.2 2.7-3 3.7.3.9.2 3.7 2.9 8 6.1L37 36l1.5 1.2.6-.4.1-.3-.7-1.1L33 25l-6-10.4-2.7-4.3-.7-2.6c-.3-1-.4-2-.4-3l3-4.2L28 0l4.2.6L33.8 2l2.6 6 4.1 9.3L47 29.9l2 3.8 1 3.4.3 1h.7v-.5l.5-7.2 1-8.7 1-11.2.3-3.2 1.6-3.8 3-2L61 2.6l2 2.9-.3 1.8-1.1 7.7L59 27.1l-1.5 8.2h.9l1-1.1 4.1-5.4 6.9-8.6 3-3.5L77 13l2.3-1.8h4.3l3.1 4.7-1.4 4.9-4.4 5.6-3.7 4.7-5.3 7.1-3.2 5.7.3.4h.7l12-2.6 6.4-1.1 7.6-1.3 3.5 1.6.4 1.6-1.4 3.4-8.2 2-9.6 2-14.3 3.3-.2.1.2.3 6.4.6 2.8.2h6.8l12.6 1 3.3 2 1.9 2.7-.3 2-5.1 2.6-6.8-1.6-16-3.8-5.4-1.3h-.8v.4l4.6 4.5 8.3 7.5L89 80.1l.5 2.4-1.3 2-1.4-.2-9.2-7-3.6-3-8-6.8h-.5v.7l1.8 2.7 9.8 14.7.5 4.5-.7 1.4-2.6 1-2.7-.6-5.8-8-6-9-4.7-8.2-.5.4-2.9 30.2-1.3 1.5-3 1.2-2.5-2-1.4-3 1.4-6.2 1.6-8 1.3-6.4 1.2-7.9.7-2.6v-.2H49L43 72l-9 12.3-7.2 7.6-1.7.7-3-1.5.3-2.8L24 86l10-12.8 6-7.9 4-4.6-.1-.5h-.3L17.2 77.4l-4.7.6-2-2 .2-3 1-1 8-5.5Z";
+        private const string CursorSymbolPathData =
+            "M84.0704 28.9353L51.9066 10.4454C50.8738 9.85153 49.5994 9.85153 48.5666 10.4454L16.4043 28.9353C15.536 29.4345 15 30.3576 15 31.3575V68.6425C15 69.6424 15.536 70.5655 16.4043 71.0647L48.5681 89.5546C49.6009 90.1485 50.8753 90.1485 51.9081 89.5546L84.0719 71.0647C84.9402 70.5655 85.4762 69.6424 85.4762 68.6425V31.3575C85.4762 30.3576 84.9402 29.4345 84.0719 28.9353H84.0704ZM82.0501 32.8519L51.0006 86.4003C50.7907 86.7611 50.2366 86.6138 50.2366 86.1958V51.1329C50.2366 50.4322 49.8606 49.7842 49.2506 49.4324L18.7553 31.9017C18.3929 31.6927 18.5409 31.141 18.9606 31.141H81.0595C81.9414 31.141 82.4925 32.0927 82.0516 32.8534H82.0501V32.8519Z";
 
         private static readonly string OpenAiWhiteLogoPath = Path.Combine(
             AppContext.BaseDirectory,
@@ -2057,11 +2151,11 @@ public sealed class UsagePopupForm : Form
         private bool pressing;
         private bool selected;
 
-        public ProviderTabButton(string text, string providerKey, bool isClaude)
+        public ProviderTabButton(string text, string providerKey, UsageProvider provider)
         {
             Text = text;
             ProviderKey = providerKey;
-            IsClaude = isClaude;
+            Provider = provider;
             Cursor = Cursors.Hand;
             SetStyle(
                 ControlStyles.AllPaintingInWmPaint |
@@ -2078,7 +2172,7 @@ public sealed class UsagePopupForm : Form
 
         [System.ComponentModel.Browsable(false)]
         [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
-        public bool IsClaude { get; }
+        public UsageProvider Provider { get; }
 
         [System.ComponentModel.Browsable(false)]
         [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
@@ -2168,9 +2262,15 @@ public sealed class UsagePopupForm : Form
 
             var iconSize = Math.Max(16, Math.Min(Width, Height) - Math.Max(8, Height / 3));
             var iconBounds = new Rectangle(Width / 2 - iconSize / 2, Height / 2 - iconSize / 2, iconSize, iconSize);
-            if (IsClaude)
+            if (Provider == UsageProvider.Claude)
             {
                 DrawClaudeLogo(e.Graphics, iconBounds);
+                return;
+            }
+
+            if (Provider == UsageProvider.Cursor)
+            {
+                DrawCursorLogo(e.Graphics, iconBounds, selected);
                 return;
             }
 
@@ -2218,6 +2318,29 @@ public sealed class UsagePopupForm : Form
             try
             {
                 using var path = CreateSvgPath(ClaudeSymbolPathData);
+                using var transform = new System.Drawing.Drawing2D.Matrix(
+                    bounds.Width / 100f,
+                    0,
+                    0,
+                    bounds.Height / 100f,
+                    bounds.Left,
+                    bounds.Top);
+                path.Transform(transform);
+                graphics.FillPath(brush, path);
+            }
+            catch
+            {
+                graphics.FillEllipse(brush, bounds);
+            }
+        }
+
+        private static void DrawCursorLogo(Graphics graphics, Rectangle bounds, bool isSelected)
+        {
+            var color = Color.White;
+            using var brush = new SolidBrush(color);
+            try
+            {
+                using var path = CreateSvgPath(CursorSymbolPathData);
                 using var transform = new System.Drawing.Drawing2D.Matrix(
                     bounds.Width / 100f,
                     0,

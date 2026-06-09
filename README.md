@@ -2,7 +2,7 @@
 
 A small Windows tray app for checking AI coding assistant usage limits without opening a terminal.
 
-CodexBarWindows stays in the system tray. Left-click the tray icon to open a compact popup near the taskbar with tabs for Codex and Claude usage limits, including percentage used, remaining allowance, reset time, and Codex history charts.
+CodexBarWindows stays in the system tray. Left-click the tray icon to open a compact popup near the taskbar with tabs for Codex, Claude, and Cursor usage limits, including percentage used, remaining allowance, reset time, and Codex history charts.
 
 ![CodexBarWindows Codex history preview](docs/codexbarwindows-history-preview.png)
 
@@ -14,6 +14,7 @@ CodexBarWindows stays in the system tray. Left-click the tray icon to open a com
 - Displays 5 hour and weekly usage windows for one or more Codex CLI accounts.
 - Shows Codex local history charts for estimated 30 day spend and model usage breakdowns from session logs.
 - Displays 5 hour and weekly usage windows for Claude Code when local Claude credentials are available.
+- Displays Cursor Total, Auto, and API usage from cursor.com when a Cursor Cookie header is configured.
 - Follows the Windows light/dark system theme.
 - Draggable popup.
 - Tray context menu for settings, manual update checks, and exit.
@@ -28,6 +29,7 @@ CodexBarWindows stays in the system tray. Left-click the tray icon to open a com
 - Codex CLI installed and authenticated for Codex limits.
 - Optional additional Codex CLI binaries or wrapper scripts for other authenticated accounts.
 - Claude Code installed and authenticated for Claude limits.
+- A Cursor Cookie header from a signed-in cursor.com browser session for Cursor limits.
 
 The installer publishes a self-contained Windows build, so the installed app does not require a separate .NET runtime.
 
@@ -121,7 +123,7 @@ The PowerShell scripts are grouped under `Scripts/` because they are the primary
 The app version is defined in [Directory.Build.props](Directory.Build.props):
 
 ```xml
-<VersionPrefix>0.4.2</VersionPrefix>
+<VersionPrefix>0.5.0</VersionPrefix>
 ```
 
 Use semantic versions in the form `major.minor.patch`. MSI upgrades use this version, and the updater compares it against GitHub release tags.
@@ -129,8 +131,8 @@ Use semantic versions in the form `major.minor.patch`. MSI upgrades use this ver
 To publish a new version:
 
 ```powershell
-git tag v0.4.2
-git push origin v0.4.2
+git tag v0.5.0
+git push origin v0.5.0
 ```
 
 The GitHub Actions release workflow builds an MSI and attaches it to a GitHub Release.
@@ -143,8 +145,8 @@ You can also right-click the tray icon and choose `Check for updates`.
 
 Release requirements:
 
-- Tags must look like `v0.4.2`.
-- The release must include an MSI asset, for example `CodexBarWindows-0.4.2-win-x64.msi`.
+- Tags must look like `v0.5.0`.
+- The release must include an MSI asset, for example `CodexBarWindows-0.5.0-win-x64.msi`.
 - The new version must be greater than the installed assembly version.
 
 For private repositories, GitHub release checks require authentication. The app checks these sources in order:
@@ -166,6 +168,8 @@ The built-in Codex tab uses `CODEX_BINARY` or `PATH`, matching the existing beha
 No Codex account token is stored by this app. Authentication remains managed by the Codex CLI.
 
 For Claude, the app reads the local Claude Code OAuth credential file at `%USERPROFILE%\.claude\.credentials.json` and calls Anthropic's OAuth usage endpoint. Tokens are read from Claude Code's existing local auth state and refreshed in memory only; this app does not write credentials back to disk.
+
+For Cursor, the app calls cursor.com usage endpoints using a manually configured Cookie header. Paste the header in `Settings` → `Cursor`. The header is stored encrypted for the current Windows user. Stage 1 does not automatically import browser cookies, and Cursor does not currently have a local token/cost history chart.
 
 ## Assets
 
