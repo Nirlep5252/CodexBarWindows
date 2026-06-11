@@ -105,6 +105,23 @@ public sealed class TrayApplicationContext : ApplicationContext
         return menu;
     }
 
+    public void NotifyAlreadyRunning()
+    {
+        uiContext.Post(_ =>
+        {
+            if (disposed)
+            {
+                return;
+            }
+
+            notifyIcon.ShowBalloonTip(
+                4000,
+                AppInfo.AppName,
+                $"{AppInfo.AppName} is already running. Use the tray icon to view usage.",
+                ToolTipIcon.Info);
+        }, null);
+    }
+
     private void OnTrayMouseUp(object? sender, MouseEventArgs e)
     {
         if (e.Button != MouseButtons.Left)

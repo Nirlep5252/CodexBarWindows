@@ -5,7 +5,16 @@ static class Program
     [STAThread]
     static void Main()
     {
+        using var instanceGuard = SingleInstanceGuard.TryAcquire();
+        if (instanceGuard is null)
+        {
+            SingleInstanceGuard.SignalExistingInstance();
+            return;
+        }
+
         ApplicationConfiguration.Initialize();
-        Application.Run(new TrayApplicationContext());
+        using var context = new TrayApplicationContext();
+        instanceGuard.ActivationRequested += context.NotifyAlreadyRunning;
+        Application.Run(context);
     }
 }
