@@ -2,9 +2,15 @@ using System.ComponentModel;
 
 namespace CodexBarWindows;
 
+/// <summary>
+/// Slim Windows 11 style progress meter: a 4px fully-rounded track with an accent fill that
+/// shifts to warning/danger at 70%/90% and animates value changes over 250ms.
+/// </summary>
 public sealed class UsageMeterControl : Control
 {
-    private double value;
+    private double targetValue;
+    private double displayedValue;
+    private IDisposable? valueAnimation;
     private Color trackColor = Color.FromArgb(237, 242, 247);
     private Color accentColor = Color.FromArgb(0, 95, 184);
     private Color warningColor = Color.FromArgb(202, 80, 16);
@@ -16,21 +22,41 @@ public sealed class UsageMeterControl : Control
             ControlStyles.AllPaintingInWmPaint |
             ControlStyles.OptimizedDoubleBuffer |
             ControlStyles.ResizeRedraw |
+            ControlStyles.SupportsTransparentBackColor |
             ControlStyles.UserPaint,
             true);
 
-        Height = 10;
+        Height = 4;
     }
 
     [DefaultValue(0d)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Visible)]
     public double Value
     {
-        get => value;
+        get => targetValue;
         set
         {
-            this.value = Math.Clamp(value, 0, 100);
-            Invalidate();
+            var clamped = Math.Clamp(value, 0, 100);
+            valueAnimation?.Dispose();
+            valueAnimation = null;
+            targetValue = clamped;
+
+            if (!IsHandleCreated || !Visible || displayedValue == clamped)
+            {
+                displayedValue = clamped;
+                Invalidate();
+                return;
+            }
+
+            valueAnimation = FluentAnimator.Animate(
+                displayedValue,
+                clamped,
+                250,
+                animated =>
+                {
+                    displayedValue = animated;
+                    Invalidate();
+                });
         }
     }
 
@@ -78,6 +104,17 @@ public sealed class UsageMeterControl : Control
         }
     }
 
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            valueAnimation?.Dispose();
+            valueAnimation = null;
+        }
+
+        base.Dispose(disposing);
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
@@ -93,60 +130,38 @@ public sealed class UsageMeterControl : Control
         using var backgroundBrush = new SolidBrush(TrackColor);
         using var fillBrush = new SolidBrush(GetFillColor());
 
-        var radius = bounds.Height;
-        using var backgroundPath = CreateRoundedPath(bounds, radius);
+        var radius = bounds.Height / 2f;
+        using var backgroundPath = FluentTheme.RoundedRect(bounds, radius);
         e.Graphics.FillPath(backgroundBrush, backgroundPath);
 
-        var fillWidth = (int)Math.Round(bounds.Width * (Value / 100));
-        if (fillWidth <= 0)
+        if (displayedValue <= 0)
         {
             return;
         }
 
-        var fillBounds = new Rectangle(bounds.X, bounds.Y, fillWidth, bounds.Height);
-        using var fillPath = CreateRoundedPath(fillBounds, radius);
+        // Never let the fill collapse below a fully-round nub; tiny percentages
+        // would otherwise render a clipped sliver instead of a rounded cap.
+        var fillWidth = Math.Max(
+            bounds.Height,
+            (int)Math.Round(bounds.Width * (displayedValue / 100d)));
+
+        var fillBounds = new RectangleF(bounds.X, bounds.Y, Math.Min(fillWidth, bounds.Width), bounds.Height);
+        using var fillPath = FluentTheme.RoundedRect(fillBounds, radius);
         e.Graphics.FillPath(fillBrush, fillPath);
     }
 
     private Color GetFillColor()
     {
-        if (Value >= 90)
+        if (targetValue >= 90)
         {
             return DangerColor;
         }
 
-        if (Value >= 70)
+        if (targetValue >= 70)
         {
             return WarningColor;
         }
 
         return AccentColor;
-    }
-
-    private static System.Drawing.Drawing2D.GraphicsPath CreateRoundedPath(Rectangle rectangle, int radius)
-    {
-        var path = new System.Drawing.Drawing2D.GraphicsPath();
-        var diameter = Math.Min(radius, Math.Min(rectangle.Width, rectangle.Height));
-
-        if (diameter <= 1)
-        {
-            path.AddRectangle(rectangle);
-            return path;
-        }
-
-        var arc = new Rectangle(rectangle.Location, new Size(diameter, diameter));
-        path.AddArc(arc, 180, 90);
-
-        arc.X = rectangle.Right - diameter;
-        path.AddArc(arc, 270, 90);
-
-        arc.Y = rectangle.Bottom - diameter;
-        path.AddArc(arc, 0, 90);
-
-        arc.X = rectangle.Left;
-        path.AddArc(arc, 90, 90);
-
-        path.CloseFigure();
-        return path;
     }
 }

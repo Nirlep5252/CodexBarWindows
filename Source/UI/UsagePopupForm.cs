@@ -1,39 +1,59 @@
 using Microsoft.Win32;
 
+// This UI is constructed in code only (no WinForms designer), so designer
+// code-serialization metadata for control properties is irrelevant.
+#pragma warning disable WFO1000
+
 namespace CodexBarWindows;
 
 public sealed class UsagePopupForm : Form
 {
+    // Base (96-dpi) layout metrics, all kept on a 4px grid and scaled via ScaleInt.
     private const int BaseWidth = 420;
-    private const int BaseHeight = 304;
-    private const int CursorBaseHeight = 400;
-    private const int HistoryExpandedHeight = 660;
-    private const int HistoryCollapsedHeight = 360;
+    private const int OuterMargin = 16;
+    private const int HeaderTitleTop = 12;
+    private const int UsageCardTop = 68;
+    private const int UsageRowHeight = 76;
+    private const int CardGap = 8;
+    private const int StatusHeight = 16;
+    private const int BottomMargin = 12;
+
     private readonly Label titleLabel;
     private readonly List<ProviderTabButton> tabButtons = [];
     private readonly List<ProviderDescriptor> providers = [];
     private readonly Dictionary<string, ProviderUsageLookupResult> usageByProvider = [];
-    private readonly Dictionary<string, ProviderUsageInsightsLookupResult> historyByProvider = [];
     private readonly Label planLabel;
     private readonly Label statusLabel;
+    private readonly UsageCardPanel usageCard;
     private readonly UsageSection fiveHourSection;
     private readonly UsageSection weeklySection;
     private readonly UsageSection tertiarySection;
-    private readonly ProviderHistorySection providerHistorySection;
-    private readonly CloseGlyphButton closeButton;
-    private ThemePalette theme = ThemePalette.FromWindows();
+    private readonly GlyphButton graphsButton;
+    private readonly GlyphButton closeButton;
+    private readonly List<Font> ownedFonts = [];
+    private UiSettings uiSettings;
+    private FluentTokens tokens;
+    private IDisposable? entranceAnimation;
+    private bool backdropActive;
+    private bool anchorToBottom = true;
     private string selectedProviderKey = CodexProviderKey("default");
 
     public event EventHandler<string>? SelectedProviderChanged;
 
+    /// <summary>Raised when the user clicks the header history button to open the usage graphs window.</summary>
+    public event EventHandler? UsageGraphsRequested;
+
     public UsagePopupForm()
     {
+        uiSettings = UiSettings.Load();
+        tokens = FluentTheme.Get(uiSettings.ResolveIsDark(), onBackdrop: false);
+
         AutoScaleMode = AutoScaleMode.None;
-        BackColor = theme.Surface;
-        ClientSize = new Size(BaseWidth, BaseHeight);
+        BackColor = tokens.Background;
+        ClientSize = new Size(BaseWidth, UsageCardTop + (UsageRowHeight * 2));
         ControlBox = false;
         DoubleBuffered = true;
-        Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular);
+        Font = OwnFont(FluentTheme.CaptionFont(1f));
         FormBorderStyle = FormBorderStyle.None;
         MaximizeBox = false;
         MinimizeBox = false;
@@ -43,65 +63,79 @@ public sealed class UsagePopupForm : Form
         Text = "Codex limits";
         TopMost = true;
 
-        closeButton = new CloseGlyphButton
+        closeButton = new GlyphButton(FluentIcons.Close, "Close")
         {
             Anchor = AnchorStyles.Top | AnchorStyles.Right,
             TabIndex = 0
         };
         closeButton.Click += (_, _) => Hide();
 
-        titleLabel = new Label
+        graphsButton = new GlyphButton(FluentIcons.History, "Usage graphs")
+        {
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            TabIndex = 1
+        };
+        graphsButton.Click += (_, _) =>
+        {
+            Hide();
+            UsageGraphsRequested?.Invoke(this, EventArgs.Empty);
+        };
+
+        titleLabel = new FluentLabel
         {
             AutoSize = false,
             AutoEllipsis = true,
-            Font = CreateFont("Segoe UI Variable Display", 15.5f, FontStyle.Bold),
-            Text = "Codex rate limits"
+            BackColor = Color.Transparent,
+            Font = OwnFont(FluentTheme.SubtitleFont(1f)),
+            Text = "Codex rate limits",
+            UseCompatibleTextRendering = true
         };
 
-        planLabel = new Label
+        planLabel = new FluentLabel
         {
             AutoSize = false,
-            Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular)
+            AutoEllipsis = true,
+            BackColor = Color.Transparent,
+            Font = OwnFont(FluentTheme.CaptionFont(1f)),
+            UseCompatibleTextRendering = true
         };
 
+        usageCard = new UsageCardPanel();
         fiveHourSection = new UsageSection("5 hour limit");
+        weeklySection = new UsageSection("Weekly limit") { ShowSeparator = true };
+        tertiarySection = new UsageSection("API") { ShowSeparator = true };
+        usageCard.Controls.Add(fiveHourSection);
+        usageCard.Controls.Add(weeklySection);
+        usageCard.Controls.Add(tertiarySection);
 
-        weeklySection = new UsageSection("Weekly limit");
-        providerHistorySection = new ProviderHistorySection();
-        providerHistorySection.ExpandedChanged += (_, _) =>
-        {
-            ApplyScaledLayout();
-            RenderSelectedProvider();
-        };
-
-        statusLabel = new Label
+        statusLabel = new FluentLabel
         {
             AutoEllipsis = true,
             AutoSize = false,
-            Font = CreateFont("Segoe UI Variable Text", 8.5f, FontStyle.Regular)
+            BackColor = Color.Transparent,
+            Font = OwnFont(FluentTheme.CaptionFont(1f)),
+            UseCompatibleTextRendering = true
         };
 
         Controls.Add(titleLabel);
         Controls.Add(planLabel);
-        Controls.Add(fiveHourSection);
-        Controls.Add(weeklySection);
-        Controls.Add(providerHistorySection);
+        Controls.Add(usageCard);
         Controls.Add(statusLabel);
+        Controls.Add(graphsButton);
         Controls.Add(closeButton);
 
         EnableDragMove(this);
         EnableDragMove(titleLabel);
         EnableDragMove(planLabel);
         EnableDragMove(statusLabel);
+        EnableDragMove(usageCard);
         fiveHourSection.EnableDragMove();
         weeklySection.EnableDragMove();
-        providerHistorySection.EnableDragMove();
+        tertiarySection.EnableDragMove();
 
         Deactivate += (_, _) => Hide();
         FormClosing += OnFormClosing;
-        tertiarySection = new UsageSection("API");
-        Controls.Add(tertiarySection);
-        tertiarySection.EnableDragMove();
+        UiSettings.Changed += OnUiSettingsChanged;
 
         ConfigureProviders([new ProviderDescriptor(CodexProviderKey("default"), "Codex", UsageProvider.Codex), ClaudeProvider, CursorProvider]);
         ApplyScaledLayout();
@@ -116,8 +150,16 @@ public sealed class UsagePopupForm : Form
         get
         {
             const int csDropShadow = 0x00020000;
+            const int wsExToolWindow = 0x00000080;
             var cp = base.CreateParams;
-            cp.ClassStyle |= csDropShadow;
+            cp.ExStyle |= wsExToolWindow;
+            if (!WindowEffects.IsWindows11)
+            {
+                // Pre-Win11 fallback only: on Windows 11 the DWM rounded-corner
+                // preference supplies the standard popup shadow.
+                cp.ClassStyle |= csDropShadow;
+            }
+
             return cp;
         }
     }
@@ -125,8 +167,12 @@ public sealed class UsagePopupForm : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
+
+        ApplyBackdropMaterial();
+        WindowEffects.SetRoundedCorners(Handle, round: true);
+        RefreshTheme(force: true);
         ApplyScaledLayout();
-        NativeMethods.ApplyWindowAttributes(Handle, theme.IsDark);
+        UpdateWindowRegion();
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -134,19 +180,145 @@ public sealed class UsagePopupForm : Form
         base.OnPaint(e);
         e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
 
-        using var borderPen = new Pen(theme.Border);
-        var borderRect = new Rectangle(0, 0, Width - 1, Height - 1);
-        using var path = RoundedPath(borderRect, 16);
+        var strokeWidth = Math.Max(1f, DpiScale);
+        using var borderPen = new Pen(tokens.CardStroke, strokeWidth);
+        var borderRect = new RectangleF(
+            strokeWidth / 2f,
+            strokeWidth / 2f,
+            Width - strokeWidth,
+            Height - strokeWidth);
+        using var path = FluentTheme.RoundedRect(borderRect, FluentTheme.OverlayCornerRadius * DpiScale);
         e.Graphics.DrawPath(borderPen, path);
+    }
+
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        // On the backdrop path alpha-0 pixels reveal the DWM material; the optional
+        // theme tint then composites over it (0 = pure material, 100 = solid).
+        if (!backdropActive)
+        {
+            e.Graphics.Clear(tokens.Background);
+            return;
+        }
+
+        e.Graphics.Clear(Color.Transparent);
+        var tintPercent = Math.Clamp(uiSettings.TintOpacityPercent, 0, 100);
+        if (tintPercent > 0)
+        {
+            var alpha = (int)Math.Round(255 * (tintPercent / 100.0));
+            using var tintBrush = new SolidBrush(Color.FromArgb(alpha, tokens.Background));
+            e.Graphics.FillRectangle(tintBrush, ClientRectangle);
+        }
+    }
+
+    protected override void OnSizeChanged(EventArgs e)
+    {
+        base.OnSizeChanged(e);
+        UpdateWindowRegion();
+    }
+
+    protected override void OnVisibleChanged(EventArgs e)
+    {
+        base.OnVisibleChanged(e);
+        if (!Visible)
+        {
+            // Stop the entrance slide as soon as the flyout hides so no
+            // animation timer keeps running behind an invisible window.
+            entranceAnimation?.Dispose();
+            entranceAnimation = null;
+        }
+    }
+
+    private void UpdateWindowRegion()
+    {
+        // Windows 11 rounds (and shadows) the frameless popup via DWM; a custom
+        // region there causes corner artifacts. Pre-Win11 keeps the legacy region.
+        if (WindowEffects.IsWindows11 || Width <= 0 || Height <= 0)
+        {
+            return;
+        }
+
+        using var path = FluentTheme.RoundedRect(
+            new RectangleF(0f, 0f, Width, Height),
+            FluentTheme.OverlayCornerRadius * DpiScale);
+        var previous = Region;
+        Region = new Region(path);
+        previous?.Dispose();
     }
 
     public void ShowNear(Point anchor)
     {
+        // DpiScale is 1.0 until the handle exists, so the first-ever open would lay out
+        // and position at 96-dpi metrics and only grow after Show() — off-screen at >100%.
+        if (!IsHandleCreated)
+        {
+            _ = Handle;
+        }
+
         RefreshTheme();
         ApplyScaledLayout();
-        Location = CalculateLocation(anchor);
+        var target = CalculateLocation(anchor);
+
+        // Entrance: slide up ~12px while keeping the window fully opaque.
+        // Never animate Opacity here - WS_EX_LAYERED disables the DWM backdrop.
+        entranceAnimation?.Dispose();
+        var slideDistance = ScaleInt(12, DpiScale);
+        entranceAnimation = FluentAnimator.Animate(
+            slideDistance,
+            0d,
+            150,
+            offset =>
+            {
+                if (!IsDisposed)
+                {
+                    Location = new Point(target.X, target.Y + (int)Math.Round(offset));
+                }
+            });
+
         Show();
         Activate();
+
+        if (uiSettings.Material != BackdropMaterial.Solid)
+        {
+            ApplyBackdropMaterial();
+            NudgeSizeForBackdrop();
+        }
+    }
+
+    /// <summary>
+    /// Forces DWM to attach the backdrop visual. A backdrop applied while the window is
+    /// hidden does not composite until the visible window genuinely resizes (a frame-changed
+    /// SetWindowPos is not enough — switching to the taller Cursor tab "fixed" it, switching
+    /// between same-height tabs did not). Grow 1px now and restore on the next message-pump
+    /// pass so DWM sees two real size changes; visually imperceptible.
+    /// </summary>
+    private void NudgeSizeForBackdrop()
+    {
+        if (!IsHandleCreated || !Visible || !backdropActive)
+        {
+            return;
+        }
+
+        var size = ClientSize;
+        ClientSize = new Size(size.Width, size.Height + 1);
+        BeginInvoke(new Action(() =>
+        {
+            if (!IsDisposed && IsHandleCreated)
+            {
+                ClientSize = size;
+            }
+        }));
+    }
+
+    protected override bool ProcessDialogKey(Keys keyData)
+    {
+        if (keyData == Keys.Escape)
+        {
+            Hide();
+            return true;
+        }
+
+        return base.ProcessDialogKey(keyData);
     }
 
     protected override void WndProc(ref Message m)
@@ -154,57 +326,122 @@ public sealed class UsagePopupForm : Form
         const int wmSettingChange = 0x001A;
         const int wmDpiChanged = 0x02E0;
         const int wmThemeChanged = 0x031A;
+        const int wmDwmColorizationColorChanged = 0x0320;
 
         base.WndProc(ref m);
 
-        if (m.Msg is wmSettingChange or wmDpiChanged or wmThemeChanged)
+        if (m.Msg is wmSettingChange or wmDpiChanged or wmThemeChanged or wmDwmColorizationColorChanged)
         {
             RefreshTheme();
             ApplyScaledLayout();
         }
     }
 
+    private void OnUiSettingsChanged(object? sender, EventArgs e)
+    {
+        if (IsDisposed)
+        {
+            return;
+        }
+
+        if (InvokeRequired)
+        {
+            BeginInvoke(new Action(() => OnUiSettingsChanged(sender, e)));
+            return;
+        }
+
+        uiSettings = UiSettings.Load();
+        ApplyBackdropMaterial();
+        RefreshTheme(force: true);
+        ApplyScaledLayout();
+        NudgeSizeForBackdrop();
+    }
+
+    private void ApplyBackdropMaterial()
+    {
+        if (!IsHandleCreated)
+        {
+            return;
+        }
+
+        if (uiSettings.Material == BackdropMaterial.Solid)
+        {
+            // Solid keeps the DWM material off and paints an opaque themed body.
+            WindowEffects.TryApplyBackdrop(Handle, SystemBackdrop.None);
+            backdropActive = false;
+            return;
+        }
+
+        var backdrop = uiSettings.Material switch
+        {
+            BackdropMaterial.Mica => SystemBackdrop.Mica,
+            BackdropMaterial.MicaAlt => SystemBackdrop.Tabbed,
+            _ => SystemBackdrop.Acrylic
+        };
+
+        // The frame must already be extended when the backdrop attribute is set,
+        // otherwise DWM may not composite the material until the next frame change.
+        if (WindowEffects.IsBackdropSupported)
+        {
+            WindowEffects.ExtendFrameIntoClientArea(Handle);
+        }
+
+        backdropActive = WindowEffects.TryApplyBackdrop(Handle, backdrop);
+    }
+
     private void ApplyScaledLayout()
     {
         var scale = DpiScale;
         var selectedProvider = GetProvider(selectedProviderKey);
-        var baseHeight = selectedProvider.IsCursor
-            ? CursorBaseHeight
-            : providerHistorySection.IsExpanded ? HistoryExpandedHeight : HistoryCollapsedHeight;
+        var rowCount = selectedProvider.IsCursor ? 3 : 2;
+
+        var rowHeight = ScaleInt(UsageRowHeight, scale);
+        var cardTop = ScaleInt(UsageCardTop, scale);
+        var cardHeight = rowHeight * rowCount;
+        var gap = ScaleInt(CardGap, scale);
+        var statusTop = cardTop + cardHeight + gap;
+        var clientHeight = statusTop + ScaleInt(StatusHeight, scale) + ScaleInt(BottomMargin, scale);
+
         SuspendLayout();
 
-        ClientSize = new Size(ScaleInt(BaseWidth, scale), ScaleInt(baseHeight, scale));
+        var previousBottom = Top + Height;
+        ClientSize = new Size(ScaleInt(BaseWidth, scale), clientHeight);
+        if (Visible && IsHandleCreated && anchorToBottom)
+        {
+            // Keep the flyout's bottom edge pinned to the taskbar anchor while
+            // expanding/collapsing content; it grows upward like system flyouts.
+            Top = previousBottom - Height;
+        }
 
-        closeButton.Bounds = ScaleRect(374, 14, 30, 30, scale);
-        planLabel.Bounds = ScaleRect(24, 54, 330, 24, scale);
+        closeButton.Bounds = ScaleRect(374, 14, 32, 32, scale);
+        graphsButton.Bounds = ScaleRect(338, 14, 32, 32, scale);
         var firstTabLeft = LayoutTabButtons(scale);
-        var titleLeft = ScaleInt(22, scale);
-        titleLabel.Bounds = new Rectangle(
-            titleLeft,
-            ScaleInt(17, scale),
-            Math.Max(ScaleInt(140, scale), firstTabLeft - titleLeft - ScaleInt(10, scale)),
-            ScaleInt(34, scale));
-        fiveHourSection.Bounds = ScaleRect(18, 82, 384, 86, scale);
-        weeklySection.Bounds = ScaleRect(18, 178, 384, 86, scale);
-        tertiarySection.Visible = selectedProvider.IsCursor;
-        if (selectedProvider.IsCursor)
-        {
-            tertiarySection.Bounds = ScaleRect(18, 274, 384, 86, scale);
-            providerHistorySection.Visible = false;
-            statusLabel.Bounds = ScaleRect(24, 374, 372, 16, scale);
-        }
-        else
-        {
-            providerHistorySection.Visible = true;
-            var insightsHeight = providerHistorySection.IsExpanded ? 370 : 70;
-            providerHistorySection.Bounds = ScaleRect(18, 274, 384, insightsHeight, scale);
-            statusLabel.Bounds = ScaleRect(24, providerHistorySection.IsExpanded ? 642 : 344, 372, 16, scale);
-        }
+        var titleLeft = ScaleInt(OuterMargin, scale);
+        var headerTextWidth = Math.Max(ScaleInt(140, scale), firstTabLeft - titleLeft - ScaleInt(8, scale));
+        titleLabel.Bounds = new Rectangle(titleLeft, ScaleInt(HeaderTitleTop, scale), headerTextWidth, ScaleInt(28, scale));
+        planLabel.Bounds = new Rectangle(titleLeft, ScaleInt(42, scale), headerTextWidth, ScaleInt(16, scale));
 
+        usageCard.Bounds = new Rectangle(
+            ScaleInt(OuterMargin, scale),
+            cardTop,
+            ScaleInt(BaseWidth - (OuterMargin * 2), scale),
+            cardHeight);
+        var cardWidth = usageCard.Width;
+        fiveHourSection.Bounds = new Rectangle(0, 0, cardWidth, rowHeight);
+        weeklySection.Bounds = new Rectangle(0, rowHeight, cardWidth, rowHeight);
+        tertiarySection.Visible = selectedProvider.IsCursor;
+        tertiarySection.Bounds = new Rectangle(0, rowHeight * 2, cardWidth, rowHeight);
+
+        statusLabel.Bounds = new Rectangle(
+            ScaleInt(OuterMargin + 4, scale),
+            statusTop,
+            ScaleInt(BaseWidth - (OuterMargin * 2) - 8, scale),
+            ScaleInt(StatusHeight, scale));
+
+        usageCard.ApplyLayoutScale(scale);
         fiveHourSection.ApplyLayoutScale(scale);
         weeklySection.ApplyLayoutScale(scale);
         tertiarySection.ApplyLayoutScale(scale);
-        providerHistorySection.ApplyLayoutScale(scale);
 
         ResumeLayout(performLayout: true);
         Invalidate(true);
@@ -251,29 +488,6 @@ public sealed class UsagePopupForm : Form
         if (providerKey == selectedProviderKey)
         {
             RenderSelectedProvider();
-        }
-    }
-
-    public void UpdateProviderHistory(string providerKey, ProviderUsageInsightsLookupResult result)
-    {
-        historyByProvider[providerKey] = result;
-
-        if (providerKey == selectedProviderKey)
-        {
-            RenderSelectedProvider();
-        }
-    }
-
-    public void SetProviderHistoryLoading(string providerKey)
-    {
-        if (GetProvider(providerKey).IsCursor)
-        {
-            return;
-        }
-
-        if (providerKey == selectedProviderKey)
-        {
-            providerHistorySection.SetLoading();
         }
     }
 
@@ -324,7 +538,6 @@ public sealed class UsagePopupForm : Form
         }
 
         var provider = GetProvider(selectedProviderKey);
-        providerHistorySection.Visible = !provider.IsCursor;
         tertiarySection.Visible = provider.IsCursor;
         titleLabel.Text = $"{provider.Name} rate limits";
         var result = GetProviderUsage(selectedProviderKey);
@@ -337,7 +550,6 @@ public sealed class UsagePopupForm : Form
             fiveHourSection.SetUnavailable(provider.IsCursor ? "Total" : "5 hour limit");
             weeklySection.SetUnavailable(provider.IsCursor ? "Auto" : "Weekly limit");
             tertiarySection.SetUnavailable("API");
-            RenderProviderHistory(provider);
             statusLabel.Text = result.Error ?? "No usage data found.";
             return;
         }
@@ -370,25 +582,7 @@ public sealed class UsagePopupForm : Form
             }
         }
 
-        RenderProviderHistory(provider);
         statusLabel.Text = provider.IsCursor ? CursorStatusText(snapshot) : string.Empty;
-    }
-
-    private void RenderProviderHistory(ProviderDescriptor provider)
-    {
-        if (provider.IsCursor)
-        {
-            return;
-        }
-
-        var result = GetProviderHistory(selectedProviderKey);
-        if (result.Insights is { } insights)
-        {
-            providerHistorySection.SetInsights(insights, result.Error);
-            return;
-        }
-
-        providerHistorySection.SetUnavailable(result.Error ?? "Usage history has not been loaded yet.");
     }
 
     private ProviderUsageLookupResult GetProviderUsage(string providerKey)
@@ -396,13 +590,6 @@ public sealed class UsagePopupForm : Form
         return usageByProvider.TryGetValue(providerKey, out var result)
             ? result
             : new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
-    }
-
-    private ProviderUsageInsightsLookupResult GetProviderHistory(string providerKey)
-    {
-        return historyByProvider.TryGetValue(providerKey, out var result)
-            ? result
-            : new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet.");
     }
 
     private ProviderDescriptor GetProvider(string providerKey)
@@ -427,9 +614,6 @@ public sealed class UsagePopupForm : Form
         foreach (var provider in providers)
         {
             usageByProvider.TryAdd(provider.Key, new ProviderUsageLookupResult(null, "Usage has not been loaded yet."));
-            historyByProvider.TryAdd(
-                provider.Key,
-                new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet."));
 
             var tabButton = new ProviderTabButton(provider.Name, provider.Key, provider.Provider)
             {
@@ -437,7 +621,7 @@ public sealed class UsagePopupForm : Form
                 AccessibleName = provider.Name
             };
             tabButton.Click += (_, _) => SelectProvider(provider.Key);
-            tabButton.ApplyTheme(theme);
+            tabButton.ApplyTheme(tokens);
             tabButtons.Add(tabButton);
             Controls.Add(tabButton);
         }
@@ -453,18 +637,19 @@ public sealed class UsagePopupForm : Form
 
     private int LayoutTabButtons(float scale)
     {
-        var right = ScaleInt(366, scale);
-        var width = ScaleInt(34, scale);
+        var right = ScaleInt(330, scale);
+        var width = ScaleInt(32, scale);
         var gap = ScaleInt(4, scale);
         var firstLeft = right;
         for (var index = tabButtons.Count - 1; index >= 0; index--)
         {
             firstLeft = right - width;
-            tabButtons[index].Bounds = new Rectangle(firstLeft, ScaleInt(16, scale), width, ScaleInt(30, scale));
+            tabButtons[index].Bounds = new Rectangle(firstLeft, ScaleInt(14, scale), width, ScaleInt(32, scale));
             tabButtons[index].BringToFront();
             right -= width + gap;
         }
 
+        graphsButton.BringToFront();
         closeButton.BringToFront();
         return firstLeft;
     }
@@ -490,7 +675,8 @@ public sealed class UsagePopupForm : Form
         var workingArea = screen.WorkingArea;
 
         var x = Math.Clamp(anchor.X - Width + 20, workingArea.Left + 8, workingArea.Right - Width - 8);
-        var y = anchor.Y >= workingArea.Top + (workingArea.Height / 2)
+        anchorToBottom = anchor.Y >= workingArea.Top + (workingArea.Height / 2);
+        var y = anchorToBottom
             ? workingArea.Bottom - Height - 8
             : workingArea.Top + 8;
 
@@ -557,75 +743,65 @@ public sealed class UsagePopupForm : Form
         return value <= 0 ? "$0.00" : value < 0.01m ? "<$0.01" : $"${value:0.00}";
     }
 
-    private void RefreshTheme()
+    private void RefreshTheme(bool force = false)
     {
-        var updated = ThemePalette.FromWindows();
-        if (updated == theme)
+        FluentTheme.RefreshAccent();
+        var updated = FluentTheme.Get(uiSettings.ResolveIsDark(), onBackdrop: backdropActive);
+        if (!force && updated == tokens)
         {
             return;
         }
 
-        theme = updated;
+        tokens = updated;
         ApplyTheme();
+    }
+
+    private static bool IsSystemDarkTheme()
+    {
+        var isLight = Registry.GetValue(
+            @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            "AppsUseLightTheme",
+            1) as int? ?? 1;
+
+        return isLight == 0;
     }
 
     private void ApplyTheme()
     {
-        BackColor = theme.Surface;
-        titleLabel.BackColor = theme.Surface;
-        titleLabel.ForeColor = theme.TextPrimary;
-        planLabel.BackColor = theme.Surface;
-        planLabel.ForeColor = theme.TextSecondary;
-        statusLabel.BackColor = theme.Surface;
-        statusLabel.ForeColor = theme.TextSecondary;
+        BackColor = tokens.Background;
+        titleLabel.ForeColor = tokens.TextPrimary;
+        planLabel.ForeColor = tokens.TextTertiary;
+        statusLabel.ForeColor = tokens.TextSecondary;
 
-        closeButton.ApplyTheme(theme);
+        graphsButton.ApplyTheme(tokens);
+        closeButton.ApplyTheme(tokens);
         foreach (var tabButton in tabButtons)
         {
-            tabButton.ApplyTheme(theme);
+            tabButton.ApplyTheme(tokens);
         }
 
-        fiveHourSection.ApplyTheme(theme);
-        weeklySection.ApplyTheme(theme);
-        tertiarySection.ApplyTheme(theme);
-        providerHistorySection.ApplyTheme(theme);
+        usageCard.ApplyTheme(tokens);
+        fiveHourSection.ApplyTheme(tokens);
+        weeklySection.ApplyTheme(tokens);
+        tertiarySection.ApplyTheme(tokens);
 
         if (IsHandleCreated)
         {
-            NativeMethods.ApplyWindowAttributes(Handle, theme.IsDark);
+            WindowEffects.SetImmersiveDarkMode(Handle, tokens.IsDark);
         }
 
         Invalidate(true);
     }
 
-    private static Font CreateFont(string family, float size, FontStyle style)
+    private Font OwnFont(Font font)
     {
-        try
-        {
-            return new Font(family, size, style);
-        }
-        catch
-        {
-            return new Font("Segoe UI", size, style);
-        }
+        ownedFonts.Add(font);
+        return font;
     }
 
-    private static System.Drawing.Drawing2D.GraphicsPath RoundedPath(Rectangle rectangle, int radius)
+    private static System.Drawing.Drawing2D.GraphicsPath RoundedPath(Rectangle rectangle, float radius)
     {
-        var path = new System.Drawing.Drawing2D.GraphicsPath();
-        var diameter = Math.Min(radius * 2, Math.Min(rectangle.Width, rectangle.Height));
-        var arc = new Rectangle(rectangle.Location, new Size(diameter, diameter));
-
-        path.AddArc(arc, 180, 90);
-        arc.X = rectangle.Right - diameter;
-        path.AddArc(arc, 270, 90);
-        arc.Y = rectangle.Bottom - diameter;
-        path.AddArc(arc, 0, 90);
-        arc.X = rectangle.Left;
-        path.AddArc(arc, 90, 90);
-        path.CloseFigure();
-
-        return path;
+        return FluentTheme.RoundedRect(rectangle, radius);
     }
 
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
@@ -637,6 +813,27 @@ public sealed class UsagePopupForm : Form
 
         e.Cancel = true;
         Hide();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            UiSettings.Changed -= OnUiSettingsChanged;
+        }
+
+        base.Dispose(disposing);
+        if (disposing)
+        {
+            entranceAnimation?.Dispose();
+            entranceAnimation = null;
+            foreach (var font in ownedFonts)
+            {
+                font.Dispose();
+            }
+
+            ownedFonts.Clear();
+        }
     }
 
     private void EnableDragMove(Control control)
@@ -653,1186 +850,79 @@ public sealed class UsagePopupForm : Form
         };
     }
 
-    private sealed class ProviderHistorySection : Panel
+    /// <summary>
+    /// Label whose GDI+ text is forced to AntiAliasGridFit: the ambient ClearType hint
+    /// assumes an opaque destination and produces sub-pixel fringing over the
+    /// alpha-composited acrylic backdrop.
+    /// </summary>
+    private sealed class FluentLabel : Label
     {
-        private readonly Label titleLabel;
-        private readonly ChevronToggleButton toggleLabel;
-        private readonly Label subtitleLabel;
-        private readonly Label todayLabel;
-        private readonly Label monthLabel;
-        private readonly HistoryMetricLabel todayMetric;
-        private readonly HistoryMetricLabel monthMetric;
-        private readonly DailyHistoryChart dailyChart;
-        private readonly ModelBreakdownChart modelChart;
-        private readonly System.Windows.Forms.Timer loadingTimer = new();
-        private ThemePalette theme = ThemePalette.FromWindows();
+        public FluentLabel()
+        {
+            BackColor = Color.Transparent;
+            UseCompatibleTextRendering = true;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+            base.OnPaint(e);
+        }
+    }
+
+    /// <summary>
+    /// The single grouped surface that hosts the usage rows: one rounded card
+    /// (CardFill + 1px CardStroke); the rows inside draw their own separators.
+    /// </summary>
+    private sealed class UsageCardPanel : Panel
+    {
+        private FluentTokens tokens = FluentTheme.Get(IsSystemDarkTheme(), onBackdrop: false);
         private float layoutScale = 1f;
-        private float loadingPhase;
-        private bool isExpanded = true;
-        private bool isLoading;
 
-        public event EventHandler? ExpandedChanged;
-
-        public ProviderHistorySection()
+        public UsageCardPanel()
         {
-            BackColor = theme.Card;
+            BackColor = Color.Transparent;
             DoubleBuffered = true;
-            Padding = new Padding(14, 12, 14, 12);
-
-            titleLabel = new Label
-            {
-                AutoSize = false,
-                Cursor = Cursors.Hand,
-                Font = CreateFont("Segoe UI Variable Text", 9.5f, FontStyle.Bold),
-                Text = "Usage history"
-            };
-            titleLabel.Click += (_, _) => ToggleExpanded();
-
-            toggleLabel = new ChevronToggleButton
-            {
-                Cursor = Cursors.Hand,
-                Expanded = true
-            };
-            toggleLabel.Click += (_, _) => ToggleExpanded();
-
-            subtitleLabel = new Label
-            {
-                AutoEllipsis = true,
-                AutoSize = false,
-                Font = CreateFont("Segoe UI Variable Text", 8.25f, FontStyle.Regular),
-                Text = "Local session estimates"
-            };
-
-            todayLabel = MetricLabel();
-            monthLabel = MetricLabel();
-            todayMetric = new HistoryMetricLabel();
-            monthMetric = new HistoryMetricLabel();
-            dailyChart = new DailyHistoryChart();
-            modelChart = new ModelBreakdownChart();
-
-            Controls.Add(titleLabel);
-            Controls.Add(toggleLabel);
-            Controls.Add(subtitleLabel);
-            Controls.Add(todayLabel);
-            Controls.Add(monthLabel);
-            Controls.Add(todayMetric);
-            Controls.Add(monthMetric);
-            Controls.Add(dailyChart);
-            Controls.Add(modelChart);
-
-            loadingTimer.Interval = 70;
-            loadingTimer.Tick += (_, _) => AdvanceLoadingAnimation();
-
-            ApplyTheme(theme);
-            UpdateChildLayout();
         }
 
-        public void EnableDragMove()
+        public void ApplyTheme(FluentTokens palette)
         {
-            if (FindForm() is not UsagePopupForm popup)
-            {
-                HandleCreated += (_, _) =>
-                {
-                    if (FindForm() is UsagePopupForm createdPopup)
-                    {
-                        createdPopup.EnableDragMove(this);
-                        createdPopup.EnableDragMove(subtitleLabel);
-                        createdPopup.EnableDragMove(todayLabel);
-                        createdPopup.EnableDragMove(monthLabel);
-                        createdPopup.EnableDragMove(todayMetric);
-                        createdPopup.EnableDragMove(monthMetric);
-                        createdPopup.EnableDragMove(dailyChart);
-                        createdPopup.EnableDragMove(modelChart);
-                    }
-                };
-                return;
-            }
-
-            popup.EnableDragMove(this);
-            popup.EnableDragMove(subtitleLabel);
-            popup.EnableDragMove(todayLabel);
-            popup.EnableDragMove(monthLabel);
-            popup.EnableDragMove(todayMetric);
-            popup.EnableDragMove(monthMetric);
-            popup.EnableDragMove(dailyChart);
-            popup.EnableDragMove(modelChart);
-        }
-
-        public void ApplyTheme(ThemePalette palette)
-        {
-            theme = palette;
-            BackColor = theme.Card;
-            foreach (Control control in Controls)
-            {
-                control.BackColor = theme.Card;
-            }
-
-            titleLabel.ForeColor = theme.TextPrimary;
-            toggleLabel.ApplyTheme(theme);
-            subtitleLabel.ForeColor = theme.TextSecondary;
-            todayLabel.ForeColor = theme.TextPrimary;
-            monthLabel.ForeColor = theme.TextPrimary;
-            todayMetric.ApplyTheme(theme);
-            monthMetric.ApplyTheme(theme);
-            dailyChart.ApplyTheme(theme);
-            modelChart.ApplyTheme(theme);
+            tokens = palette;
             Invalidate(true);
-        }
-
-        public bool IsExpanded
-        {
-            get => isExpanded;
-            private set
-            {
-                if (isExpanded == value)
-                {
-                    return;
-                }
-
-                isExpanded = value;
-                ApplyExpandedState();
-                ExpandedChanged?.Invoke(this, EventArgs.Empty);
-            }
         }
 
         public void ApplyLayoutScale(float scale)
         {
             layoutScale = Math.Max(1f, scale);
-            dailyChart.LayoutScale = layoutScale;
-            modelChart.LayoutScale = layoutScale;
-            UpdateChildLayout();
-        }
-
-        private void ToggleExpanded()
-        {
-            IsExpanded = !IsExpanded;
-        }
-
-        private void ApplyExpandedState()
-        {
-            toggleLabel.Expanded = IsExpanded;
-            var showDetails = IsExpanded;
-            todayLabel.Visible = showDetails;
-            monthLabel.Visible = showDetails;
-            todayMetric.Visible = showDetails;
-            monthMetric.Visible = showDetails;
-            dailyChart.Visible = showDetails;
-            modelChart.Visible = showDetails;
-            subtitleLabel.Text = showDetails && !string.IsNullOrWhiteSpace(expandedSubtitle)
-                ? expandedSubtitle
-                : showDetails ? subtitleLabel.Text : "History hidden. Click to expand.";
-            UpdateChildLayout();
-            Invalidate(true);
-        }
-
-        private string? expandedSubtitle;
-
-        private void AdvanceLoadingAnimation()
-        {
-            if (!isLoading)
-            {
-                loadingTimer.Stop();
-                return;
-            }
-
-            loadingPhase += 0.035f;
-            if (loadingPhase > 1f)
-            {
-                loadingPhase -= 1f;
-            }
-
-            todayMetric.LoadingPhase = loadingPhase;
-            monthMetric.LoadingPhase = WrapPhase(loadingPhase + 0.18f);
-            dailyChart.LoadingPhase = loadingPhase;
-            modelChart.LoadingPhase = WrapPhase(loadingPhase + 0.28f);
-        }
-
-        private void StartLoadingAnimation()
-        {
-            isLoading = true;
-            if (!loadingTimer.Enabled)
-            {
-                loadingTimer.Start();
-            }
-        }
-
-        private void StopLoadingAnimation()
-        {
-            isLoading = false;
-            loadingTimer.Stop();
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                loadingTimer.Dispose();
-            }
-
-            base.Dispose(disposing);
-        }
-
-        public void SetLoading()
-        {
-            StartLoadingAnimation();
-            titleLabel.Text = "Usage history";
-            expandedSubtitle = "Scanning local sessions...";
-            subtitleLabel.Text = IsExpanded ? expandedSubtitle : "History hidden. Click to expand.";
-            todayLabel.Text = "Today";
-            monthLabel.Text = "30 days";
-            todayMetric.SetLoading();
-            monthMetric.SetLoading();
-            dailyChart.SetLoading();
-            modelChart.SetLoading();
-        }
-
-        public void SetUnavailable(string message)
-        {
-            StopLoadingAnimation();
-            titleLabel.Text = "Usage history";
-            expandedSubtitle = message;
-            subtitleLabel.Text = IsExpanded ? expandedSubtitle : "History hidden. Click to expand.";
-            todayLabel.Text = "Today";
-            monthLabel.Text = "30 days";
-            todayMetric.SetText("--");
-            monthMetric.SetText("--");
-            dailyChart.SetData([], "No history yet");
-            modelChart.SetData([], "No model breakdown yet");
-        }
-
-        public void SetInsights(ProviderUsageInsights insights, string? warning)
-        {
-            StopLoadingAnimation();
-            titleLabel.Text = "Usage history";
-            var source = string.IsNullOrWhiteSpace(insights.Source) ? "Local estimates" : insights.Source;
-            expandedSubtitle = warning is null
-                ? $"{source}, updated {FormatObservedAt(insights.ObservedAt)}"
-                : $"{warning} · {source}";
-            subtitleLabel.Text = IsExpanded ? expandedSubtitle : "History hidden. Click to expand.";
-            todayLabel.Text = "Today";
-            monthLabel.Text = "30 days";
-            todayMetric.SetText(FormatMetric(insights.TodayEstimatedCostUsd, insights.TodayFastEstimatedCostUsd, insights.TodayTokens));
-            monthMetric.SetText(FormatMetric(insights.Last30DaysEstimatedCostUsd, insights.Last30DaysFastEstimatedCostUsd, insights.Last30DaysTokens));
-            dailyChart.SetData(insights.Daily, insights.HasUsage ? null : "No token rows found");
-            modelChart.SetData(insights.Models, insights.HasUsage ? null : "No model data found");
+            Invalidate();
         }
 
         protected override void OnPaint(PaintEventArgs e)
         {
             e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
 
-            var bounds = new Rectangle(0, 0, Width - 1, Height - 1);
-            using var fillBrush = new SolidBrush(theme.Card);
-            using var borderPen = new Pen(theme.CardBorder);
-            using var path = RoundedPath(bounds, 12);
+            var strokeWidth = Math.Max(1f, layoutScale);
+            var bounds = new RectangleF(
+                strokeWidth / 2f,
+                strokeWidth / 2f,
+                Width - strokeWidth,
+                Height - strokeWidth);
+            using var fillBrush = new SolidBrush(tokens.CardFill);
+            using var borderPen = new Pen(tokens.CardStroke, strokeWidth);
+            using var path = FluentTheme.RoundedRect(bounds, FluentTheme.CardCornerRadius * layoutScale);
 
             e.Graphics.FillPath(fillBrush, path);
             e.Graphics.DrawPath(borderPen, path);
 
             base.OnPaint(e);
         }
-
-        protected override void OnSizeChanged(EventArgs e)
-        {
-            base.OnSizeChanged(e);
-            UpdateChildLayout();
-        }
-
-        private void UpdateChildLayout()
-        {
-            var left = ScaleInt(16, layoutScale);
-            var right = ScaleInt(16, layoutScale);
-            titleLabel.Bounds = new Rectangle(left, ScaleInt(12, layoutScale), ScaleInt(170, layoutScale), ScaleInt(22, layoutScale));
-            toggleLabel.Bounds = new Rectangle(Width - right - ScaleInt(24, layoutScale), ScaleInt(10, layoutScale), ScaleInt(24, layoutScale), ScaleInt(24, layoutScale));
-            subtitleLabel.Bounds = new Rectangle(left, ScaleInt(34, layoutScale), Width - left - right, ScaleInt(20, layoutScale));
-            if (!IsExpanded)
-            {
-                return;
-            }
-
-            todayLabel.Bounds = new Rectangle(left, ScaleInt(66, layoutScale), ScaleInt(168, layoutScale), ScaleInt(18, layoutScale));
-            monthLabel.Bounds = new Rectangle(Width - ScaleInt(184, layoutScale), ScaleInt(66, layoutScale), ScaleInt(168, layoutScale), ScaleInt(18, layoutScale));
-            todayMetric.Bounds = new Rectangle(left, ScaleInt(84, layoutScale), ScaleInt(168, layoutScale), ScaleInt(34, layoutScale));
-            monthMetric.Bounds = new Rectangle(Width - ScaleInt(184, layoutScale), ScaleInt(84, layoutScale), ScaleInt(168, layoutScale), ScaleInt(34, layoutScale));
-            dailyChart.Bounds = new Rectangle(left, ScaleInt(124, layoutScale), Width - left - right, ScaleInt(138, layoutScale));
-            modelChart.Bounds = new Rectangle(left, ScaleInt(278, layoutScale), Width - left - right, ScaleInt(78, layoutScale));
-        }
-
-        private static Label MetricLabel()
-        {
-            return new Label
-            {
-                AutoSize = false,
-                Font = CreateFont("Segoe UI Variable Text", 8.5f, FontStyle.Bold)
-            };
-        }
-
-        private static string FormatMetric(decimal totalCost, decimal fastCost, long tokens)
-        {
-            var text = $"{FormatCurrency(totalCost)} · {FormatTokens(tokens)}";
-            return fastCost > 0 ? $"{text}\nfast {FormatCurrency(fastCost)}" : text;
-        }
-
-        private static string FormatCurrency(decimal value)
-        {
-            if (value <= 0)
-            {
-                return "$0.00";
-            }
-
-            return value < 0.01m ? "<$0.01" : $"${value:0.00}";
-        }
-
-        public static string FormatTokens(long tokens)
-        {
-            if (tokens >= 1_000_000_000)
-            {
-                return $"{tokens / 1_000_000_000d:0.##}B tok";
-            }
-
-            if (tokens >= 1_000_000)
-            {
-                return $"{tokens / 1_000_000d:0.#}M tok";
-            }
-
-            if (tokens >= 1_000)
-            {
-                return $"{tokens / 1_000d:0.#}K tok";
-            }
-
-            return $"{tokens} tok";
-        }
     }
 
-    private sealed class HistoryMetricLabel : Control
-    {
-        private string text = "--";
-        private bool loading;
-        private float loadingPhase;
-        private ThemePalette theme = ThemePalette.FromWindows();
-
-        public HistoryMetricLabel()
-        {
-            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
-        }
-
-        [System.ComponentModel.Browsable(false)]
-        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
-        public float LoadingPhase
-        {
-            get => loadingPhase;
-            set
-            {
-                loadingPhase = WrapPhase(value);
-                if (loading)
-                {
-                    Invalidate();
-                }
-            }
-        }
-
-        public void ApplyTheme(ThemePalette palette)
-        {
-            theme = palette;
-            BackColor = theme.Card;
-            Invalidate();
-        }
-
-        public void SetLoading()
-        {
-            loading = true;
-            text = string.Empty;
-            Invalidate();
-        }
-
-        public void SetText(string value)
-        {
-            loading = false;
-            text = value;
-            Invalidate();
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            if (loading)
-            {
-                DrawSkeletonPill(e.Graphics, ClientRectangle, theme, loadingPhase);
-                return;
-            }
-
-            using var brush = new SolidBrush(theme.TextPrimary);
-            using var font = CreateFont("Segoe UI Variable Text", 8.25f, FontStyle.Bold);
-            using var format = new StringFormat(StringFormatFlags.NoWrap)
-            {
-                Trimming = StringTrimming.None,
-                LineAlignment = StringAlignment.Near,
-                Alignment = StringAlignment.Near
-            };
-            e.Graphics.DrawString(text, font, brush, ClientRectangle, format);
-        }
-    }
-
-    private sealed class ChevronToggleButton : Control
-    {
-        private ThemePalette theme = ThemePalette.FromWindows();
-        private bool hovering;
-        private bool pressing;
-        private bool expanded = true;
-
-        [System.ComponentModel.Browsable(false)]
-        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
-        public bool Expanded
-        {
-            get => expanded;
-            set
-            {
-                if (expanded == value)
-                {
-                    return;
-                }
-
-                expanded = value;
-                AccessibleName = expanded ? "Collapse Usage history" : "Expand Usage history";
-                Invalidate();
-            }
-        }
-
-        public ChevronToggleButton()
-        {
-            AccessibleName = "Collapse Usage history";
-            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable | ControlStyles.UserPaint, true);
-        }
-
-        public void ApplyTheme(ThemePalette palette)
-        {
-            theme = palette;
-            BackColor = theme.Card;
-            Invalidate();
-        }
-
-        protected override void OnMouseEnter(EventArgs e)
-        {
-            hovering = true;
-            Invalidate();
-            base.OnMouseEnter(e);
-        }
-
-        protected override void OnMouseLeave(EventArgs e)
-        {
-            hovering = false;
-            pressing = false;
-            Invalidate();
-            base.OnMouseLeave(e);
-        }
-
-        protected override void OnMouseDown(MouseEventArgs e)
-        {
-            if (e.Button == MouseButtons.Left)
-            {
-                pressing = true;
-                Invalidate();
-            }
-
-            base.OnMouseDown(e);
-        }
-
-        protected override void OnMouseUp(MouseEventArgs e)
-        {
-            pressing = false;
-            Invalidate();
-            base.OnMouseUp(e);
-        }
-
-        protected override void OnKeyDown(KeyEventArgs e)
-        {
-            if (e.KeyCode is Keys.Enter or Keys.Space)
-            {
-                OnClick(EventArgs.Empty);
-                e.Handled = true;
-            }
-
-            base.OnKeyDown(e);
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            var fill = pressing ? theme.Pressed : hovering ? theme.Hover : theme.Card;
-            using (var fillBrush = new SolidBrush(fill))
-            using (var path = RoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), 7))
-            {
-                e.Graphics.FillPath(fillBrush, path);
-            }
-
-            using var pen = new Pen(theme.TextSecondary, 1.7f)
-            {
-                StartCap = System.Drawing.Drawing2D.LineCap.Round,
-                EndCap = System.Drawing.Drawing2D.LineCap.Round,
-                LineJoin = System.Drawing.Drawing2D.LineJoin.Round
-            };
-
-            var cx = Width / 2f;
-            var cy = Height / 2f;
-            var size = Math.Max(5f, Math.Min(Width, Height) * 0.22f);
-            if (Expanded)
-            {
-                e.Graphics.DrawLine(pen, cx - size, cy - size / 2f, cx, cy + size / 2f);
-                e.Graphics.DrawLine(pen, cx, cy + size / 2f, cx + size, cy - size / 2f);
-            }
-            else
-            {
-                e.Graphics.DrawLine(pen, cx - size / 2f, cy - size, cx + size / 2f, cy);
-                e.Graphics.DrawLine(pen, cx + size / 2f, cy, cx - size / 2f, cy + size);
-            }
-        }
-    }
-
-    private sealed class DailyHistoryChart : Control
-    {
-        private readonly ToolTip toolTip = new() { AutomaticDelay = 120, AutoPopDelay = 8000, ReshowDelay = 80 };
-        private IReadOnlyList<ProviderDailyUsage> daily = [];
-        private string? emptyMessage;
-        private ThemePalette theme = ThemePalette.FromWindows();
-        private bool loading;
-        private float loadingPhase;
-        private int hoveredIndex = -1;
-        private string? lastToolTipText;
-
-        [System.ComponentModel.Browsable(false)]
-        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
-        public float LayoutScale { get; set; } = 1f;
-
-        [System.ComponentModel.Browsable(false)]
-        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
-        public float LoadingPhase
-        {
-            get => loadingPhase;
-            set
-            {
-                loadingPhase = WrapPhase(value);
-                if (loading)
-                {
-                    Invalidate();
-                }
-            }
-        }
-
-        public DailyHistoryChart()
-        {
-            Cursor = Cursors.Hand;
-            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
-        }
-
-        public void ApplyTheme(ThemePalette palette)
-        {
-            theme = palette;
-            BackColor = theme.Card;
-            Invalidate();
-        }
-
-        public void SetData(IReadOnlyList<ProviderDailyUsage> data, string? message)
-        {
-            loading = false;
-            daily = data;
-            emptyMessage = message;
-            hoveredIndex = -1;
-            lastToolTipText = null;
-            toolTip.SetToolTip(this, null);
-            Invalidate();
-        }
-
-        public void SetLoading()
-        {
-            loading = true;
-            daily = [];
-            emptyMessage = null;
-            hoveredIndex = -1;
-            lastToolTipText = null;
-            toolTip.SetToolTip(this, null);
-            Invalidate();
-        }
-
-        protected override void OnMouseMove(MouseEventArgs e)
-        {
-            base.OnMouseMove(e);
-            var index = HitTest(e.Location);
-            if (index == hoveredIndex)
-            {
-                return;
-            }
-
-            hoveredIndex = index;
-            if (index >= 0 && index < daily.Count)
-            {
-                var day = daily[index];
-                var categoryLines = DailySpendCategories(day).Count == 0
-                    ? string.Empty
-                    : "\n" + string.Join("\n", DailySpendCategories(day)
-                        .OrderByDescending(category => category.EstimatedCostUsd)
-                        .Take(4)
-                        .Select(category => $"{ShortSpendLabel(category.Label)} {FormatUsd(category.EstimatedCostUsd)}"));
-                var cacheCreateLine = day.CacheCreationTokens > 0 ? $", {ProviderHistorySection.FormatTokens(day.CacheCreationTokens)} cache create" : string.Empty;
-                var text = $"{day.Day:MMM d}: {FormatUsd(day.EstimatedCostUsd)}{categoryLines}\n{ProviderHistorySection.FormatTokens(day.TotalTokens)} total, {ProviderHistorySection.FormatTokens(day.OutputTokens)} output{cacheCreateLine}";
-                if (text != lastToolTipText)
-                {
-                    lastToolTipText = text;
-                    toolTip.SetToolTip(this, text);
-                }
-            }
-            else
-            {
-                lastToolTipText = null;
-                toolTip.SetToolTip(this, null);
-            }
-
-            Invalidate();
-        }
-
-        protected override void OnMouseLeave(EventArgs e)
-        {
-            hoveredIndex = -1;
-            lastToolTipText = null;
-            toolTip.SetToolTip(this, null);
-            Invalidate();
-            base.OnMouseLeave(e);
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            var titleBounds = new Rectangle(0, 0, Width, ScaleInt(16, LayoutScale));
-            using var titleBrush = new SolidBrush(theme.TextSecondary);
-            using var titleFont = CreateFont("Segoe UI Variable Text", 7.5f, FontStyle.Regular);
-            e.Graphics.DrawString("Estimated spend by day", titleFont, titleBrush, titleBounds);
-            DrawSpendCategoryLegend(e.Graphics, new Rectangle(Width - ScaleInt(220, LayoutScale), 0, ScaleInt(220, LayoutScale), ScaleInt(16, LayoutScale)), TopSpendCategories(daily), theme, LayoutScale);
-
-            var chartBounds = ChartBounds;
-            if (loading)
-            {
-                DrawDailyLoading(e.Graphics, chartBounds, theme, LayoutScale, loadingPhase);
-                return;
-            }
-
-            if (daily.Count == 0 || daily.All(day => day.EstimatedCostUsd <= 0))
-            {
-                DrawEmpty(e.Graphics, chartBounds, emptyMessage ?? "No spend data");
-                return;
-            }
-
-            var max = Math.Max(0.01m, daily.Max(day => day.EstimatedCostUsd));
-            var gap = BarGap;
-            var barWidth = BarWidth(chartBounds, gap);
-            var x = chartBounds.Left;
-            using var trackBrush = new SolidBrush(theme.MeterTrack);
-            using var hoverPen = new Pen(theme.TextPrimary, 1f);
-            for (var index = 0; index < daily.Count; index++)
-            {
-                var day = daily[index];
-                var track = new Rectangle(x, chartBounds.Top, barWidth, chartBounds.Height);
-                e.Graphics.FillRectangle(trackBrush, track);
-                var totalHeight = (int)Math.Round(chartBounds.Height * (double)(day.EstimatedCostUsd / max));
-                var categories = DailySpendCategories(day).Where(category => category.EstimatedCostUsd > 0).ToArray();
-                if (totalHeight > 0 && categories.Length > 0)
-                {
-                    var paintedHeight = 0;
-                    for (var categoryIndex = 0; categoryIndex < categories.Length; categoryIndex++)
-                    {
-                        var category = categories[categoryIndex];
-                        var height = categoryIndex == categories.Length - 1
-                            ? totalHeight - paintedHeight
-                            : (int)Math.Round(totalHeight * (double)(category.EstimatedCostUsd / day.EstimatedCostUsd));
-                        height = Math.Clamp(height, 0, totalHeight - paintedHeight);
-                        if (height <= 0)
-                        {
-                            continue;
-                        }
-
-                        var color = SpendCategoryColor(category.Label, theme);
-                        using var brush = new SolidBrush(index == hoveredIndex ? ControlPaint.Light(color) : color);
-                        var fill = new Rectangle(x, chartBounds.Bottom - paintedHeight - height, barWidth, height);
-                        e.Graphics.FillRectangle(brush, fill);
-                        paintedHeight += height;
-                    }
-                }
-
-                if (index == hoveredIndex)
-                {
-                    e.Graphics.DrawRectangle(hoverPen, track);
-                }
-
-                x += barWidth + gap;
-            }
-
-            DrawDailyAxis(e.Graphics, chartBounds, daily);
-        }
-
-        private Rectangle ChartBounds => new(0, ScaleInt(18, LayoutScale), Width, Math.Max(20, Height - ScaleInt(36, LayoutScale)));
-        private int BarGap => Math.Max(1, ScaleInt(2, LayoutScale));
-
-        private int BarWidth(Rectangle chartBounds, int gap)
-        {
-            return Math.Max(2, (chartBounds.Width - gap * Math.Max(0, daily.Count - 1)) / Math.Max(1, daily.Count));
-        }
-
-        private int HitTest(Point point)
-        {
-            if (daily.Count == 0 || !ChartBounds.Contains(point))
-            {
-                return -1;
-            }
-
-            var gap = BarGap;
-            var step = BarWidth(ChartBounds, gap) + gap;
-            var index = step <= 0 ? -1 : (point.X - ChartBounds.Left) / step;
-            return index >= 0 && index < daily.Count ? index : -1;
-        }
-    }
-
-    private sealed class ModelBreakdownChart : Control
-    {
-        private readonly ToolTip toolTip = new() { AutomaticDelay = 120, AutoPopDelay = 8000, ReshowDelay = 80 };
-        private IReadOnlyList<ProviderModelUsage> models = [];
-        private string? emptyMessage;
-        private ThemePalette theme = ThemePalette.FromWindows();
-        private bool loading;
-        private float loadingPhase;
-        private int hoveredIndex = -1;
-        private string? lastToolTipText;
-
-        [System.ComponentModel.Browsable(false)]
-        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
-        public float LayoutScale { get; set; } = 1f;
-
-        [System.ComponentModel.Browsable(false)]
-        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
-        public float LoadingPhase
-        {
-            get => loadingPhase;
-            set
-            {
-                loadingPhase = WrapPhase(value);
-                if (loading)
-                {
-                    Invalidate();
-                }
-            }
-        }
-
-        public ModelBreakdownChart()
-        {
-            Cursor = Cursors.Hand;
-            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
-        }
-
-        public void ApplyTheme(ThemePalette palette)
-        {
-            theme = palette;
-            BackColor = theme.Card;
-            Invalidate();
-        }
-
-        public void SetData(IReadOnlyList<ProviderModelUsage> data, string? message)
-        {
-            loading = false;
-            models = data;
-            emptyMessage = message;
-            hoveredIndex = -1;
-            lastToolTipText = null;
-            toolTip.SetToolTip(this, null);
-            Invalidate();
-        }
-
-        public void SetLoading()
-        {
-            loading = true;
-            models = [];
-            emptyMessage = null;
-            hoveredIndex = -1;
-            lastToolTipText = null;
-            toolTip.SetToolTip(this, null);
-            Invalidate();
-        }
-
-        protected override void OnMouseMove(MouseEventArgs e)
-        {
-            base.OnMouseMove(e);
-            var index = HitTest(e.Location);
-            if (index == hoveredIndex)
-            {
-                return;
-            }
-
-            hoveredIndex = index;
-            var top = TopModels;
-            if (index >= 0 && index < top.Length)
-            {
-                var model = top[index];
-                var fastLine = model.FastEstimatedCostUsd > 0 ? $"\nFast {FormatUsd(model.FastEstimatedCostUsd)}, regular {FormatUsd(model.RegularEstimatedCostUsd)}" : string.Empty;
-                var cacheCreateLine = model.CacheCreationTokens > 0 ? $", {ProviderHistorySection.FormatTokens(model.CacheCreationTokens)} cache create" : string.Empty;
-                var text = $"{model.Model}\nEstimated {FormatUsd(model.EstimatedCostUsd)}{fastLine}\n{ProviderHistorySection.FormatTokens(model.TotalTokens)} total, {ProviderHistorySection.FormatTokens(model.OutputTokens)} output{cacheCreateLine}";
-                if (text != lastToolTipText)
-                {
-                    lastToolTipText = text;
-                    toolTip.SetToolTip(this, text);
-                }
-            }
-            else
-            {
-                lastToolTipText = null;
-                toolTip.SetToolTip(this, null);
-            }
-
-            Invalidate();
-        }
-
-        protected override void OnMouseLeave(EventArgs e)
-        {
-            hoveredIndex = -1;
-            lastToolTipText = null;
-            toolTip.SetToolTip(this, null);
-            Invalidate();
-            base.OnMouseLeave(e);
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            var titleBounds = new Rectangle(0, 0, Width, ScaleInt(16, LayoutScale));
-            using var titleBrush = new SolidBrush(theme.TextSecondary);
-            using var titleFont = CreateFont("Segoe UI Variable Text", 7.5f, FontStyle.Regular);
-            e.Graphics.DrawString("Estimated spend by model", titleFont, titleBrush, titleBounds);
-
-            var chartBounds = BarBounds;
-            if (loading)
-            {
-                DrawModelLoading(e.Graphics, chartBounds, Width, theme, LayoutScale, loadingPhase);
-                return;
-            }
-
-            if (models.Count == 0 || models.All(model => model.EstimatedCostUsd <= 0))
-            {
-                DrawEmpty(e.Graphics, new Rectangle(0, ScaleInt(18, LayoutScale), Width, Height - ScaleInt(18, LayoutScale)), emptyMessage ?? "No model data");
-                return;
-            }
-
-            var top = TopModels;
-            var total = Math.Max(0.01m, top.Sum(model => model.EstimatedCostUsd));
-            var x = chartBounds.Left;
-            for (var index = 0; index < top.Length; index++)
-            {
-                var width = index == top.Length - 1
-                    ? chartBounds.Right - x
-                    : Math.Max(1, (int)Math.Round(chartBounds.Width * (double)(top[index].EstimatedCostUsd / total)));
-                var segment = new Rectangle(x, chartBounds.Top, width, chartBounds.Height);
-                var color = SegmentColor(top[index]);
-                using var brush = new SolidBrush(index == hoveredIndex ? ControlPaint.Light(color) : color);
-                e.Graphics.FillRectangle(brush, segment);
-                if (index == hoveredIndex)
-                {
-                    using var pen = new Pen(theme.TextPrimary, 1f);
-                    e.Graphics.DrawRectangle(pen, segment);
-                }
-
-                x += width;
-            }
-
-            DrawLegend(e.Graphics, top);
-        }
-
-        private ProviderModelUsage[] TopModels => models.Take(4).ToArray();
-
-        private Rectangle BarBounds => new(0, ScaleInt(19, LayoutScale), Width, ScaleInt(10, LayoutScale));
-
-        private Color SegmentColor(ProviderModelUsage model)
-        {
-            return SpendCategoryColor(model.Model, theme);
-        }
-
-        private int HitTest(Point point)
-        {
-            var top = TopModels;
-            if (top.Length == 0 || !BarBounds.Contains(point))
-            {
-                return -1;
-            }
-
-            var total = Math.Max(0.01m, top.Sum(model => model.EstimatedCostUsd));
-            var x = BarBounds.Left;
-            for (var index = 0; index < top.Length; index++)
-            {
-                var width = index == top.Length - 1
-                    ? BarBounds.Right - x
-                    : Math.Max(1, (int)Math.Round(BarBounds.Width * (double)(top[index].EstimatedCostUsd / total)));
-                if (point.X >= x && point.X <= x + width)
-                {
-                    return index;
-                }
-
-                x += width;
-            }
-
-            return -1;
-        }
-
-        private void DrawLegend(Graphics graphics, IReadOnlyList<ProviderModelUsage> top)
-        {
-            using var textBrush = new SolidBrush(theme.TextSecondary);
-            using var font = CreateFont("Segoe UI Variable Text", 7.25f, FontStyle.Regular);
-            var y = ScaleInt(36, LayoutScale);
-            var columnWidth = Width / 2;
-            for (var index = 0; index < Math.Min(4, top.Count); index++)
-            {
-                var x = (index % 2) * columnWidth;
-                var rowY = y + (index / 2) * ScaleInt(16, LayoutScale);
-                using var dotBrush = new SolidBrush(SegmentColor(top[index]));
-                graphics.FillEllipse(dotBrush, x, rowY + ScaleInt(4, LayoutScale), ScaleInt(7, LayoutScale), ScaleInt(7, LayoutScale));
-                var label = $"{ShortModel(top[index].Model)} {FormatUsd(top[index].EstimatedCostUsd)}";
-                graphics.DrawString(label, font, textBrush, new RectangleF(x + ScaleInt(11, LayoutScale), rowY, columnWidth - ScaleInt(13, LayoutScale), ScaleInt(16, LayoutScale)));
-            }
-        }
-
-        private static string ShortModel(string model)
-        {
-            var label = FriendlyModelLabel(model);
-            if (label.Length <= 13)
-            {
-                return label;
-            }
-
-            return label[..12] + "…";
-        }
-    }
-
-    private static void DrawDailyLoading(Graphics graphics, Rectangle chartBounds, ThemePalette theme, float scale, float phase)
-    {
-        var inset = ScaleInt(4, scale);
-        var block = Rectangle.Inflate(chartBounds, -inset, -inset);
-        using (var borderPen = new Pen(Color.FromArgb(theme.IsDark ? 42 : 70, theme.TextSecondary)))
-        using (var path = RoundedPath(block, ScaleInt(10, scale)))
-        {
-            graphics.DrawPath(borderPen, path);
-        }
-
-        var top = block.Top + ScaleInt(18, scale);
-        var left = block.Left + ScaleInt(18, scale);
-        var width = block.Width - ScaleInt(36, scale);
-        DrawSkeletonPill(graphics, new Rectangle(left, top, (int)(width * 0.72), ScaleInt(12, scale)), theme, phase);
-        DrawSkeletonPill(graphics, new Rectangle(left, top + ScaleInt(28, scale), (int)(width * 0.88), ScaleInt(12, scale)), theme, WrapPhase(phase + 0.18f));
-        DrawSkeletonPill(graphics, new Rectangle(left, top + ScaleInt(56, scale), (int)(width * 0.54), ScaleInt(12, scale)), theme, WrapPhase(phase + 0.36f));
-
-        using var textBrush = new SolidBrush(theme.TextSecondary);
-        using var font = CreateFont("Segoe UI Variable Text", 7f, FontStyle.Regular);
-        graphics.DrawString("Scanning usage history...", font, textBrush, new RectangleF(chartBounds.Left, chartBounds.Bottom + 1, chartBounds.Width, ScaleInt(14, scale)));
-    }
-
-    private static void DrawModelLoading(Graphics graphics, Rectangle barBounds, int width, ThemePalette theme, float scale, float phase)
-    {
-        DrawSkeletonPill(graphics, barBounds, theme, phase);
-        var y = barBounds.Bottom + ScaleInt(14, scale);
-        var columnWidth = width / 2;
-        DrawSkeletonPill(graphics, new Rectangle(0, y, Math.Max(40, columnWidth - ScaleInt(34, scale)), ScaleInt(9, scale)), theme, WrapPhase(phase + 0.2f));
-        DrawSkeletonPill(graphics, new Rectangle(columnWidth, y, Math.Max(40, columnWidth - ScaleInt(34, scale)), ScaleInt(9, scale)), theme, WrapPhase(phase + 0.38f));
-    }
-
-    private static void DrawSkeletonPill(Graphics graphics, Rectangle bounds, ThemePalette theme, float phase)
-    {
-        if (bounds.Width <= 0 || bounds.Height <= 0)
-        {
-            return;
-        }
-
-        var baseColor = theme.MeterTrack;
-        var highlightColor = Color.FromArgb(
-            theme.IsDark ? 82 : 165,
-            Math.Min(255, theme.Accent.R + 24),
-            Math.Min(255, theme.Accent.G + 24),
-            Math.Min(255, theme.Accent.B + 24));
-        using var brush = new SolidBrush(baseColor);
-        using var highlight = new SolidBrush(highlightColor);
-        using var path = RoundedPath(bounds, Math.Max(4, bounds.Height / 2));
-        graphics.FillPath(brush, path);
-
-        var state = graphics.Save();
-        graphics.SetClip(path);
-        var shineWidth = Math.Max(18, bounds.Width / 3);
-        var travel = bounds.Width + (shineWidth * 2);
-        var x = bounds.Left - shineWidth + (int)Math.Round(travel * WrapPhase(phase));
-        graphics.FillRectangle(highlight, new Rectangle(x, bounds.Top, shineWidth, bounds.Height));
-        graphics.Restore(state);
-    }
-
-    private static float WrapPhase(float phase)
-    {
-        phase %= 1f;
-        return phase < 0 ? phase + 1f : phase;
-    }
-
-    private static void DrawDailyAxis(Graphics graphics, Rectangle chartBounds, IReadOnlyList<ProviderDailyUsage> daily)
-    {
-        if (daily.Count == 0)
-        {
-            return;
-        }
-
-        using var textBrush = new SolidBrush(Color.FromArgb(150, 128, 128, 128));
-        using var font = CreateFont("Segoe UI Variable Text", 7f, FontStyle.Regular);
-        var first = daily.First().Day.ToString("MMM d");
-        var last = daily.Last().Day.ToString("MMM d");
-        graphics.DrawString(first, font, textBrush, new RectangleF(chartBounds.Left, chartBounds.Bottom + 1, chartBounds.Width / 2f, 14));
-        var lastSize = graphics.MeasureString(last, font);
-        graphics.DrawString(last, font, textBrush, new PointF(chartBounds.Right - lastSize.Width, chartBounds.Bottom + 1));
-    }
-
-    private static void DrawSpendCategoryLegend(Graphics graphics, Rectangle bounds, IReadOnlyList<ProviderSpendCategory> categories, ThemePalette theme, float scale)
-    {
-        if (categories.Count == 0)
-        {
-            return;
-        }
-
-        using var textBrush = new SolidBrush(theme.TextSecondary);
-        using var font = CreateFont("Segoe UI Variable Text", 7f, FontStyle.Regular);
-        var dot = ScaleInt(6, scale);
-        var y = bounds.Top + ScaleInt(5, scale);
-        var x = bounds.Left + ScaleInt(4, scale);
-        var gap = ScaleInt(10, scale);
-        foreach (var category in categories.Take(3))
-        {
-            var label = ShortSpendLabel(category.Label);
-            var textWidth = (int)Math.Ceiling(graphics.MeasureString(label, font).Width);
-            var itemWidth = dot + ScaleInt(3, scale) + textWidth;
-            if (x + itemWidth > bounds.Right)
-            {
-                break;
-            }
-
-            using var dotBrush = new SolidBrush(SpendCategoryColor(category.Label, theme));
-            graphics.FillEllipse(dotBrush, x, y, dot, dot);
-            graphics.DrawString(label, font, textBrush, x + dot + ScaleInt(3, scale), bounds.Top);
-            x += itemWidth + gap;
-        }
-    }
-
-    private static IReadOnlyList<ProviderSpendCategory> TopSpendCategories(IReadOnlyList<ProviderDailyUsage> daily)
-    {
-        return daily
-            .SelectMany(DailySpendCategories)
-            .GroupBy(category => category.Label, StringComparer.OrdinalIgnoreCase)
-            .Select(group => new ProviderSpendCategory(group.Key, group.Sum(category => category.EstimatedCostUsd)))
-            .OrderByDescending(category => category.EstimatedCostUsd)
-            .Take(3)
-            .ToArray();
-    }
-
-    private static IReadOnlyList<ProviderSpendCategory> DailySpendCategories(ProviderDailyUsage day)
-    {
-        if (day.Categories.Count > 0)
-        {
-            return day.Categories
-                .Where(category => category.EstimatedCostUsd > 0)
-                .OrderBy(category => category.Label.Contains(" fast", StringComparison.OrdinalIgnoreCase) ? 1 : 0)
-                .ThenBy(category => category.Label, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-        }
-
-        var categories = new List<ProviderSpendCategory>();
-        if (day.RegularEstimatedCostUsd > 0)
-        {
-            categories.Add(new ProviderSpendCategory("regular", day.RegularEstimatedCostUsd));
-        }
-        if (day.FastEstimatedCostUsd > 0)
-        {
-            categories.Add(new ProviderSpendCategory("fast", day.FastEstimatedCostUsd));
-        }
-        return categories;
-    }
-
-    private static Color SpendCategoryColor(string label, ThemePalette theme)
-    {
-        var normalized = label.Replace(" fast", string.Empty, StringComparison.OrdinalIgnoreCase).ToLowerInvariant();
-        if (label.Contains("fast", StringComparison.OrdinalIgnoreCase))
-        {
-            return theme.Warning;
-        }
-
-        if (normalized.Contains("gpt-5.5", StringComparison.OrdinalIgnoreCase) || normalized.Contains("claude-opus", StringComparison.OrdinalIgnoreCase))
-        {
-            return theme.Accent;
-        }
-
-        if (normalized.Contains("gpt-5.4", StringComparison.OrdinalIgnoreCase) || normalized.Contains("claude-sonnet", StringComparison.OrdinalIgnoreCase) || normalized == "regular")
-        {
-            return Color.FromArgb(134, 97, 197);
-        }
-
-        if (normalized.Contains("gpt-5.3", StringComparison.OrdinalIgnoreCase) || normalized.Contains("claude-haiku", StringComparison.OrdinalIgnoreCase))
-        {
-            return Color.FromArgb(16, 124, 16);
-        }
-
-        if (normalized.Contains("gpt-5.2", StringComparison.OrdinalIgnoreCase))
-        {
-            return theme.Danger;
-        }
-
-        return ModelPalette[StableColorIndex(normalized, ModelPalette.Length)];
-    }
-
-    private static string ShortSpendLabel(string label)
-    {
-        var normalized = FriendlyModelLabel(label);
-        return normalized.Length <= 14 ? normalized : normalized[..13] + "…";
-    }
-
-    private static string FriendlyModelLabel(string label)
-    {
-        var isFast = label.EndsWith(" fast", StringComparison.OrdinalIgnoreCase);
-        var normalized = isFast ? label[..^5] : label;
-        normalized = normalized.Replace("gpt-", string.Empty, StringComparison.OrdinalIgnoreCase);
-        normalized = normalized.Replace("claude-", string.Empty, StringComparison.OrdinalIgnoreCase);
-        normalized = normalized.Replace("-codex", string.Empty, StringComparison.OrdinalIgnoreCase);
-        return isFast ? normalized + " fast" : normalized;
-    }
-
-    private static Color[] ModelPalette =>
-    [
-        Color.FromArgb(0, 95, 184),
-        Color.FromArgb(16, 124, 16),
-        Color.FromArgb(134, 97, 197),
-        Color.FromArgb(196, 86, 9),
-    ];
-
-    private static int StableColorIndex(string value, int length)
-    {
-        var hash = 17;
-        foreach (var character in value)
-        {
-            hash = unchecked((hash * 31) + character);
-        }
-
-        return (hash & int.MaxValue) % Math.Max(1, length);
-    }
-
-    private static string FormatUsd(decimal value)
-    {
-        if (value <= 0)
-        {
-            return "$0.00";
-        }
-
-        return value < 0.01m ? "<$0.01" : $"${value:0.00}";
-    }
-
-    private static void DrawEmpty(Graphics graphics, Rectangle bounds, string message)
-    {
-        using var pen = new Pen(Color.FromArgb(90, 128, 128, 128));
-        using var brush = new SolidBrush(Color.FromArgb(150, 128, 128, 128));
-        graphics.DrawLine(pen, bounds.Left, bounds.Bottom - 1, bounds.Right, bounds.Bottom - 1);
-        using var font = CreateFont("Segoe UI Variable Text", 7.5f, FontStyle.Regular);
-        graphics.DrawString(message, font, brush, bounds);
-    }
-
+    /// <summary>
+    /// One usage row inside the grouped card: name + percent on the first line,
+    /// a slim 4px meter, then remaining/reset captions. Transparent surface; the
+    /// hosting <see cref="UsageCardPanel"/> provides the card chrome.
+    /// </summary>
     private sealed class UsageSection : Panel
     {
         private readonly Label nameLabel;
@@ -1840,47 +930,56 @@ public sealed class UsagePopupForm : Form
         private readonly Label remainingLabel;
         private readonly Label resetLabel;
         private readonly UsageMeterControl meter;
-        private ThemePalette theme = ThemePalette.FromWindows();
+        private readonly Font strongFont = FluentTheme.BodyStrongFont(1f);
+        private readonly Font detailFont = FluentTheme.CaptionFont(1f);
+        private FluentTokens tokens = FluentTheme.Get(IsSystemDarkTheme(), onBackdrop: false);
         private float layoutScale = 1f;
+        private bool showSeparator;
 
         public UsageSection(string name)
         {
-            BackColor = theme.Card;
+            BackColor = Color.Transparent;
             DoubleBuffered = true;
-            Padding = new Padding(14, 12, 14, 12);
 
-            nameLabel = new Label
+            nameLabel = new FluentLabel
             {
                 AutoSize = false,
-                Font = CreateFont("Segoe UI Variable Text", 9.5f, FontStyle.Bold),
-                Text = name
+                AutoEllipsis = true,
+                BackColor = Color.Transparent,
+                Font = strongFont,
+                Text = name,
+                UseCompatibleTextRendering = true
             };
 
-            percentLabel = new Label
+            percentLabel = new FluentLabel
             {
-                Anchor = AnchorStyles.Top | AnchorStyles.Right,
                 AutoSize = false,
-                Font = CreateFont("Segoe UI Variable Text", 9.5f, FontStyle.Bold),
-                TextAlign = ContentAlignment.TopRight
+                BackColor = Color.Transparent,
+                Font = strongFont,
+                TextAlign = ContentAlignment.TopRight,
+                UseCompatibleTextRendering = true
             };
 
             meter = new UsageMeterControl
             {
-                Anchor = AnchorStyles.Left | AnchorStyles.Top
+                BackColor = Color.Transparent
             };
 
-            remainingLabel = new Label
+            remainingLabel = new FluentLabel
             {
                 AutoSize = false,
-                Font = CreateFont("Segoe UI Variable Text", 8.75f, FontStyle.Regular)
+                BackColor = Color.Transparent,
+                Font = detailFont,
+                UseCompatibleTextRendering = true
             };
 
-            resetLabel = new Label
+            resetLabel = new FluentLabel
             {
-                Anchor = AnchorStyles.Top | AnchorStyles.Right,
                 AutoSize = false,
-                Font = CreateFont("Segoe UI Variable Text", 8.75f, FontStyle.Regular),
-                TextAlign = ContentAlignment.TopRight
+                BackColor = Color.Transparent,
+                Font = detailFont,
+                TextAlign = ContentAlignment.TopRight,
+                UseCompatibleTextRendering = true
             };
 
             Controls.Add(nameLabel);
@@ -1888,8 +987,24 @@ public sealed class UsagePopupForm : Form
             Controls.Add(meter);
             Controls.Add(remainingLabel);
             Controls.Add(resetLabel);
-            ApplyTheme(theme);
+            ApplyTheme(tokens);
             UpdateChildLayout();
+        }
+
+        /// <summary>Draws a full-width 1px CardStroke separator along the row's top edge.</summary>
+        public bool ShowSeparator
+        {
+            get => showSeparator;
+            set
+            {
+                if (showSeparator == value)
+                {
+                    return;
+                }
+
+                showSeparator = value;
+                Invalidate();
+            }
         }
 
         public void EnableDragMove()
@@ -1919,26 +1034,27 @@ public sealed class UsagePopupForm : Form
             popup.EnableDragMove(meter);
         }
 
-        public void ApplyTheme(ThemePalette palette)
+        public void ApplyTheme(FluentTokens palette)
         {
-            theme = palette;
-            BackColor = theme.Card;
+            tokens = palette;
 
+            // The card chrome lives on the parent UsageCardPanel; every surface in
+            // the row stays transparent so the backdrop path composites correctly.
+            BackColor = Color.Transparent;
             foreach (Control control in Controls)
             {
-                control.BackColor = theme.Card;
+                control.BackColor = Color.Transparent;
             }
 
-            nameLabel.ForeColor = theme.TextPrimary;
-            percentLabel.ForeColor = theme.Accent;
-            remainingLabel.ForeColor = theme.TextSecondary;
-            resetLabel.ForeColor = theme.TextSecondary;
+            nameLabel.ForeColor = tokens.TextPrimary;
+            percentLabel.ForeColor = tokens.AccentText;
+            remainingLabel.ForeColor = tokens.TextSecondary;
+            resetLabel.ForeColor = tokens.TextSecondary;
 
-            meter.TrackColor = theme.MeterTrack;
-            meter.AccentColor = theme.Accent;
-            meter.WarningColor = theme.Warning;
-            meter.DangerColor = theme.Danger;
-            meter.BackColor = theme.Card;
+            meter.TrackColor = tokens.MeterTrack;
+            meter.AccentColor = tokens.Accent;
+            meter.WarningColor = tokens.Warning;
+            meter.DangerColor = tokens.Danger;
 
             Invalidate(true);
         }
@@ -1952,7 +1068,7 @@ public sealed class UsagePopupForm : Form
         public void SetUnavailable(string title)
         {
             nameLabel.Text = title;
-            percentLabel.Text = "-- used";
+            percentLabel.Text = "--";
             meter.Value = 0;
             remainingLabel.Text = "-- remaining";
             resetLabel.Text = "Reset unknown";
@@ -1961,16 +1077,16 @@ public sealed class UsagePopupForm : Form
         public void SetLoading(string title)
         {
             nameLabel.Text = title;
-            percentLabel.Text = "Loading...";
+            percentLabel.Text = "…";
             meter.Value = 0;
-            remainingLabel.Text = "Fetching usage";
-            resetLabel.Text = "Reset loading";
+            remainingLabel.Text = "Fetching usage…";
+            resetLabel.Text = "Reset pending";
         }
 
         public void SetUsage(ProviderUsageWindow usage)
         {
             nameLabel.Text = usage.Title;
-            percentLabel.Text = $"{usage.UsedPercent:0.#}% used";
+            percentLabel.Text = $"{usage.UsedPercent:0.#}%";
             meter.Value = usage.UsedPercent;
             remainingLabel.Text = $"{usage.RemainingPercent:0.#}% remaining";
             resetLabel.Text = usage.ResetsAt is { } resetAt
@@ -1999,15 +1115,13 @@ public sealed class UsagePopupForm : Form
 
         protected override void OnPaint(PaintEventArgs e)
         {
-            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-
-            var bounds = new Rectangle(0, 0, Width - 1, Height - 1);
-            using var fillBrush = new SolidBrush(theme.Card);
-            using var borderPen = new Pen(theme.CardBorder);
-            using var path = RoundedPath(bounds, 12);
-
-            e.Graphics.FillPath(fillBrush, path);
-            e.Graphics.DrawPath(borderPen, path);
+            if (showSeparator)
+            {
+                var strokeWidth = Math.Max(1f, layoutScale);
+                using var separatorPen = new Pen(tokens.CardStroke, strokeWidth);
+                var y = strokeWidth / 2f;
+                e.Graphics.DrawLine(separatorPen, strokeWidth, y, Width - strokeWidth, y);
+            }
 
             base.OnPaint(e);
         }
@@ -2018,114 +1132,57 @@ public sealed class UsagePopupForm : Form
             UpdateChildLayout();
         }
 
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                strongFont.Dispose();
+                detailFont.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+
         private void UpdateChildLayout()
         {
-            var leftPadding = ScaleInt(16, layoutScale);
-            var rightPadding = ScaleInt(34, layoutScale);
-            var titleTop = ScaleInt(13, layoutScale);
-            var titleHeight = ScaleInt(24, layoutScale);
-            var meterTop = ScaleInt(43, layoutScale);
-            var meterHeight = ScaleInt(8, layoutScale);
-            var footerTop = ScaleInt(59, layoutScale);
-            var footerHeight = ScaleInt(22, layoutScale);
+            var pad = ScaleInt(16, layoutScale);
+            var line1Top = ScaleInt(14, layoutScale);
+            var line1Height = ScaleInt(20, layoutScale);
+            var percentWidth = ScaleInt(96, layoutScale);
+            var meterTop = ScaleInt(42, layoutScale);
+            var meterHeight = Math.Max(3, ScaleInt(4, layoutScale));
+            var line3Top = ScaleInt(52, layoutScale);
+            var line3Height = ScaleInt(16, layoutScale);
 
             nameLabel.Bounds = new Rectangle(
-                leftPadding,
-                titleTop,
-                Math.Max(ScaleInt(130, layoutScale), Width - ScaleInt(220, layoutScale)),
-                titleHeight);
+                pad,
+                line1Top,
+                Math.Max(ScaleInt(120, layoutScale), Width - (pad * 2) - percentWidth - ScaleInt(8, layoutScale)),
+                line1Height);
 
             percentLabel.Bounds = new Rectangle(
-                Math.Max(leftPadding, Width - ScaleInt(186, layoutScale)),
-                titleTop,
-                Math.Max(ScaleInt(120, layoutScale), ScaleInt(168, layoutScale)),
-                titleHeight);
-            percentLabel.Width = Math.Max(
-                ScaleInt(110, layoutScale),
-                Width - percentLabel.Left - rightPadding);
+                Math.Max(pad, Width - pad - percentWidth),
+                line1Top,
+                percentWidth,
+                line1Height);
 
             meter.Bounds = new Rectangle(
-                leftPadding,
+                pad,
                 meterTop,
-                Math.Max(ScaleInt(80, layoutScale), Width - leftPadding - rightPadding),
+                Math.Max(ScaleInt(80, layoutScale), Width - (pad * 2)),
                 meterHeight);
 
             remainingLabel.Bounds = new Rectangle(
-                leftPadding,
-                footerTop,
-                Math.Max(ScaleInt(120, layoutScale), Width / 2 - leftPadding),
-                footerHeight);
+                pad,
+                line3Top,
+                Math.Max(ScaleInt(120, layoutScale), (Width / 2) - pad),
+                line3Height);
 
             resetLabel.Bounds = new Rectangle(
-                Math.Max(leftPadding, Width - ScaleInt(210, layoutScale)),
-                footerTop,
-                Math.Max(ScaleInt(140, layoutScale), ScaleInt(192, layoutScale)),
-                footerHeight);
-            resetLabel.Width = Math.Max(
-                ScaleInt(140, layoutScale),
-                Width - resetLabel.Left - rightPadding);
-        }
-    }
-
-    private sealed record ThemePalette(
-        bool IsDark,
-        Color Surface,
-        Color Card,
-        Color Border,
-        Color CardBorder,
-        Color TextPrimary,
-        Color TextSecondary,
-        Color Accent,
-        Color MeterTrack,
-        Color Hover,
-        Color Pressed,
-        Color Warning,
-        Color Danger)
-    {
-        public static ThemePalette FromWindows()
-        {
-            var isLight = Registry.GetValue(
-                @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-                "AppsUseLightTheme",
-                1) as int? ?? 1;
-
-            return isLight == 0 ? Dark() : Light();
-        }
-
-        private static ThemePalette Dark()
-        {
-            return new ThemePalette(
-                true,
-                Color.FromArgb(32, 32, 32),
-                Color.FromArgb(43, 43, 43),
-                Color.FromArgb(62, 62, 62),
-                Color.FromArgb(70, 70, 70),
-                Color.FromArgb(245, 245, 245),
-                Color.FromArgb(199, 199, 199),
-                Color.FromArgb(96, 205, 255),
-                Color.FromArgb(62, 69, 74),
-                Color.FromArgb(54, 54, 54),
-                Color.FromArgb(68, 68, 68),
-                Color.FromArgb(255, 185, 0),
-                Color.FromArgb(255, 99, 71));
-        }
-
-        private static ThemePalette Light()
-        {
-            return new ThemePalette(
-                false,
-                Color.FromArgb(243, 243, 243),
-                Color.FromArgb(255, 255, 255),
-                Color.FromArgb(218, 220, 224),
-                Color.FromArgb(226, 226, 226),
-                Color.FromArgb(32, 31, 30),
-                Color.FromArgb(96, 94, 92),
-                Color.FromArgb(0, 95, 184),
-                Color.FromArgb(233, 238, 243),
-                Color.FromArgb(235, 235, 235),
-                Color.FromArgb(225, 225, 225),
-                Color.FromArgb(202, 80, 16),
-                Color.FromArgb(196, 43, 28));
+                Width / 2,
+                line3Top,
+                Math.Max(ScaleInt(120, layoutScale), (Width / 2) - pad),
+                line3Height);
         }
     }
 
@@ -2146,7 +1203,7 @@ public sealed class UsagePopupForm : Form
             "Assets",
             "OpenAICodexLogoBlack.png");
 
-        private ThemePalette theme = ThemePalette.FromWindows();
+        private FluentTokens tokens = FluentTheme.Get(IsSystemDarkTheme(), onBackdrop: false);
         private bool hovering;
         private bool pressing;
         private bool selected;
@@ -2162,8 +1219,10 @@ public sealed class UsagePopupForm : Form
                 ControlStyles.OptimizedDoubleBuffer |
                 ControlStyles.ResizeRedraw |
                 ControlStyles.Selectable |
+                ControlStyles.SupportsTransparentBackColor |
                 ControlStyles.UserPaint,
                 true);
+            BackColor = Color.Transparent;
         }
 
         [System.ComponentModel.Browsable(false)]
@@ -2191,10 +1250,9 @@ public sealed class UsagePopupForm : Form
             }
         }
 
-        public void ApplyTheme(ThemePalette palette)
+        public void ApplyTheme(FluentTokens palette)
         {
-            theme = palette;
-            BackColor = theme.Surface;
+            tokens = palette;
             Invalidate();
         }
 
@@ -2246,61 +1304,85 @@ public sealed class UsagePopupForm : Form
         {
             e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
 
-            var fill = selected
-                ? theme.Accent
-                : pressing
-                    ? theme.Pressed
-                    : hovering
-                        ? theme.Hover
-                        : theme.Surface;
+            var dpiScale = DeviceDpi / 96f;
+            var cornerRadius = FluentTheme.ControlCornerRadius * dpiScale;
 
-            using var fillBrush = new SolidBrush(fill);
-            using var borderPen = new Pen(selected ? theme.Accent : theme.CardBorder);
-            using var path = RoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), 8);
-            e.Graphics.FillPath(fillBrush, path);
-            e.Graphics.DrawPath(borderPen, path);
+            // Idle tabs are fully transparent (acrylic shows through); hover and
+            // pressed use the Subtle fills, the selected tab gets ControlFill plus
+            // a small accent pill indicator under the icon.
+            if (selected)
+            {
+                using var fillBrush = new SolidBrush(tokens.ControlFill);
+                using var borderPen = new Pen(tokens.ControlStroke);
+                using var path = RoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), cornerRadius);
+                e.Graphics.FillPath(fillBrush, path);
+                e.Graphics.DrawPath(borderPen, path);
+            }
+            else if (pressing || hovering)
+            {
+                using var fillBrush = new SolidBrush(pressing ? tokens.SubtlePressed : tokens.SubtleHover);
+                using var path = RoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), cornerRadius);
+                e.Graphics.FillPath(fillBrush, path);
+            }
 
             var iconSize = Math.Max(16, Math.Min(Width, Height) - Math.Max(8, Height / 3));
             var iconBounds = new Rectangle(Width / 2 - iconSize / 2, Height / 2 - iconSize / 2, iconSize, iconSize);
             if (Provider == UsageProvider.Claude)
             {
                 DrawClaudeLogo(e.Graphics, iconBounds);
-                return;
+            }
+            else if (Provider == UsageProvider.Cursor)
+            {
+                DrawCursorLogo(e.Graphics, iconBounds, tokens.IsDark ? Color.White : tokens.TextPrimary);
+            }
+            else
+            {
+                DrawOpenAiLogo(e.Graphics, iconBounds);
+
+                if (!string.Equals(Text, "Codex", StringComparison.OrdinalIgnoreCase))
+                {
+                    e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+                    using var font = new Font(Font.FontFamily, Math.Max(6f, Font.Size - 2f), FontStyle.Bold);
+                    using var brush = new SolidBrush(tokens.TextPrimary);
+                    var label = Text.Length <= 2 ? Text : Text[^1..];
+                    e.Graphics.DrawString(label, font, brush, Width - ScaleInt(12, dpiScale), Height - ScaleInt(13, dpiScale));
+                }
             }
 
-            if (Provider == UsageProvider.Cursor)
+            if (selected)
             {
-                DrawCursorLogo(e.Graphics, iconBounds, selected);
-                return;
-            }
-
-            DrawOpenAiLogo(e.Graphics, iconBounds, selected);
-
-            if (!string.Equals(Text, "Codex", StringComparison.OrdinalIgnoreCase))
-            {
-                using var font = new Font(Font.FontFamily, Math.Max(6f, Font.Size - 2f), FontStyle.Bold);
-                using var brush = new SolidBrush(selected || !theme.IsDark ? Color.Black : theme.TextPrimary);
-                var label = Text.Length <= 2 ? Text : Text[^1..];
-                e.Graphics.DrawString(label, font, brush, Width - 12, Height - 13);
+                DrawSelectionPill(e.Graphics, dpiScale);
             }
         }
 
-        private void DrawOpenAiLogo(Graphics graphics, Rectangle bounds, bool isSelected)
+        private void DrawSelectionPill(Graphics graphics, float dpiScale)
         {
-            var preferredPath = isSelected || !theme.IsDark ? OpenAiBlackLogoPath : OpenAiWhiteLogoPath;
-            var fallbackPath = preferredPath == OpenAiBlackLogoPath ? OpenAiWhiteLogoPath : OpenAiBlackLogoPath;
-            var path = File.Exists(preferredPath) ? preferredPath : fallbackPath;
+            var pillWidth = ScaleInt(16, dpiScale);
+            var pillHeight = Math.Max(2, ScaleInt(3, dpiScale));
+            var pillBounds = new RectangleF(
+                (Width - pillWidth) / 2f,
+                Height - pillHeight - Math.Max(1, ScaleInt(2, dpiScale)),
+                pillWidth,
+                pillHeight);
+            using var pillBrush = new SolidBrush(tokens.Accent);
+            using var pillPath = FluentTheme.RoundedRect(pillBounds, pillHeight / 2f);
+            graphics.FillPath(pillBrush, pillPath);
+        }
 
-            if (File.Exists(path))
+        private void DrawOpenAiLogo(Graphics graphics, Rectangle bounds)
+        {
+            var preferredPath = tokens.IsDark ? OpenAiWhiteLogoPath : OpenAiBlackLogoPath;
+            var fallbackPath = preferredPath == OpenAiBlackLogoPath ? OpenAiWhiteLogoPath : OpenAiBlackLogoPath;
+
+            if ((GetCachedLogo(preferredPath) ?? GetCachedLogo(fallbackPath)) is { } image)
             {
-                using var image = Image.FromFile(path);
                 graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
                 graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
                 graphics.DrawImage(image, bounds);
                 return;
             }
 
-            var fallbackColor = isSelected || !theme.IsDark ? Color.Black : Color.White;
+            var fallbackColor = tokens.IsDark ? Color.White : tokens.TextPrimary;
             using var pen = new Pen(fallbackColor, 2.2f)
             {
                 StartCap = System.Drawing.Drawing2D.LineCap.Round,
@@ -2310,6 +1392,34 @@ public sealed class UsagePopupForm : Form
             graphics.DrawEllipse(pen, bounds);
             graphics.DrawLine(pen, bounds.Left + 4, bounds.Top + 13, bounds.Right - 3, bounds.Top + 5);
             graphics.DrawLine(pen, bounds.Left + 5, bounds.Top + 5, bounds.Right - 4, bounds.Bottom - 4);
+        }
+
+        private static readonly Dictionary<string, Image?> LogoCache = [];
+
+        private static Image? GetCachedLogo(string path)
+        {
+            // Loaded once per process and kept for the app lifetime; repaint-heavy
+            // paths (hover, loading pulse) make per-paint Image.FromFile too costly.
+            if (LogoCache.TryGetValue(path, out var cached))
+            {
+                return cached;
+            }
+
+            Image? image = null;
+            try
+            {
+                if (File.Exists(path))
+                {
+                    image = Image.FromFile(path);
+                }
+            }
+            catch (Exception exception) when (exception is IOException or OutOfMemoryException or UnauthorizedAccessException)
+            {
+                image = null;
+            }
+
+            LogoCache[path] = image;
+            return image;
         }
 
         private static void DrawClaudeLogo(Graphics graphics, Rectangle bounds)
@@ -2334,9 +1444,8 @@ public sealed class UsagePopupForm : Form
             }
         }
 
-        private static void DrawCursorLogo(Graphics graphics, Rectangle bounds, bool isSelected)
+        private static void DrawCursorLogo(Graphics graphics, Rectangle bounds, Color color)
         {
-            var color = Color.White;
             using var brush = new SolidBrush(color);
             try
             {
@@ -2514,27 +1623,32 @@ public sealed class UsagePopupForm : Form
         }
     }
 
-    private sealed class CloseGlyphButton : Control
+    private sealed class GlyphButton : Control
     {
-        private ThemePalette theme = ThemePalette.FromWindows();
+        private readonly string glyph;
+        private FluentTokens tokens = FluentTheme.Get(IsSystemDarkTheme(), onBackdrop: false);
         private bool hovering;
         private bool pressing;
 
-        public CloseGlyphButton()
+        public GlyphButton(string glyph, string accessibleName)
         {
+            this.glyph = glyph;
+            AccessibleName = accessibleName;
             Cursor = Cursors.Hand;
             SetStyle(
                 ControlStyles.AllPaintingInWmPaint |
                 ControlStyles.OptimizedDoubleBuffer |
                 ControlStyles.ResizeRedraw |
+                ControlStyles.Selectable |
+                ControlStyles.SupportsTransparentBackColor |
                 ControlStyles.UserPaint,
                 true);
+            BackColor = Color.Transparent;
         }
 
-        public void ApplyTheme(ThemePalette palette)
+        public void ApplyTheme(FluentTokens palette)
         {
-            theme = palette;
-            BackColor = theme.Surface;
+            tokens = palette;
             Invalidate();
         }
 
@@ -2571,20 +1685,34 @@ public sealed class UsagePopupForm : Form
         {
             e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
 
-            var fill = pressing ? theme.Pressed : hovering ? theme.Hover : theme.Surface;
-            using var fillBrush = new SolidBrush(fill);
-            using var path = RoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), 7);
-            e.Graphics.FillPath(fillBrush, path);
-
-            using var pen = new Pen(theme.TextSecondary, 1.4f)
+            // Idle state stays fully transparent so the backdrop shows through.
+            if (pressing || hovering)
             {
-                StartCap = System.Drawing.Drawing2D.LineCap.Round,
-                EndCap = System.Drawing.Drawing2D.LineCap.Round
-            };
+                using var fillBrush = new SolidBrush(pressing ? tokens.SubtlePressed : tokens.SubtleHover);
+                using var path = RoundedPath(
+                    new Rectangle(0, 0, Width - 1, Height - 1),
+                    FluentTheme.ControlCornerRadius * (DeviceDpi / 96f));
+                e.Graphics.FillPath(fillBrush, path);
+            }
 
-            var inset = Math.Max(8, Width / 3);
-            e.Graphics.DrawLine(pen, inset, inset, Width - inset, Height - inset);
-            e.Graphics.DrawLine(pen, Width - inset, inset, inset, Height - inset);
+            using var iconFont = FluentIcons.CreateFont(9f);
+            FluentIcons.Draw(
+                e.Graphics,
+                glyph,
+                iconFont,
+                tokens.TextSecondary,
+                ClientRectangle);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode is Keys.Enter or Keys.Space)
+            {
+                OnClick(EventArgs.Empty);
+                e.Handled = true;
+            }
+
+            base.OnKeyDown(e);
         }
     }
 
@@ -2592,39 +1720,6 @@ public sealed class UsagePopupForm : Form
     {
         public const int WmNclButtonDown = 0x00A1;
         public const int HtCaption = 0x0002;
-
-        private const int DwmwaWindowCornerPreference = 33;
-        private const int DwmwaUseImmersiveDarkMode = 20;
-        private const int DwmwcpRound = 2;
-
-        public static void ApplyWindowAttributes(IntPtr handle, bool isDark)
-        {
-            if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
-            {
-                return;
-            }
-
-            var preference = DwmwcpRound;
-            _ = DwmSetWindowAttribute(
-                handle,
-                DwmwaWindowCornerPreference,
-                ref preference,
-                sizeof(int));
-
-            var darkMode = isDark ? 1 : 0;
-            _ = DwmSetWindowAttribute(
-                handle,
-                DwmwaUseImmersiveDarkMode,
-                ref darkMode,
-                sizeof(int));
-        }
-
-        [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
-        private static extern int DwmSetWindowAttribute(
-            IntPtr hwnd,
-            int dwAttribute,
-            ref int pvAttribute,
-            int cbAttribute);
 
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         public static extern bool ReleaseCapture();
