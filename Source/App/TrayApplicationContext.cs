@@ -9,6 +9,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly NotifyIcon notifyIcon;
     private readonly UsagePopupForm popup = new();
     private SettingsForm? settingsForm;
+    private UsageGraphsForm? graphsForm;
     private readonly System.Windows.Forms.Timer refreshTimer = new();
     private readonly System.Windows.Forms.Timer updateTimer = new();
     private readonly SynchronizationContext uiContext;
@@ -46,12 +47,12 @@ public sealed class TrayApplicationContext : ApplicationContext
         notifyIcon.MouseUp += OnTrayMouseUp;
         popup.SelectedProviderChanged += (_, providerKey) =>
         {
-            var needsHistory = providerKey != UsagePopupForm.CursorProviderKey;
-            if (!GetLatestUsage(providerKey).HasSnapshot || (needsHistory && !GetLatestHistory(providerKey).HasInsights))
+            if (!GetLatestUsage(providerKey).HasSnapshot)
             {
                 BeginRefresh(showLoading: true);
             }
         };
+        popup.UsageGraphsRequested += (_, _) => ShowUsageGraphs();
 
         refreshTimer.Interval = (int)TimeSpan.FromMinutes(1).TotalMilliseconds;
         refreshTimer.Tick += (_, _) => BeginRefresh(showLoading: false);
@@ -75,6 +76,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             refreshTimer.Dispose();
             updateTimer.Dispose();
             settingsForm?.Dispose();
+            graphsForm?.Dispose();
             popup.Dispose();
             notifyIcon.Visible = false;
             notifyIcon.Dispose();
@@ -88,6 +90,9 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         var menu = new ContextMenuStrip();
 
+        var graphsItem = new ToolStripMenuItem("Usage graphs");
+        graphsItem.Click += (_, _) => ShowUsageGraphs();
+
         var settingsItem = new ToolStripMenuItem("Settings");
         settingsItem.Click += (_, _) => ShowSettings();
 
@@ -97,6 +102,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         var exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (_, _) => ExitThread();
 
+        menu.Items.Add(graphsItem);
         menu.Items.Add(settingsItem);
         menu.Items.Add(checkForUpdatesItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -149,11 +155,9 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
             popup.UpdateUsage(providerKey, GetLatestUsage(providerKey));
-            popup.UpdateProviderHistory(providerKey, GetLatestHistory(providerKey));
         }
 
         popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
-        popup.UpdateProviderHistory(UsagePopupForm.ClaudeProviderKey, GetLatestHistory(UsagePopupForm.ClaudeProviderKey));
         popup.UpdateUsage(UsagePopupForm.CursorProviderKey, latestCursorUsage);
         popup.ShowNear(anchor);
 
@@ -168,7 +172,11 @@ public sealed class TrayApplicationContext : ApplicationContext
         if (showLoading)
         {
             popup.SetLoading(popup.SelectedProvider);
-            popup.SetProviderHistoryLoading(popup.SelectedProvider);
+        }
+
+        if (graphsForm is { IsDisposed: false } activeGraphs)
+        {
+            activeGraphs.SetLoading(activeGraphs.SelectedProvider);
         }
 
         refreshCancellation?.Cancel();
@@ -241,7 +249,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                     {
                         var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
                         latestHistory[providerKey] = codexHistory;
-                        popup.UpdateProviderHistory(providerKey, codexHistory);
+                        graphsForm?.UpdateHistory(providerKey, codexHistory);
                     }
                 });
             }
@@ -264,7 +272,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 PostIfCurrent(() =>
                 {
                     latestHistory[UsagePopupForm.ClaudeProviderKey] = claudeHistory;
-                    popup.UpdateProviderHistory(UsagePopupForm.ClaudeProviderKey, claudeHistory);
+                    graphsForm?.UpdateHistory(UsagePopupForm.ClaudeProviderKey, claudeHistory);
                 });
             }
 
@@ -329,6 +337,58 @@ public sealed class TrayApplicationContext : ApplicationContext
                 }, null);
             }
         }, CancellationToken.None);
+    }
+
+    private void ShowUsageGraphs()
+    {
+        if (graphsForm is { IsDisposed: false })
+        {
+            PushHistoryToGraphs();
+            graphsForm.Show();
+            if (graphsForm.WindowState == FormWindowState.Minimized)
+            {
+                graphsForm.WindowState = FormWindowState.Normal;
+            }
+
+            graphsForm.Activate();
+            return;
+        }
+
+        graphsForm = new UsageGraphsForm();
+        graphsForm.ConfigureCodexEntries(codexCliEntries);
+        graphsForm.SelectedProviderChanged += (_, providerKey) =>
+        {
+            if (!GetLatestHistory(providerKey).HasInsights)
+            {
+                BeginRefresh(showLoading: false);
+            }
+        };
+        graphsForm.FormClosed += (_, _) => graphsForm = null;
+        PushHistoryToGraphs();
+        graphsForm.Show();
+        graphsForm.Activate();
+
+        if (!GetLatestHistory(graphsForm.SelectedProvider).HasInsights)
+        {
+            graphsForm.SetLoading(graphsForm.SelectedProvider);
+            BeginRefresh(showLoading: false);
+        }
+    }
+
+    private void PushHistoryToGraphs()
+    {
+        if (graphsForm is not { IsDisposed: false } form)
+        {
+            return;
+        }
+
+        foreach (var entry in codexCliEntries)
+        {
+            var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
+            form.UpdateHistory(providerKey, GetLatestHistory(providerKey));
+        }
+
+        form.UpdateHistory(UsagePopupForm.ClaudeProviderKey, GetLatestHistory(UsagePopupForm.ClaudeProviderKey));
     }
 
     private void ShowSettings()
@@ -465,13 +525,18 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
             popup.UpdateUsage(providerKey, GetLatestUsage(providerKey));
-            popup.UpdateProviderHistory(providerKey, GetLatestHistory(providerKey));
         }
 
         latestHistory.TryAdd(UsagePopupForm.ClaudeProviderKey, new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet."));
         popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
-        popup.UpdateProviderHistory(UsagePopupForm.ClaudeProviderKey, GetLatestHistory(UsagePopupForm.ClaudeProviderKey));
         popup.UpdateUsage(UsagePopupForm.CursorProviderKey, latestCursorUsage);
+
+        if (graphsForm is { IsDisposed: false } activeGraphs)
+        {
+            activeGraphs.ConfigureCodexEntries(codexCliEntries);
+            PushHistoryToGraphs();
+        }
+
         BeginRefresh(showLoading: false);
     }
 

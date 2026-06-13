@@ -1,225 +1,366 @@
-using System.Runtime.InteropServices;
-using Microsoft.Win32;
+using System.Drawing.Drawing2D;
+
+// This UI is constructed in code only (no WinForms designer), so designer
+// code-serialization metadata for control properties is irrelevant.
+#pragma warning disable WFO1000
 
 namespace CodexBarWindows;
 
+/// <summary>
+/// Windows 11 Settings-style dialog: a left navigation rail (General, Appearance, Codex
+/// accounts, Cursor) and per-section pages built from the Fluent settings cards/expanders.
+/// Appearance changes persist through <see cref="UiSettings"/> and restyle this window in place.
+/// </summary>
 public sealed class SettingsForm : Form
 {
-    private readonly ThemePalette theme = ThemePalette.FromWindows();
-    private readonly Label headingLabel;
-    private readonly Label subtitleLabel;
-    private readonly CardPanel generalCard;
-    private readonly CardPanel accountsCard;
-    private readonly CardPanel cursorCard;
-    private readonly Label generalTitleLabel;
-    private readonly Label generalDescriptionLabel;
-    private readonly Label startupTitleLabel;
-    private readonly Label startupDescriptionLabel;
-    private readonly ToggleSwitch startWithWindowsToggle;
-    private readonly Label accountsTitleLabel;
-    private readonly Label accountsDescriptionLabel;
-    private readonly Label cursorTitleLabel;
-    private readonly Label cursorDescriptionLabel;
-    private readonly Label cursorCookieLabel;
-    private readonly ModernTextField cursorCookieTextBox;
-    private readonly ModernButton saveCursorCookieButton;
-    private readonly ModernButton clearCursorCookieButton;
-    private readonly AccountListBox accountListBox;
-    private readonly Label accountNameLabel;
-    private readonly Label binaryPathLabel;
-    private readonly ModernTextField accountNameTextBox;
-    private readonly ModernTextField binaryPathTextBox;
-    private readonly ModernButton browseButton;
-    private readonly ModernButton addButton;
-    private readonly ModernButton saveButton;
-    private readonly ModernButton removeButton;
-    private readonly Label versionLabel;
-    private readonly ModernButton closeButton;
+    // Additional Segoe Fluent Icons glyphs (not part of the shared FluentIcons set).
+    private const string GeneralGlyph = "\uE770";     // System
+    private const string AppearanceGlyph = "\uE790";  // Color
+    private const string AccountsGlyph = "\uE716";    // People
+    private const string CursorGlyph = "\uE774";      // Globe
+    private const string StartupGlyph = "\uE7E8";     // Power button
+    private const string MaterialGlyph = "\uE771";    // Personalize
+
+    private readonly Font subtitleFont;
+    private readonly Font bodyFont;
+    private readonly Font captionFont;
     private readonly List<CodexCliEntry> codexCliEntries;
+    private readonly NavigationRail navRail;
+    private readonly Panel[] pages;
+
+    private FluentTokens tokens;
+    private UiSettings uiSettings;
+
+    private Panel generalPage = null!;
+    private Panel appearancePage = null!;
+    private Panel accountsPage = null!;
+    private Panel cursorPage = null!;
+
+    private Label generalTitleLabel = null!;
+    private SettingsCard startupCard = null!;
+    private FluentToggle startWithWindowsToggle = null!;
+    private SettingsCard versionCard = null!;
+
+    private Label appearanceTitleLabel = null!;
+    private SettingsCard themeCard = null!;
+    private FluentComboBox themeCombo = null!;
+    private SettingsExpander materialExpander = null!;
+    private FluentComboBox materialCombo = null!;
+    private SettingsExpanderRow opacityRow = null!;
+    private Panel opacityPanel = null!;
+    private FluentSlider opacitySlider = null!;
+    private Label opacityValueLabel = null!;
+
+    private Label accountsTitleLabel = null!;
+    private Label accountsCaptionLabel = null!;
+    private AccountListBox accountListBox = null!;
+    private Label accountNameLabel = null!;
+    private FluentTextField accountNameTextBox = null!;
+    private Label binaryPathLabel = null!;
+    private FluentTextField binaryPathTextBox = null!;
+    private FluentButton browseButton = null!;
+    private FluentButton addButton = null!;
+    private FluentButton saveButton = null!;
+    private FluentButton removeButton = null!;
+
+    private Label cursorTitleLabel = null!;
+    private Label cursorCaptionLabel = null!;
+    private SettingsCard cursorCard = null!;
+    private FluentTextField cursorCookieTextBox = null!;
+    private FluentButton saveCursorCookieButton = null!;
+    private FluentButton clearCursorCookieButton = null!;
 
     public event EventHandler? CodexCliEntriesChanged;
     public event EventHandler? CursorSettingsChanged;
 
     public SettingsForm()
     {
+        // Re-read the accent so a dialog opened after an accent change does not paint the
+        // launch-time color (the popup only refreshes the cache once its own handle exists).
+        FluentTheme.RefreshAccent();
+        uiSettings = UiSettings.Load();
+        tokens = FluentTheme.Get(uiSettings.ResolveIsDark(), onBackdrop: false);
+
         codexCliEntries = CodexCliSettings.Load().ToList();
 
+        subtitleFont = FluentTheme.SubtitleFont(1f);
+        bodyFont = FluentTheme.BodyFont(1f);
+        captionFont = FluentTheme.CaptionFont(1f);
+
+        // Without explicit AutoScaleDimensions, AutoScaleMode.Dpi never scales (factor stays 1.0)
+        // and the DeviceDpi-scaled paint metrics would overflow the unscaled control bounds.
         AutoScaleMode = AutoScaleMode.Dpi;
-        AutoScroll = true;
-        BackColor = theme.Window;
-        ClientSize = new Size(620, 890);
-        Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular);
+        AutoScaleDimensions = new SizeF(96F, 96F);
+        BackColor = tokens.Background;
+        ClientSize = new Size(780, 560);
+        Font = bodyFont;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         Icon = TrayIconFactory.Create();
         MaximizeBox = false;
         MinimizeBox = false;
         ShowInTaskbar = true;
         StartPosition = FormStartPosition.CenterScreen;
-        Text = "CodexBarWindows Settings";
+        Text = "CodexBar Settings";
 
-        headingLabel = new Label
+        navRail = new NavigationRail(tokens)
         {
-            AutoSize = false,
-            Font = CreateFont("Segoe UI Variable Display", 24f, FontStyle.Bold),
-            Location = new Point(28, 28),
-            Size = new Size(360, 42),
-            Text = "Settings"
+            Location = new Point(8, 16),
+            Size = new Size(192, 160)
         };
+        navRail.AddItem(GeneralGlyph, "General");
+        navRail.AddItem(AppearanceGlyph, "Appearance");
+        navRail.AddItem(AccountsGlyph, "Codex accounts");
+        navRail.AddItem(CursorGlyph, "Cursor");
 
-        subtitleLabel = new Label
+        generalPage = CreatePage();
+        appearancePage = CreatePage();
+        accountsPage = CreatePage();
+        cursorPage = CreatePage();
+        pages = [generalPage, appearancePage, accountsPage, cursorPage];
+
+        BuildGeneralPage();
+        BuildAppearancePage();
+        BuildAccountsPage();
+        BuildCursorPage();
+
+        Controls.AddRange([navRail, generalPage, appearancePage, accountsPage, cursorPage]);
+
+        navRail.SelectedIndexChanged += (_, _) => ShowPage(navRail.SelectedIndex);
+
+        cursorCookieTextBox.Text = CursorSettings.LoadCookieHeader();
+        RefreshCodexCliList();
+        ShowPage(0);
+        ApplyThemeToTree();
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        _ = WindowEffects.TryApplyBackdrop(Handle, SystemBackdrop.Mica);
+        WindowEffects.SetImmersiveDarkMode(Handle, tokens.IsDark);
+    }
+
+    protected override void OnLoad(EventArgs e)
+    {
+        base.OnLoad(e);
+        // Expanded after the form has auto-scaled so the expander computes its expanded height
+        // from final (per-monitor) device metrics instead of the pre-scale designer units.
+        materialExpander.Expanded = true;
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        base.Dispose(disposing);
+        if (disposing)
         {
-            AutoSize = false,
-            Font = CreateFont("Segoe UI Variable Text", 9.5f, FontStyle.Regular),
-            Location = new Point(30, 74),
-            Size = new Size(540, 24),
-            Text = "Choose how CodexBarWindows launches and which Codex CLI accounts appear in the tray popup."
-        };
+            subtitleFont.Dispose();
+            bodyFont.Dispose();
+            captionFont.Dispose();
+        }
+    }
 
-        generalCard = new CardPanel(theme)
+    private Panel CreatePage()
+    {
+        return new Panel
         {
-            Location = new Point(28, 122),
-            Size = new Size(564, 152)
+            AutoScroll = true,
+            BackColor = tokens.Background,
+            Location = new Point(200, 0),
+            Size = new Size(580, 560),
+            Visible = false
         };
+    }
 
-        generalTitleLabel = CardTitle("General", new Point(20, 18), new Size(220, 28));
-        generalDescriptionLabel = CardDescription(
-            "Core tray behavior and startup preferences.",
-            new Point(20, 48),
-            new Size(500, 24));
-        startupTitleLabel = RowTitle("Auto start on login", new Point(20, 96), new Size(220, 24));
-        startupDescriptionLabel = RowDescription(
-            "Launch automatically when you sign in to Windows.",
-            new Point(20, 119),
-            new Size(360, 22));
-        startWithWindowsToggle = new ToggleSwitch(theme)
+    private void ShowPage(int index)
+    {
+        for (var i = 0; i < pages.Length; i++)
+        {
+            pages[i].Visible = i == index;
+        }
+    }
+
+    private void BuildGeneralPage()
+    {
+        generalTitleLabel = CreatePageTitle("General");
+
+        startWithWindowsToggle = new FluentToggle(tokens)
         {
             Checked = StartupSettings.IsEnabled,
-            Location = new Point(478, 103),
-            Size = new Size(58, 28)
+            Size = new Size(40, 20)
         };
         startWithWindowsToggle.CheckedChanged += (_, _) => StartupSettings.SetEnabled(startWithWindowsToggle.Checked);
-        generalCard.Controls.AddRange([
-            generalTitleLabel,
-            generalDescriptionLabel,
-            startupTitleLabel,
-            startupDescriptionLabel,
-            startWithWindowsToggle
-        ]);
 
-        cursorCard = new CardPanel(theme)
+        startupCard = new SettingsCard(tokens)
         {
-            Location = new Point(28, 310),
-            Size = new Size(564, 154)
+            Description = "Launch CodexBar automatically when you sign in",
+            Glyph = StartupGlyph,
+            Location = new Point(24, 70),
+            Size = new Size(532, 64),
+            Title = "Start with Windows"
+        };
+        startupCard.ActionControl = startWithWindowsToggle;
+
+        versionCard = new SettingsCard(tokens)
+        {
+            Description = AppInfo.VersionText,
+            Glyph = FluentIcons.Info,
+            Location = new Point(24, 142),
+            Size = new Size(532, 64),
+            Title = "Version"
         };
 
-        cursorTitleLabel = CardTitle("Cursor", new Point(20, 18), new Size(220, 28));
-        cursorDescriptionLabel = CardDescription(
-            "Paste a Cookie header from a cursor.com request to show Cursor usage.",
-            new Point(20, 48),
-            new Size(508, 24));
-        cursorCookieLabel = FieldLabel("Cookie header", new Point(20, 82), new Size(140, 18));
-        cursorCookieTextBox = new ModernTextField(theme)
+        generalPage.Controls.AddRange([generalTitleLabel, startupCard, versionCard]);
+    }
+
+    private void BuildAppearancePage()
+    {
+        appearanceTitleLabel = CreatePageTitle("Appearance");
+
+        themeCombo = new FluentComboBox(tokens)
         {
-            Location = new Point(20, 103),
-            Size = new Size(346, 34),
-            PlaceholderText = "Cookie: WorkosCursorSessionToken=..."
+            Size = new Size(180, 32)
+        };
+        themeCombo.Items.AddRange(["System default", "Light", "Dark"]);
+        themeCombo.SelectedIndex = (int)uiSettings.Theme;
+
+        themeCard = new SettingsCard(tokens)
+        {
+            Description = "Choose how CodexBar looks",
+            Glyph = AppearanceGlyph,
+            Location = new Point(24, 70),
+            Size = new Size(532, 64),
+            Title = "Theme"
+        };
+        themeCard.ActionControl = themeCombo;
+
+        materialCombo = new FluentComboBox(tokens)
+        {
+            Size = new Size(180, 32)
+        };
+        materialCombo.Items.AddRange(["Acrylic (default)", "Mica", "Mica Alt", "Solid"]);
+        materialCombo.SelectedIndex = (int)uiSettings.Material;
+
+        materialExpander = new SettingsExpander(tokens)
+        {
+            Description = "Select the visual material used for the flyout background",
+            Glyph = MaterialGlyph,
+            Location = new Point(24, 142),
+            Size = new Size(532, 64),
+            Title = "Material"
+        };
+        materialExpander.HeaderControl = materialCombo;
+
+        opacitySlider = new FluentSlider(tokens)
+        {
+            Enabled = uiSettings.Material != BackdropMaterial.Solid,
+            Location = new Point(0, 0),
+            Maximum = 100,
+            Minimum = 0,
+            Size = new Size(220, 28),
+            Value = uiSettings.TintOpacityPercent
         };
 
-        saveCursorCookieButton = new ModernButton(theme, ButtonKind.Primary)
+        opacityValueLabel = new Label
         {
-            Location = new Point(378, 103),
-            Size = new Size(72, 34),
-            Text = "Save"
-        };
-        saveCursorCookieButton.Click += (_, _) => SaveCursorCookieHeader();
-
-        clearCursorCookieButton = new ModernButton(theme, ButtonKind.Secondary)
-        {
-            Location = new Point(458, 103),
-            Size = new Size(72, 34),
-            Text = "Clear"
-        };
-        clearCursorCookieButton.Click += (_, _) => ClearCursorCookieHeader();
-
-        cursorCard.Controls.AddRange([
-            cursorTitleLabel,
-            cursorDescriptionLabel,
-            cursorCookieLabel,
-            cursorCookieTextBox,
-            saveCursorCookieButton,
-            clearCursorCookieButton
-        ]);
-
-        accountsCard = new CardPanel(theme)
-        {
-            Location = new Point(28, 500),
-            Size = new Size(564, 260)
+            AutoSize = false,
+            BackColor = tokens.CardFill,
+            Font = captionFont,
+            Location = new Point(228, 0),
+            Size = new Size(40, 28),
+            Text = uiSettings.TintOpacityPercent.ToString(),
+            TextAlign = ContentAlignment.MiddleRight
         };
 
-        accountsTitleLabel = CardTitle("Codex CLI Accounts", new Point(20, 18), new Size(260, 28));
-        accountsDescriptionLabel = CardDescription(
+        opacityPanel = new Panel
+        {
+            BackColor = tokens.CardFill,
+            Size = new Size(268, 28)
+        };
+        opacityPanel.Controls.AddRange([opacitySlider, opacityValueLabel]);
+
+        opacityRow = new SettingsExpanderRow(tokens)
+        {
+            Description = "Background tint strength",
+            Size = new Size(532, 64),
+            Title = "Opacity"
+        };
+        opacityRow.ActionControl = opacityPanel;
+        materialExpander.AddRow(opacityRow);
+
+        // Subscribed after the initial values are set so construction never writes settings.
+        themeCombo.SelectedIndexChanged += (_, _) => OnThemeSelectionChanged();
+        materialCombo.SelectedIndexChanged += (_, _) => OnMaterialSelectionChanged();
+        opacitySlider.ValueChanged += (_, _) => OnOpacityChanged();
+
+        appearancePage.Controls.AddRange([appearanceTitleLabel, themeCard, materialExpander]);
+    }
+
+    private void BuildAccountsPage()
+    {
+        accountsTitleLabel = CreatePageTitle("Codex accounts");
+        accountsCaptionLabel = CreateCaption(
             "Add another authenticated CLI binary or wrapper script for each extra account.",
-            new Point(20, 48),
-            new Size(508, 24));
+            new Point(24, 58),
+            new Size(532, 18));
 
-        accountListBox = new AccountListBox(theme)
+        accountListBox = new AccountListBox(tokens)
         {
-            Location = new Point(20, 86),
-            Size = new Size(190, 92)
+            Location = new Point(24, 88),
+            Size = new Size(220, 240)
         };
         accountListBox.SelectedIndexChanged += (_, _) => PopulateSelectedCodexCli();
 
-        accountNameLabel = FieldLabel("Account name", new Point(230, 82), new Size(140, 18));
-        accountNameTextBox = new ModernTextField(theme)
+        accountNameLabel = CreateCaption("Display name", new Point(260, 88), new Size(296, 16));
+        accountNameTextBox = new FluentTextField(tokens)
         {
-            Location = new Point(230, 103),
-            Size = new Size(298, 34),
+            Location = new Point(260, 108),
+            Size = new Size(296, 32),
             PlaceholderText = "Name shown in popup"
         };
 
-        binaryPathLabel = FieldLabel("Binary path", new Point(230, 136), new Size(140, 18));
-        binaryPathTextBox = new ModernTextField(theme)
+        binaryPathLabel = CreateCaption("Codex binary path", new Point(260, 152), new Size(296, 16));
+        binaryPathTextBox = new FluentTextField(tokens)
         {
-            Location = new Point(230, 157),
-            Size = new Size(226, 34),
+            Location = new Point(260, 172),
+            Size = new Size(210, 32),
             PlaceholderText = "codex.exe, codex.cmd, or wrapper path"
         };
 
-        browseButton = new ModernButton(theme, ButtonKind.Secondary)
+        browseButton = new FluentButton(tokens, FluentButtonKind.Secondary)
         {
-            Location = new Point(466, 157),
-            Size = new Size(62, 34),
+            Location = new Point(478, 172),
+            Size = new Size(78, 32),
             Text = "Browse"
         };
         browseButton.Click += (_, _) => BrowseForCodexCli();
 
-        addButton = new ModernButton(theme, ButtonKind.Primary)
+        addButton = new FluentButton(tokens, FluentButtonKind.Primary)
         {
-            Location = new Point(230, 210),
+            Location = new Point(260, 220),
             Size = new Size(86, 32),
             Text = "Add"
         };
         addButton.Click += (_, _) => AddCodexCli();
 
-        saveButton = new ModernButton(theme, ButtonKind.Secondary)
+        saveButton = new FluentButton(tokens, FluentButtonKind.Secondary)
         {
-            Location = new Point(324, 210),
+            Location = new Point(354, 220),
             Size = new Size(86, 32),
             Text = "Save"
         };
         saveButton.Click += (_, _) => SaveSelectedCodexCli();
 
-        removeButton = new ModernButton(theme, ButtonKind.Secondary)
+        removeButton = new FluentButton(tokens, FluentButtonKind.Secondary)
         {
-            Location = new Point(418, 210),
-            Size = new Size(110, 32),
+            Location = new Point(448, 220),
+            Size = new Size(100, 32),
             Text = "Remove"
         };
         removeButton.Click += (_, _) => RemoveSelectedCodexCli();
 
-        accountsCard.Controls.AddRange([
+        accountsPage.Controls.AddRange([
             accountsTitleLabel,
-            accountsDescriptionLabel,
+            accountsCaptionLabel,
             accountListBox,
             accountNameLabel,
             accountNameTextBox,
@@ -230,84 +371,140 @@ public sealed class SettingsForm : Form
             saveButton,
             removeButton
         ]);
-
-        versionLabel = new Label
-        {
-            AutoSize = false,
-            Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular),
-            Location = new Point(30, 846),
-            Size = new Size(360, 24),
-            Text = $"Version {AppInfo.VersionText}"
-        };
-
-        closeButton = new ModernButton(theme, ButtonKind.Secondary)
-        {
-            Location = new Point(488, 838),
-            Size = new Size(104, 34),
-            Text = "Close"
-        };
-        closeButton.Click += (_, _) => Close();
-
-        Controls.AddRange([
-            headingLabel,
-            subtitleLabel,
-            generalCard,
-            cursorCard,
-            accountsCard,
-            versionLabel,
-            closeButton
-        ]);
-
-        cursorCookieTextBox.Text = CursorSettings.LoadCookieHeader();
-        RefreshCodexCliList();
-        ApplyTheme();
     }
 
-    protected override void OnHandleCreated(EventArgs e)
+    private void BuildCursorPage()
     {
-        base.OnHandleCreated(e);
-        ApplyWindowAttributes(Handle, theme.IsDark);
+        cursorTitleLabel = CreatePageTitle("Cursor");
+        cursorCaptionLabel = CreateCaption(
+            "Paste a Cookie header from a cursor.com request to show Cursor usage.",
+            new Point(24, 58),
+            new Size(532, 18));
+
+        cursorCookieTextBox = new FluentTextField(tokens)
+        {
+            Location = new Point(16, 52),
+            Size = new Size(340, 32),
+            PlaceholderText = "Cookie: WorkosCursorSessionToken=..."
+        };
+
+        saveCursorCookieButton = new FluentButton(tokens, FluentButtonKind.Primary)
+        {
+            Location = new Point(364, 52),
+            Size = new Size(72, 32),
+            Text = "Save"
+        };
+        saveCursorCookieButton.Click += (_, _) => SaveCursorCookieHeader();
+
+        clearCursorCookieButton = new FluentButton(tokens, FluentButtonKind.Secondary)
+        {
+            Location = new Point(444, 52),
+            Size = new Size(72, 32),
+            Text = "Clear"
+        };
+        clearCursorCookieButton.Click += (_, _) => ClearCursorCookieHeader();
+
+        cursorCard = new SettingsCard(tokens)
+        {
+            Location = new Point(24, 88),
+            Size = new Size(532, 100),
+            Title = "Cookie header",
+            TopAlignContent = true
+        };
+        cursorCard.Controls.AddRange([cursorCookieTextBox, saveCursorCookieButton, clearCursorCookieButton]);
+
+        cursorPage.Controls.AddRange([cursorTitleLabel, cursorCaptionLabel, cursorCard]);
     }
 
-    private void ApplyTheme()
+    private void OnThemeSelectionChanged()
     {
-        headingLabel.BackColor = theme.Window;
-        headingLabel.ForeColor = theme.TextPrimary;
-        subtitleLabel.BackColor = theme.Window;
-        subtitleLabel.ForeColor = theme.TextSecondary;
-        versionLabel.BackColor = theme.Window;
-        versionLabel.ForeColor = theme.TextSecondary;
-
-        foreach (var label in new[]
-                 {
-                     generalTitleLabel,
-                     startupTitleLabel,
-                     cursorTitleLabel,
-                     accountsTitleLabel
-                 })
+        var theme = (AppThemeMode)Math.Clamp(themeCombo.SelectedIndex, 0, 2);
+        if (theme == uiSettings.Theme)
         {
-            label.BackColor = theme.Card;
-            label.ForeColor = theme.TextPrimary;
+            return;
         }
 
-        foreach (var label in new[]
-                 {
-                     generalDescriptionLabel,
-                     startupDescriptionLabel,
-                     cursorDescriptionLabel,
-                     cursorCookieLabel,
-                     accountsDescriptionLabel,
-                     accountNameLabel,
-                     binaryPathLabel
-                 })
+        uiSettings = uiSettings with { Theme = theme };
+        uiSettings.Save();
+        ApplyThemeToTree();
+    }
+
+    private void OnMaterialSelectionChanged()
+    {
+        var material = (BackdropMaterial)Math.Clamp(materialCombo.SelectedIndex, 0, 3);
+        if (material == uiSettings.Material)
         {
-            label.BackColor = theme.Card;
-            label.ForeColor = theme.TextSecondary;
+            return;
         }
 
-        accountNameTextBox.ApplyTheme(theme);
-        binaryPathTextBox.ApplyTheme(theme);
-        cursorCookieTextBox.ApplyTheme(theme);
+        uiSettings = uiSettings with { Material = material };
+        uiSettings.Save();
+        opacitySlider.Enabled = material != BackdropMaterial.Solid;
+    }
+
+    private void OnOpacityChanged()
+    {
+        opacityValueLabel.Text = opacitySlider.Value.ToString();
+        if (opacitySlider.Value == uiSettings.TintOpacityPercent)
+        {
+            return;
+        }
+
+        uiSettings = uiSettings with { TintOpacityPercent = opacitySlider.Value };
+        uiSettings.Save();
+    }
+
+    /// <summary>
+    /// Re-resolves the token set from the current <see cref="UiSettings"/> and restyles the
+    /// whole control tree in place (single pass; no controls are rebuilt).
+    /// </summary>
+    private void ApplyThemeToTree()
+    {
+        tokens = FluentTheme.Get(uiSettings.ResolveIsDark(), onBackdrop: false);
+        BackColor = tokens.Background;
+
+        navRail.ApplyTheme(tokens);
+
+        foreach (var page in pages)
+        {
+            page.BackColor = tokens.Background;
+        }
+
+        foreach (var title in new[] { generalTitleLabel, appearanceTitleLabel, accountsTitleLabel, cursorTitleLabel })
+        {
+            title.BackColor = tokens.Background;
+            title.ForeColor = tokens.TextPrimary;
+        }
+
+        foreach (var caption in new[] { accountsCaptionLabel, cursorCaptionLabel, accountNameLabel, binaryPathLabel })
+        {
+            caption.BackColor = tokens.Background;
+            caption.ForeColor = tokens.TextSecondary;
+        }
+
+        startupCard.ApplyTheme(tokens);
+        versionCard.ApplyTheme(tokens);
+        themeCard.ApplyTheme(tokens);
+        materialExpander.ApplyTheme(tokens);
+        cursorCard.ApplyTheme(tokens);
+
+        accountListBox.ApplyTheme(tokens);
+        accountNameTextBox.ApplyTheme(tokens);
+        binaryPathTextBox.ApplyTheme(tokens);
+        browseButton.ApplyTheme(tokens);
+        addButton.ApplyTheme(tokens);
+        saveButton.ApplyTheme(tokens);
+        removeButton.ApplyTheme(tokens);
+
+        // The cascade only re-surfaces hosted controls; the value label keeps its own text color.
+        opacityValueLabel.ForeColor = tokens.TextSecondary;
+
+        if (IsHandleCreated)
+        {
+            WindowEffects.SetImmersiveDarkMode(Handle, tokens.IsDark);
+        }
+
+        Invalidate(true);
     }
 
     private void RefreshCodexCliList()
@@ -464,611 +661,388 @@ public sealed class SettingsForm : Form
         CursorSettingsChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    private static Label CardTitle(string text, Point location, Size size)
+    private Label CreatePageTitle(string text)
     {
         return new Label
         {
             AutoSize = false,
-            Font = CreateFont("Segoe UI Variable Text", 13f, FontStyle.Bold),
-            Location = location,
-            Size = size,
+            Font = subtitleFont,
+            Location = new Point(24, 24),
+            Size = new Size(532, 30),
             Text = text
         };
     }
 
-    private static Label CardDescription(string text, Point location, Size size)
+    private Label CreateCaption(string text, Point location, Size size)
     {
         return new Label
         {
             AutoEllipsis = true,
             AutoSize = false,
-            Font = CreateFont("Segoe UI Variable Text", 9.2f, FontStyle.Regular),
+            Font = captionFont,
             Location = location,
             Size = size,
             Text = text
         };
     }
 
-    private static Label RowTitle(string text, Point location, Size size)
+    /// <summary>
+    /// Windows 11 Settings-style navigation rail: 36px items with a 16px glyph and Body label,
+    /// SubtleHover hot-tracking and ControlFill + accent pill for the selected item.
+    /// </summary>
+    private sealed class NavigationRail : Control
     {
-        return new Label
+        private const float ItemHeight96 = 36f;
+        private const float ItemGap96 = 4f;
+
+        private readonly List<(string Glyph, string Label)> items = [];
+        private readonly Font labelFont = FluentTheme.BodyFont(1f);
+        private readonly Font iconFont = FluentIcons.CreateFont(12f);
+        private FluentTokens tokens;
+        private int selectedIndex;
+        private int hotIndex = -1;
+
+        public event EventHandler? SelectedIndexChanged;
+
+        public NavigationRail(FluentTokens tokens)
         {
-            AutoSize = false,
-            Font = CreateFont("Segoe UI Variable Text", 10.2f, FontStyle.Bold),
-            Location = location,
-            Size = size,
-            Text = text
-        };
-    }
-
-    private static Label RowDescription(string text, Point location, Size size)
-    {
-        return new Label
-        {
-            AutoSize = false,
-            Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular),
-            Location = location,
-            Size = size,
-            Text = text
-        };
-    }
-
-    private static Label FieldLabel(string text, Point location, Size size)
-    {
-        return new Label
-        {
-            AutoSize = false,
-            Font = CreateFont("Segoe UI Variable Text", 8.5f, FontStyle.Regular),
-            Location = location,
-            Size = size,
-            Text = text
-        };
-    }
-
-    private static Font CreateFont(string family, float size, FontStyle style)
-    {
-        try
-        {
-            return new Font(family, size, style);
-        }
-        catch
-        {
-            return new Font("Segoe UI", size, style);
-        }
-    }
-
-    private static System.Drawing.Drawing2D.GraphicsPath RoundedPath(Rectangle rectangle, int radius)
-    {
-        var path = new System.Drawing.Drawing2D.GraphicsPath();
-        var diameter = Math.Min(radius * 2, Math.Min(rectangle.Width, rectangle.Height));
-        var arc = new Rectangle(rectangle.Location, new Size(diameter, diameter));
-
-        path.AddArc(arc, 180, 90);
-        arc.X = rectangle.Right - diameter;
-        path.AddArc(arc, 270, 90);
-        arc.Y = rectangle.Bottom - diameter;
-        path.AddArc(arc, 0, 90);
-        arc.X = rectangle.Left;
-        path.AddArc(arc, 90, 90);
-        path.CloseFigure();
-
-        return path;
-    }
-
-    private static bool IsDarkTheme()
-    {
-        var value = Registry.GetValue(
-            @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-            "AppsUseLightTheme",
-            1);
-
-        return value is int intValue && intValue == 0;
-    }
-
-    private static void ApplyWindowAttributes(IntPtr handle, bool isDarkMode)
-    {
-        if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
-        {
-            return;
-        }
-
-        var preference = 2;
-        _ = DwmSetWindowAttribute(handle, 33, ref preference, sizeof(int));
-
-        var darkMode = isDarkMode ? 1 : 0;
-        _ = DwmSetWindowAttribute(handle, 20, ref darkMode, sizeof(int));
-    }
-
-    [DllImport("dwmapi.dll")]
-    private static extern int DwmSetWindowAttribute(
-        IntPtr hwnd,
-        int dwAttribute,
-        ref int pvAttribute,
-        int cbAttribute);
-
-    private sealed record ThemePalette(
-        bool IsDark,
-        Color Window,
-        Color Card,
-        Color CardBorder,
-        Color Input,
-        Color InputBorder,
-        Color TextPrimary,
-        Color TextSecondary,
-        Color Accent,
-        Color AccentText,
-        Color Hover,
-        Color Pressed,
-        Color Disabled,
-        Color DisabledText)
-    {
-        public static ThemePalette FromWindows()
-        {
-            return IsDarkTheme() ? Dark() : Light();
-        }
-
-        private static ThemePalette Dark()
-        {
-            return new ThemePalette(
-                true,
-                Color.FromArgb(32, 32, 32),
-                Color.FromArgb(43, 43, 43),
-                Color.FromArgb(58, 58, 58),
-                Color.FromArgb(52, 52, 52),
-                Color.FromArgb(86, 86, 86),
-                Color.FromArgb(246, 246, 246),
-                Color.FromArgb(196, 196, 196),
-                Color.FromArgb(96, 205, 255),
-                Color.FromArgb(0, 0, 0),
-                Color.FromArgb(58, 58, 58),
-                Color.FromArgb(68, 68, 68),
-                Color.FromArgb(49, 49, 49),
-                Color.FromArgb(126, 126, 126));
-        }
-
-        private static ThemePalette Light()
-        {
-            return new ThemePalette(
-                false,
-                Color.FromArgb(243, 243, 243),
-                Color.FromArgb(255, 255, 255),
-                Color.FromArgb(229, 229, 229),
-                Color.FromArgb(255, 255, 255),
-                Color.FromArgb(211, 211, 211),
-                Color.FromArgb(32, 31, 30),
-                Color.FromArgb(96, 94, 92),
-                Color.FromArgb(0, 95, 184),
-                Color.FromArgb(255, 255, 255),
-                Color.FromArgb(245, 245, 245),
-                Color.FromArgb(236, 236, 236),
-                Color.FromArgb(235, 235, 235),
-                Color.FromArgb(132, 132, 132));
-        }
-    }
-
-    private sealed class CardPanel : Panel
-    {
-        private readonly ThemePalette theme;
-
-        public CardPanel(ThemePalette theme)
-        {
-            this.theme = theme;
-            BackColor = theme.Card;
-            DoubleBuffered = true;
-            Padding = new Padding(18);
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            var bounds = new Rectangle(0, 0, Width - 1, Height - 1);
-            using var fillBrush = new SolidBrush(theme.Card);
-            using var borderPen = new Pen(theme.CardBorder);
-            using var path = RoundedPath(bounds, 10);
-            e.Graphics.FillPath(fillBrush, path);
-            e.Graphics.DrawPath(borderPen, path);
-
-            base.OnPaint(e);
-        }
-    }
-
-    private sealed class ToggleSwitch : Control
-    {
-        private readonly ThemePalette theme;
-        private bool isChecked;
-        private bool hovering;
-
-        public event EventHandler? CheckedChanged;
-
-        public ToggleSwitch(ThemePalette theme)
-        {
-            this.theme = theme;
+            this.tokens = tokens;
+            BackColor = tokens.Background;
             Cursor = Cursors.Hand;
             SetStyle(
                 ControlStyles.AllPaintingInWmPaint |
                 ControlStyles.OptimizedDoubleBuffer |
                 ControlStyles.ResizeRedraw |
-                ControlStyles.Selectable |
                 ControlStyles.UserPaint,
                 true);
         }
 
-        [System.ComponentModel.Browsable(true)]
-        [System.ComponentModel.DefaultValue(false)]
-        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Visible)]
-        public bool Checked
+        public int SelectedIndex
         {
-            get => isChecked;
+            get => selectedIndex;
             set
             {
-                if (isChecked == value)
+                var clamped = Math.Clamp(value, 0, Math.Max(0, items.Count - 1));
+                if (clamped == selectedIndex)
                 {
                     return;
                 }
 
-                isChecked = value;
+                selectedIndex = clamped;
                 Invalidate();
-                CheckedChanged?.Invoke(this, EventArgs.Empty);
+                SelectedIndexChanged?.Invoke(this, EventArgs.Empty);
             }
         }
 
-        protected override void OnClick(EventArgs e)
+        public void AddItem(string glyph, string label)
         {
-            Checked = !Checked;
-            base.OnClick(e);
-        }
-
-        protected override void OnMouseEnter(EventArgs e)
-        {
-            hovering = true;
+            items.Add((glyph, label));
             Invalidate();
-            base.OnMouseEnter(e);
         }
 
-        protected override void OnMouseLeave(EventArgs e)
+        public void ApplyTheme(FluentTokens palette)
         {
-            hovering = false;
+            tokens = palette;
+            BackColor = palette.Background;
             Invalidate();
-            base.OnMouseLeave(e);
         }
 
-        protected override void OnKeyDown(KeyEventArgs e)
+        protected override void Dispose(bool disposing)
         {
-            if (e.KeyCode is Keys.Space or Keys.Enter)
+            if (disposing)
             {
-                Checked = !Checked;
-                e.Handled = true;
+                labelFont.Dispose();
+                iconFont.Dispose();
             }
 
-            base.OnKeyDown(e);
+            base.Dispose(disposing);
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void OnMouseMove(MouseEventArgs e)
         {
-            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            var index = ItemIndexAt(e.Location);
+            if (index != hotIndex)
+            {
+                hotIndex = index;
+                Invalidate();
+            }
 
-            var track = new Rectangle(0, 0, Width - 1, Height - 1);
-            var trackColor = Checked
-                ? theme.Accent
-                : hovering ? theme.Pressed : theme.InputBorder;
-            using var trackBrush = new SolidBrush(trackColor);
-            using var trackPath = RoundedPath(track, Height / 2);
-            e.Graphics.FillPath(trackBrush, trackPath);
-
-            var knobSize = Height - 8;
-            var knobX = Checked ? Width - knobSize - 4 : 4;
-            var knob = new Rectangle(knobX, 4, knobSize, knobSize);
-            using var knobBrush = new SolidBrush(Checked ? Color.Black : theme.TextPrimary);
-            e.Graphics.FillEllipse(knobBrush, knob);
-        }
-    }
-
-    private enum ButtonKind
-    {
-        Primary,
-        Secondary
-    }
-
-    private sealed class ModernButton : Control
-    {
-        private readonly ThemePalette theme;
-        private readonly ButtonKind kind;
-        private bool hovering;
-        private bool pressing;
-
-        public ModernButton(ThemePalette theme, ButtonKind kind)
-        {
-            this.theme = theme;
-            this.kind = kind;
-            Cursor = Cursors.Hand;
-            Font = CreateFont("Segoe UI Variable Text", 9f, FontStyle.Regular);
-            SetStyle(
-                ControlStyles.AllPaintingInWmPaint |
-                ControlStyles.OptimizedDoubleBuffer |
-                ControlStyles.ResizeRedraw |
-                ControlStyles.Selectable |
-                ControlStyles.UserPaint,
-                true);
-        }
-
-        protected override void OnEnabledChanged(EventArgs e)
-        {
-            Cursor = Enabled ? Cursors.Hand : Cursors.Default;
-            Invalidate();
-            base.OnEnabledChanged(e);
-        }
-
-        protected override void OnMouseEnter(EventArgs e)
-        {
-            hovering = true;
-            Invalidate();
-            base.OnMouseEnter(e);
+            base.OnMouseMove(e);
         }
 
         protected override void OnMouseLeave(EventArgs e)
         {
-            hovering = false;
-            pressing = false;
-            Invalidate();
+            if (hotIndex != -1)
+            {
+                hotIndex = -1;
+                Invalidate();
+            }
+
             base.OnMouseLeave(e);
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
         {
-            if (Enabled && e.Button == MouseButtons.Left)
+            if (e.Button == MouseButtons.Left)
             {
-                pressing = true;
-                Invalidate();
+                var index = ItemIndexAt(e.Location);
+                if (index >= 0)
+                {
+                    SelectedIndex = index;
+                }
             }
 
             base.OnMouseDown(e);
         }
 
-        protected override void OnMouseUp(MouseEventArgs e)
-        {
-            pressing = false;
-            Invalidate();
-            base.OnMouseUp(e);
-        }
-
-        protected override void OnKeyDown(KeyEventArgs e)
-        {
-            if (Enabled && e.KeyCode is Keys.Space or Keys.Enter)
-            {
-                OnClick(EventArgs.Empty);
-                e.Handled = true;
-            }
-
-            base.OnKeyDown(e);
-        }
-
         protected override void OnPaint(PaintEventArgs e)
         {
-            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            var graphics = e.Graphics;
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            var scale = DeviceDpi / 96f;
 
-            var fill = ButtonFill();
-            var stroke = Enabled && kind == ButtonKind.Secondary ? theme.CardBorder : fill;
-            var textColor = ButtonTextColor();
-            using var fillBrush = new SolidBrush(fill);
-            using var borderPen = new Pen(stroke);
-            using var path = RoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), 6);
-            e.Graphics.FillPath(fillBrush, path);
-            e.Graphics.DrawPath(borderPen, path);
+            for (var i = 0; i < items.Count; i++)
+            {
+                var bounds = ItemBounds(i);
+                var selected = i == selectedIndex;
 
-            TextRenderer.DrawText(
-                e.Graphics,
-                Text,
-                Font,
-                ClientRectangle,
-                textColor,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+                if (selected || i == hotIndex)
+                {
+                    using var fillBrush = new SolidBrush(selected ? tokens.ControlFill : tokens.SubtleHover);
+                    using var fillPath = FluentTheme.RoundedRect(bounds, FluentTheme.ControlCornerRadius * scale);
+                    graphics.FillPath(fillBrush, fillPath);
+                }
+
+                if (selected)
+                {
+                    var pillWidth = 3f * scale;
+                    var pillHeight = 16f * scale;
+                    var pillBounds = new RectangleF(
+                        bounds.Left,
+                        bounds.Top + ((bounds.Height - pillHeight) / 2f),
+                        pillWidth,
+                        pillHeight);
+                    using var pillBrush = new SolidBrush(tokens.Accent);
+                    using var pillPath = FluentTheme.RoundedRect(pillBounds, pillWidth / 2f);
+                    graphics.FillPath(pillBrush, pillPath);
+                }
+
+                var iconSize = 16f * scale;
+                var iconBounds = new RectangleF(
+                    bounds.Left + (12f * scale),
+                    bounds.Top + ((bounds.Height - iconSize) / 2f),
+                    iconSize,
+                    iconSize);
+                FluentIcons.Draw(graphics, items[i].Glyph, iconFont, tokens.TextPrimary, iconBounds);
+
+                var textBounds = new RectangleF(
+                    bounds.Left + (40f * scale),
+                    bounds.Top,
+                    Math.Max(0f, bounds.Width - (48f * scale)),
+                    bounds.Height);
+                FluentControlPaint.DrawText(
+                    graphics,
+                    items[i].Label,
+                    labelFont,
+                    tokens.TextPrimary,
+                    textBounds,
+                    StringAlignment.Near);
+            }
         }
 
-        private Color ButtonFill()
+        private RectangleF ItemBounds(int index)
         {
-            if (!Enabled)
-            {
-                return theme.Disabled;
-            }
-
-            if (kind == ButtonKind.Primary)
-            {
-                return pressing ? ControlPaint.Dark(theme.Accent, 0.08f) : hovering ? ControlPaint.Light(theme.Accent, 0.08f) : theme.Accent;
-            }
-
-            return pressing ? theme.Pressed : hovering ? theme.Hover : theme.Input;
+            var scale = DeviceDpi / 96f;
+            var itemHeight = ItemHeight96 * scale;
+            var gap = ItemGap96 * scale;
+            return new RectangleF(0f, index * (itemHeight + gap), Width, itemHeight);
         }
 
-        private Color ButtonTextColor()
+        private int ItemIndexAt(Point location)
         {
-            if (!Enabled)
+            for (var i = 0; i < items.Count; i++)
             {
-                return theme.DisabledText;
+                if (ItemBounds(i).Contains(location))
+                {
+                    return i;
+                }
             }
 
-            return kind == ButtonKind.Primary ? theme.AccentText : theme.TextPrimary;
+            return -1;
         }
     }
 
-    private sealed class ModernTextField : UserControl
-    {
-        private readonly TextBox textBox;
-        private ThemePalette theme;
-        private bool focused;
-        private bool hovering;
-
-        public ModernTextField(ThemePalette theme)
-        {
-            this.theme = theme;
-            BackColor = theme.Input;
-            DoubleBuffered = true;
-            Padding = new Padding(10, 6, 10, 6);
-            SetStyle(
-                ControlStyles.AllPaintingInWmPaint |
-                ControlStyles.OptimizedDoubleBuffer |
-                ControlStyles.ResizeRedraw |
-                ControlStyles.UserPaint,
-                true);
-
-            textBox = new TextBox
-            {
-                BorderStyle = BorderStyle.None,
-                Location = new Point(10, 8),
-                Size = new Size(Math.Max(10, Width - 20), 20)
-            };
-            textBox.GotFocus += (_, _) =>
-            {
-                focused = true;
-                Invalidate();
-            };
-            textBox.LostFocus += (_, _) =>
-            {
-                focused = false;
-                Invalidate();
-            };
-            textBox.MouseEnter += (_, _) =>
-            {
-                hovering = true;
-                Invalidate();
-            };
-            textBox.MouseLeave += (_, _) =>
-            {
-                hovering = false;
-                Invalidate();
-            };
-
-            Controls.Add(textBox);
-            ApplyTheme(theme);
-        }
-
-        [System.ComponentModel.Browsable(true)]
-        [System.ComponentModel.DefaultValue("")]
-        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Visible)]
-        public new string Text
-        {
-            get => textBox.Text;
-            set => textBox.Text = value ?? string.Empty;
-        }
-
-        [System.ComponentModel.Browsable(true)]
-        [System.ComponentModel.DefaultValue("")]
-        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Visible)]
-        public string PlaceholderText
-        {
-            get => textBox.PlaceholderText;
-            set => textBox.PlaceholderText = value;
-        }
-
-        public void ApplyTheme(ThemePalette palette)
-        {
-            theme = palette;
-            BackColor = theme.Input;
-            textBox.BackColor = theme.Input;
-            textBox.ForeColor = theme.TextPrimary;
-            Invalidate();
-        }
-
-        protected override void OnEnabledChanged(EventArgs e)
-        {
-            textBox.Enabled = Enabled;
-            Invalidate();
-            base.OnEnabledChanged(e);
-        }
-
-        protected override void OnMouseEnter(EventArgs e)
-        {
-            hovering = true;
-            Invalidate();
-            base.OnMouseEnter(e);
-        }
-
-        protected override void OnMouseLeave(EventArgs e)
-        {
-            hovering = false;
-            Invalidate();
-            base.OnMouseLeave(e);
-        }
-
-        protected override void OnClick(EventArgs e)
-        {
-            textBox.Focus();
-            base.OnClick(e);
-        }
-
-        protected override void OnSizeChanged(EventArgs e)
-        {
-            base.OnSizeChanged(e);
-            textBox.Bounds = new Rectangle(10, Height / 2 - textBox.Height / 2, Math.Max(10, Width - 20), textBox.Height);
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-
-            var bounds = new Rectangle(0, 0, Width - 1, Height - 1);
-            var fill = Enabled ? theme.Input : theme.Disabled;
-            var border = !Enabled
-                ? theme.CardBorder
-                : focused
-                    ? theme.Accent
-                    : hovering
-                        ? theme.TextSecondary
-                        : theme.InputBorder;
-            using var fillBrush = new SolidBrush(fill);
-            using var borderPen = new Pen(border, focused ? 1.6f : 1f);
-            using var path = RoundedPath(bounds, 6);
-            e.Graphics.FillPath(fillBrush, path);
-            e.Graphics.DrawPath(borderPen, path);
-        }
-    }
-
+    /// <summary>
+    /// Owner-drawn account list: ControlFill surface with a Fluent outline (drawn post-WM_PAINT
+    /// because ListBox never raises OnPaint), SubtleHover hot-tracking and an accent selection pill.
+    /// </summary>
     private sealed class AccountListBox : ListBox
     {
-        private readonly ThemePalette theme;
+        private FluentTokens tokens;
+        private FluentTokens layerTokens;
+        private int hotIndex = -1;
 
-        public AccountListBox(ThemePalette theme)
+        public AccountListBox(FluentTokens tokens)
         {
-            this.theme = theme;
+            this.tokens = tokens;
+            layerTokens = FluentTheme.Get(tokens.IsDark, onBackdrop: true);
             BorderStyle = BorderStyle.None;
             DrawMode = DrawMode.OwnerDrawFixed;
-            ItemHeight = 28;
+            ItemHeight = 32;
             IntegralHeight = false;
-            BackColor = theme.Input;
-            ForeColor = theme.TextPrimary;
+            BackColor = tokens.ControlFill;
+            ForeColor = tokens.TextPrimary;
+            DoubleBuffered = true;
         }
 
-        protected override void OnDrawItem(DrawItemEventArgs e)
+        public void ApplyTheme(FluentTokens palette)
         {
-            if (e.Index < 0)
+            tokens = palette;
+            layerTokens = FluentTheme.Get(palette.IsDark, onBackdrop: true);
+            BackColor = palette.ControlFill;
+            ForeColor = palette.TextPrimary;
+            Invalidate();
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            ItemHeight = (int)Math.Round(32f * DeviceDpi / 96f);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            var index = HotIndexFromPoint(e.Location);
+            if (index == hotIndex)
             {
                 return;
             }
 
-            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            var selected = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
-            var bounds = new Rectangle(e.Bounds.Left + 4, e.Bounds.Top + 3, e.Bounds.Width - 8, e.Bounds.Height - 6);
+            InvalidateItem(hotIndex);
+            hotIndex = index;
+            InvalidateItem(hotIndex);
+        }
 
-            using var backgroundBrush = new SolidBrush(selected ? theme.Accent : theme.Input);
-            using var backgroundPath = RoundedPath(bounds, 6);
-            e.Graphics.FillPath(backgroundBrush, backgroundPath);
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            InvalidateItem(hotIndex);
+            hotIndex = -1;
+        }
+
+        protected override void OnDrawItem(DrawItemEventArgs e)
+        {
+            if (e.Index < 0 || e.Index >= Items.Count)
+            {
+                return;
+            }
+
+            var graphics = e.Graphics;
+            var scale = DeviceDpi / 96f;
+
+            using (var surfaceBrush = new SolidBrush(tokens.ControlFill))
+            {
+                graphics.FillRectangle(surfaceBrush, e.Bounds);
+            }
+
+            var selected = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
+            var previousSmoothing = graphics.SmoothingMode;
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+
+            var highlightBounds = new RectangleF(
+                e.Bounds.Left + (4f * scale),
+                e.Bounds.Top + (2f * scale),
+                e.Bounds.Width - (8f * scale),
+                e.Bounds.Height - (4f * scale));
+
+            if (selected || e.Index == hotIndex)
+            {
+                var highlight = selected && tokens.IsDark
+                    ? layerTokens.ControlFill
+                    : layerTokens.SubtleHover;
+                using var highlightBrush = new SolidBrush(highlight);
+                using var highlightPath = FluentTheme.RoundedRect(
+                    highlightBounds,
+                    FluentTheme.ControlCornerRadius * scale);
+                graphics.FillPath(highlightBrush, highlightPath);
+            }
+
+            if (selected)
+            {
+                var pillWidth = 3f * scale;
+                var pillHeight = 16f * scale;
+                var pillBounds = new RectangleF(
+                    highlightBounds.Left,
+                    e.Bounds.Top + ((e.Bounds.Height - pillHeight) / 2f),
+                    pillWidth,
+                    pillHeight);
+                using var pillBrush = new SolidBrush(tokens.Accent);
+                using var pillPath = FluentTheme.RoundedRect(pillBounds, pillWidth / 2f);
+                graphics.FillPath(pillBrush, pillPath);
+            }
+
+            graphics.SmoothingMode = previousSmoothing;
 
             var entry = Items[e.Index] as CodexCliEntry;
             var text = entry?.Name ?? Items[e.Index]?.ToString() ?? string.Empty;
-            TextRenderer.DrawText(
-                e.Graphics,
-                text,
-                Font,
-                new Rectangle(bounds.Left + 10, bounds.Top, bounds.Width - 20, bounds.Height),
-                selected ? theme.AccentText : theme.TextPrimary,
-                TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            var textBounds = new RectangleF(
+                highlightBounds.Left + (12f * scale),
+                highlightBounds.Top,
+                Math.Max(0f, highlightBounds.Width - (20f * scale)),
+                highlightBounds.Height);
+            FluentControlPaint.DrawText(graphics, text, Font, tokens.TextPrimary, textBounds, StringAlignment.Near);
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void WndProc(ref Message m)
         {
-            base.OnPaint(e);
-            using var pen = new Pen(theme.InputBorder);
-            using var path = RoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), 6);
-            e.Graphics.DrawPath(pen, path);
+            base.WndProc(ref m);
+
+            // ListBox never sets ControlStyles.UserPaint, so an OnPaint override is never
+            // raised; the Fluent outline has to be drawn after the native WM_PAINT instead.
+            const int WmPaint = 0x000F;
+            if (m.Msg == WmPaint && IsHandleCreated)
+            {
+                using var graphics = Graphics.FromHwnd(Handle);
+                DrawFluentBorder(graphics);
+            }
+        }
+
+        private void DrawFluentBorder(Graphics graphics)
+        {
+            var scale = DeviceDpi / 96f;
+            var strokeWidth = Math.Max(1f, scale);
+            var previousSmoothing = graphics.SmoothingMode;
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using var pen = new Pen(tokens.ControlStroke, strokeWidth);
+            using var path = FluentTheme.RoundedRect(
+                new RectangleF(
+                    strokeWidth / 2f,
+                    strokeWidth / 2f,
+                    Width - strokeWidth,
+                    Height - strokeWidth),
+                FluentTheme.ControlCornerRadius * scale);
+            graphics.DrawPath(pen, path);
+            graphics.SmoothingMode = previousSmoothing;
+        }
+
+        private int HotIndexFromPoint(Point location)
+        {
+            var index = IndexFromPoint(location);
+            if (index < 0 || index >= Items.Count)
+            {
+                return -1;
+            }
+
+            return GetItemRectangle(index).Contains(location) ? index : -1;
+        }
+
+        private void InvalidateItem(int index)
+        {
+            if (index >= 0 && index < Items.Count)
+            {
+                Invalidate(GetItemRectangle(index));
+            }
         }
     }
 }
