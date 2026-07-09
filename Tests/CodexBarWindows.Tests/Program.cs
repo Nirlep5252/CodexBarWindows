@@ -55,6 +55,7 @@ var tests = new (string Name, Action Run)[]
     ("Claude history dedupes streaming and subagent rows", ClaudeHistoryDedupesRows),
     ("Claude history reports incomplete cost for unknown models", ClaudeHistoryReportsIncompleteCost),
     ("Claude history is usable without Claude credentials", ClaudeHistoryDoesNotRequireCredentials),
+    ("Claude usage maps the Fable weekly limit", ClaudeUsageMapsFableLimit),
     ("Cursor usage keeps fractional percent fields", CursorUsageKeepsFractionalPercents),
     ("Cursor enterprise overall drives headline", CursorEnterpriseOverallDrivesHeadline),
     ("Cursor legacy request usage drives primary", CursorLegacyRequestsDrivePrimary),
@@ -283,7 +284,7 @@ static void CodexHistoryIgnoresStalePrimaryLimitForRegularTurns()
 
 static void UsageLabelsPreserveFastSuffix()
 {
-    var method = typeof(UsagePopupForm).GetMethod("FriendlyModelLabel", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+    var method = typeof(UsageGraphsForm).GetMethod("FriendlyModelLabel", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
     Assert(method is not null, "FriendlyModelLabel should exist");
 
     AssertEqual("5.5", (string)method!.Invoke(null, ["gpt-5.5"])!, "regular model label");
@@ -364,6 +365,28 @@ static void ClaudeHistoryDoesNotRequireCredentials()
     var result = fixture.Read();
     Assert(result.Insights is not null, "history should be read from files only");
     AssertEqual(15L, Today(result).TotalTokens, "local tokens");
+}
+
+static void ClaudeUsageMapsFableLimit()
+{
+    var usage = JsonSerializer.Deserialize<ClaudeUsageReader.OAuthUsageResponse>("""
+        {
+          "five_hour": { "utilization": 12.5, "resets_at": "2026-07-10T12:30:00Z" },
+          "seven_day": { "utilization": 34.5, "resets_at": "2026-07-13T12:30:00Z" },
+          "seven_day_overage_included": { "utilization": 56.75, "resets_at": "2026-07-13T12:30:00Z" }
+        }
+        """);
+
+    Assert(usage is not null, "Claude usage response should deserialize");
+    var snapshot = ClaudeUsageReader.MapUsage(
+        usage!,
+        planLabel: "max");
+
+    Assert(snapshot.Tertiary is not null, "Fable limit should be present");
+    AssertEqual("Fable 5 limit", snapshot.Tertiary!.Title, "Fable limit title");
+    AssertClose(56.75m, (decimal)snapshot.Tertiary.UsedPercent, "Fable utilization");
+    AssertEqual(10080, snapshot.Tertiary.WindowMinutes, "Fable weekly window minutes");
+    Assert(snapshot.Tertiary.ResetsAt is not null, "Fable reset should be parsed");
 }
 
 static void CursorUsageKeepsFractionalPercents()

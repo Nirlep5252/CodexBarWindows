@@ -38,7 +38,7 @@ public sealed class ClaudeUsageReader
             var usage = await FetchUsageAsync(httpClient, credentials.AccessToken, cancellationToken)
                 .ConfigureAwait(false);
 
-            var snapshot = MapUsage(usage, credentials);
+            var snapshot = MapUsage(usage, PlanLabel(credentials));
             return new ProviderUsageLookupResult(snapshot, null);
         }
         catch (Exception exception)
@@ -157,7 +157,7 @@ public sealed class ClaudeUsageReader
             ?? throw new InvalidOperationException("Claude usage response was empty.");
     }
 
-    private static ProviderUsageSnapshot MapUsage(OAuthUsageResponse usage, ClaudeOAuthCredentials credentials)
+    internal static ProviderUsageSnapshot MapUsage(OAuthUsageResponse usage, string? planLabel)
     {
         var primary = MakeWindow("5 hour limit", usage.FiveHour, 5 * 60)
             ?? throw new InvalidOperationException("Claude usage response did not include 5 hour data.");
@@ -166,13 +166,16 @@ public sealed class ClaudeUsageReader
             ?? MakeWindow("Weekly limit", usage.SevenDaySonnet, 7 * 24 * 60)
             ?? MakeWindow("Weekly limit", usage.SevenDayOpus, 7 * 24 * 60);
 
+        var fable = MakeWindow("Fable 5 limit", usage.SevenDayOverageIncluded, 7 * 24 * 60);
+
         return new ProviderUsageSnapshot(
             UsageProvider.Claude,
             DateTimeOffset.Now,
-            PlanLabel(credentials),
+            planLabel,
             primary,
             weekly,
-            "Claude Code OAuth");
+            "Claude Code OAuth",
+            fable);
     }
 
     private static ProviderUsageWindow? MakeWindow(string title, OAuthUsageWindow? window, int windowMinutes)
@@ -294,13 +297,14 @@ public sealed class ClaudeUsageReader
         [property: JsonPropertyName("refresh_token")] string? RefreshToken,
         [property: JsonPropertyName("expires_in")] int ExpiresIn);
 
-    private sealed record OAuthUsageResponse(
+    internal sealed record OAuthUsageResponse(
         [property: JsonPropertyName("five_hour")] OAuthUsageWindow? FiveHour,
         [property: JsonPropertyName("seven_day")] OAuthUsageWindow? SevenDay,
         [property: JsonPropertyName("seven_day_sonnet")] OAuthUsageWindow? SevenDaySonnet,
-        [property: JsonPropertyName("seven_day_opus")] OAuthUsageWindow? SevenDayOpus);
+        [property: JsonPropertyName("seven_day_opus")] OAuthUsageWindow? SevenDayOpus,
+        [property: JsonPropertyName("seven_day_overage_included")] OAuthUsageWindow? SevenDayOverageIncluded);
 
-    private sealed record OAuthUsageWindow(
+    internal sealed record OAuthUsageWindow(
         [property: JsonPropertyName("utilization")] double? Utilization,
         [property: JsonPropertyName("resets_at")] string? ResetsAt);
 }

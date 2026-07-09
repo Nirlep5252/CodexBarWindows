@@ -14,6 +14,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="CodexBarWindows.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Content Include="Assets\CodexBarWindows.ico">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
