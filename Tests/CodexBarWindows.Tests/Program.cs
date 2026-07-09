@@ -55,7 +55,7 @@ var tests = new (string Name, Action Run)[]
     ("Claude history dedupes streaming and subagent rows", ClaudeHistoryDedupesRows),
     ("Claude history reports incomplete cost for unknown models", ClaudeHistoryReportsIncompleteCost),
     ("Claude history is usable without Claude credentials", ClaudeHistoryDoesNotRequireCredentials),
-    ("Claude usage maps the Fable weekly limit", ClaudeUsageMapsFableLimit),
+    ("Claude usage maps Fable from scoped limits", ClaudeUsageMapsFableLimit),
     ("Cursor usage keeps fractional percent fields", CursorUsageKeepsFractionalPercents),
     ("Cursor enterprise overall drives headline", CursorEnterpriseOverallDrivesHeadline),
     ("Cursor legacy request usage drives primary", CursorLegacyRequestsDrivePrimary),
@@ -373,7 +373,33 @@ static void ClaudeUsageMapsFableLimit()
         {
           "five_hour": { "utilization": 12.5, "resets_at": "2026-07-10T12:30:00Z" },
           "seven_day": { "utilization": 34.5, "resets_at": "2026-07-13T12:30:00Z" },
-          "seven_day_overage_included": { "utilization": 56.75, "resets_at": "2026-07-13T12:30:00Z" }
+          "seven_day_overage_included": null,
+          "limits": [
+            {
+              "kind": "session",
+              "group": "session",
+              "percent": 12.5,
+              "resets_at": "2026-07-10T12:30:00Z",
+              "scope": null
+            },
+            {
+              "kind": "weekly_all",
+              "group": "weekly",
+              "percent": 34.5,
+              "resets_at": "2026-07-13T12:30:00Z",
+              "scope": null
+            },
+            {
+              "kind": "weekly_scoped",
+              "group": "weekly",
+              "percent": 0,
+              "resets_at": "2026-07-13T12:30:00Z",
+              "scope": {
+                "model": { "id": null, "display_name": "Fable" },
+                "surface": null
+              }
+            }
+          ]
         }
         """);
 
@@ -384,7 +410,7 @@ static void ClaudeUsageMapsFableLimit()
 
     Assert(snapshot.Tertiary is not null, "Fable limit should be present");
     AssertEqual("Fable 5 limit", snapshot.Tertiary!.Title, "Fable limit title");
-    AssertClose(56.75m, (decimal)snapshot.Tertiary.UsedPercent, "Fable utilization");
+    AssertClose(0m, (decimal)snapshot.Tertiary.UsedPercent, "Fable utilization");
     AssertEqual(10080, snapshot.Tertiary.WindowMinutes, "Fable weekly window minutes");
     Assert(snapshot.Tertiary.ResetsAt is not null, "Fable reset should be parsed");
 }

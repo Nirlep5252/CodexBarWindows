@@ -166,7 +166,8 @@ public sealed class ClaudeUsageReader
             ?? MakeWindow("Weekly limit", usage.SevenDaySonnet, 7 * 24 * 60)
             ?? MakeWindow("Weekly limit", usage.SevenDayOpus, 7 * 24 * 60);
 
-        var fable = MakeWindow("Fable 5 limit", usage.SevenDayOverageIncluded, 7 * 24 * 60);
+        var fable = MakeWindow("Fable 5 limit", usage.SevenDayOverageIncluded, 7 * 24 * 60)
+            ?? MakeFableWindow(usage.Limits);
 
         return new ProviderUsageSnapshot(
             UsageProvider.Claude,
@@ -190,6 +191,24 @@ public sealed class ClaudeUsageReader
             Math.Clamp(utilization, 0, 100),
             windowMinutes,
             ParseIsoDate(window.ResetsAt));
+    }
+
+    private static ProviderUsageWindow? MakeFableWindow(IReadOnlyList<OAuthUsageLimit>? limits)
+    {
+        var limit = limits?.FirstOrDefault(candidate =>
+            string.Equals(candidate.Kind, "weekly_scoped", StringComparison.OrdinalIgnoreCase) &&
+            candidate.Scope?.Model?.DisplayName?.StartsWith("Fable", StringComparison.OrdinalIgnoreCase) == true);
+
+        if (limit?.Percent is not { } percent)
+        {
+            return null;
+        }
+
+        return new ProviderUsageWindow(
+            "Fable 5 limit",
+            Math.Clamp(percent, 0, 100),
+            7 * 24 * 60,
+            ParseIsoDate(limit.ResetsAt));
     }
 
     private static string? PlanLabel(ClaudeOAuthCredentials credentials)
@@ -302,9 +321,22 @@ public sealed class ClaudeUsageReader
         [property: JsonPropertyName("seven_day")] OAuthUsageWindow? SevenDay,
         [property: JsonPropertyName("seven_day_sonnet")] OAuthUsageWindow? SevenDaySonnet,
         [property: JsonPropertyName("seven_day_opus")] OAuthUsageWindow? SevenDayOpus,
-        [property: JsonPropertyName("seven_day_overage_included")] OAuthUsageWindow? SevenDayOverageIncluded);
+        [property: JsonPropertyName("seven_day_overage_included")] OAuthUsageWindow? SevenDayOverageIncluded,
+        [property: JsonPropertyName("limits")] OAuthUsageLimit[]? Limits);
 
     internal sealed record OAuthUsageWindow(
         [property: JsonPropertyName("utilization")] double? Utilization,
         [property: JsonPropertyName("resets_at")] string? ResetsAt);
+
+    internal sealed record OAuthUsageLimit(
+        [property: JsonPropertyName("kind")] string? Kind,
+        [property: JsonPropertyName("percent")] double? Percent,
+        [property: JsonPropertyName("resets_at")] string? ResetsAt,
+        [property: JsonPropertyName("scope")] OAuthUsageLimitScope? Scope);
+
+    internal sealed record OAuthUsageLimitScope(
+        [property: JsonPropertyName("model")] OAuthUsageLimitModel? Model);
+
+    internal sealed record OAuthUsageLimitModel(
+        [property: JsonPropertyName("display_name")] string? DisplayName);
 }
