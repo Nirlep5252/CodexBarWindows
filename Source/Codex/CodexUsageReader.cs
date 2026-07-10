@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Diagnostics;
 using System.Text.Json;
 
@@ -6,10 +5,10 @@ namespace CodexBarWindows;
 
 public sealed class CodexUsageReader
 {
-    private const int MaxSessionFilesToScan = 80;
+    private const int InitialRpcSampleCount = 3;
     private static readonly TimeSpan RpcTimeout = TimeSpan.FromSeconds(10);
-    private readonly string sessionsRoot;
     private readonly string? codexPath;
+    private readonly CodexRateLimitStabilizer stabilizer;
 
     public CodexUsageReader()
         : this(null)
@@ -17,49 +16,33 @@ public sealed class CodexUsageReader
     }
 
     public CodexUsageReader(string? codexPath)
-        : this(
-            codexPath,
-            Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".codex",
-            "sessions"))
+        : this(codexPath, new CodexRateLimitStabilizer())
     {
     }
 
-    public CodexUsageReader(string? codexPath, string sessionsRoot)
+    internal CodexUsageReader(string? codexPath, CodexRateLimitStabilizer stabilizer)
     {
         this.codexPath = string.IsNullOrWhiteSpace(codexPath) ? null : codexPath;
-        this.sessionsRoot = sessionsRoot;
+        this.stabilizer = stabilizer;
     }
-
-    public string SessionsRoot => sessionsRoot;
 
     public UsageLookupResult ReadLatest()
     {
-        var rpcResult = ReadLatestFromRpc();
-        if (rpcResult.HasSnapshot)
+        return ReadLatest(CancellationToken.None);
+    }
+
+    internal UsageLookupResult ReadLatest(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var sampleCount = stabilizer.NeedsInitialConsensus ? InitialRpcSampleCount : 1;
+        var samples = new List<UsageLookupResult>(sampleCount);
+        for (var index = 0; index < sampleCount; index++)
         {
-            return rpcResult;
+            samples.Add(ReadLatestFromRpc());
+            cancellationToken.ThrowIfCancellationRequested();
         }
 
-        if (codexPath is not null)
-        {
-            return rpcResult;
-        }
-
-        var sessionsResult = ReadLatestFromSessions();
-        if (sessionsResult.HasSnapshot)
-        {
-            return sessionsResult;
-        }
-
-        var error = rpcResult.Error ?? sessionsResult.Error ?? "No Codex rate-limit data was found.";
-        if (!string.IsNullOrWhiteSpace(sessionsResult.Error))
-        {
-            error = $"{error} Session fallback: {sessionsResult.Error}";
-        }
-
-        return new UsageLookupResult(null, error);
+        return stabilizer.Stabilize(samples, DateTimeOffset.Now);
     }
 
     private UsageLookupResult ReadLatestFromRpc()
@@ -78,14 +61,7 @@ public sealed class CodexUsageReader
         try
         {
             process = StartCodexRpc(resolvedCodexPath);
-            var stderr = new List<string>();
-            process.ErrorDataReceived += (_, args) =>
-            {
-                if (!string.IsNullOrWhiteSpace(args.Data))
-                {
-                    stderr.Add(args.Data);
-                }
-            };
+            process.ErrorDataReceived += (_, _) => { };
             process.BeginErrorReadLine();
 
             SendRpcRequest(
@@ -102,7 +78,7 @@ public sealed class CodexUsageReader
 
             var snapshot = ParseRpcSnapshot(response, $"Codex CLI RPC ({resolvedCodexPath})");
             return snapshot is null
-                ? new UsageLookupResult(null, "Codex CLI RPC returned no rate-limit windows.")
+                ? new UsageLookupResult(null, "Codex CLI RPC returned no Codex rate-limit window.")
                 : new UsageLookupResult(snapshot, null);
         }
         catch (Exception exception)
@@ -116,46 +92,6 @@ public sealed class CodexUsageReader
                 TryKill(process);
                 process.Dispose();
             }
-        }
-    }
-
-    private UsageLookupResult ReadLatestFromSessions()
-    {
-        if (!Directory.Exists(sessionsRoot))
-        {
-            return new UsageLookupResult(null, $"Codex sessions folder was not found: {sessionsRoot}");
-        }
-
-        try
-        {
-            var files = EnumerateSessionFiles(sessionsRoot)
-                .Select(path => new FileInfo(path))
-                .OrderByDescending(file => file.LastWriteTimeUtc)
-                .Take(MaxSessionFilesToScan);
-
-            CodexRateLimitSnapshot? latest = null;
-
-            foreach (var file in files)
-            {
-                var snapshot = TryReadLatestFromFile(file.FullName);
-                if (snapshot is null)
-                {
-                    continue;
-                }
-
-                if (latest is null || snapshot.ObservedAt > latest.ObservedAt)
-                {
-                    latest = snapshot;
-                }
-            }
-
-            return latest is null
-                ? new UsageLookupResult(null, "No Codex rate-limit events were found in recent sessions.")
-                : new UsageLookupResult(latest, null);
-        }
-        catch (Exception exception)
-        {
-            return new UsageLookupResult(null, $"Could not read Codex usage: {exception.Message}");
         }
     }
 
@@ -243,11 +179,11 @@ public sealed class CodexUsageReader
         throw new TimeoutException("Timed out waiting for codex app-server.");
     }
 
-    private static CodexRateLimitSnapshot? ParseRpcSnapshot(string json, string source)
+    internal static CodexRateLimitSnapshot? ParseRpcSnapshot(string json, string source)
     {
         using var document = JsonDocument.Parse(json);
         if (!document.RootElement.TryGetProperty("result", out var result) ||
-            !result.TryGetProperty("rateLimits", out var rateLimits))
+            !TryGetCodexRateLimits(result, out var rateLimits))
         {
             return null;
         }
@@ -271,6 +207,28 @@ public sealed class CodexUsageReader
             source);
     }
 
+    private static bool TryGetCodexRateLimits(JsonElement result, out JsonElement rateLimits)
+    {
+        if (result.TryGetProperty("rateLimitsByLimitId", out var limitsById) &&
+            limitsById.ValueKind == JsonValueKind.Object &&
+            limitsById.TryGetProperty("codex", out rateLimits) &&
+            rateLimits.ValueKind == JsonValueKind.Object)
+        {
+            return true;
+        }
+
+        if (result.TryGetProperty("rateLimits", out rateLimits) &&
+            rateLimits.ValueKind == JsonValueKind.Object &&
+            (!rateLimits.TryGetProperty("limitId", out var limitId) ||
+             string.Equals(limitId.GetString(), "codex", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        rateLimits = default;
+        return false;
+    }
+
     private static UsageWindow? ParseRpcWindow(JsonElement rateLimits, string propertyName)
     {
         if (!rateLimits.TryGetProperty(propertyName, out var element) ||
@@ -286,168 +244,6 @@ public sealed class CodexUsageReader
             usedPercentElement.GetDouble(),
             windowMinutesElement.GetInt32(),
             DateTimeOffset.FromUnixTimeSeconds(resetsAtElement.GetInt64()).ToLocalTime());
-    }
-
-    private static CodexRateLimitSnapshot? TryReadLatestFromFile(string path)
-    {
-        var lines = ReadSharedLines(path);
-        if (lines is null)
-        {
-            return null;
-        }
-
-        for (var index = lines.Count - 1; index >= 0; index--)
-        {
-            var line = lines[index];
-            if (!line.Contains("\"rate_limits\"", StringComparison.Ordinal))
-            {
-                continue;
-            }
-
-            var snapshot = TryParseSnapshot(line, path);
-            if (snapshot is not null)
-            {
-                return snapshot;
-            }
-        }
-
-        return null;
-    }
-
-    private static IEnumerable<string> EnumerateSessionFiles(string root)
-    {
-        var pending = new Stack<string>();
-        pending.Push(root);
-
-        while (pending.Count > 0)
-        {
-            var directory = pending.Pop();
-
-            string[] files;
-            try
-            {
-                files = Directory.GetFiles(directory, "*.jsonl");
-            }
-            catch (Exception exception) when (IsSkippableIoException(exception))
-            {
-                continue;
-            }
-
-            foreach (var file in files)
-            {
-                yield return file;
-            }
-
-            string[] directories;
-            try
-            {
-                directories = Directory.GetDirectories(directory);
-            }
-            catch (Exception exception) when (IsSkippableIoException(exception))
-            {
-                continue;
-            }
-
-            foreach (var childDirectory in directories)
-            {
-                pending.Push(childDirectory);
-            }
-        }
-    }
-
-    private static List<string>? ReadSharedLines(string path)
-    {
-        try
-        {
-            using var stream = new FileStream(
-                path,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete);
-            using var reader = new StreamReader(stream);
-
-            var lines = new List<string>();
-            while (reader.ReadLine() is { } line)
-            {
-                lines.Add(line);
-            }
-
-            return lines;
-        }
-        catch (Exception exception) when (IsSkippableIoException(exception))
-        {
-            return null;
-        }
-    }
-
-    private static CodexRateLimitSnapshot? TryParseSnapshot(string line, string sourcePath)
-    {
-        try
-        {
-            using var document = JsonDocument.Parse(line);
-            var root = document.RootElement;
-
-            if (!root.TryGetProperty("timestamp", out var timestampElement) ||
-                !DateTimeOffset.TryParse(
-                    timestampElement.GetString(),
-                    CultureInfo.InvariantCulture,
-                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
-                    out var observedAt))
-            {
-                observedAt = DateTimeOffset.UtcNow;
-            }
-
-            if (!root.TryGetProperty("payload", out var payload) ||
-                !payload.TryGetProperty("rate_limits", out var rateLimits) ||
-                !rateLimits.TryGetProperty("primary", out var primary))
-            {
-                return null;
-            }
-
-            var primaryWindow = ParseUsageWindow(primary);
-            UsageWindow? secondaryWindow = null;
-            if (rateLimits.TryGetProperty("secondary", out var secondary) &&
-                secondary.ValueKind != JsonValueKind.Null)
-            {
-                secondaryWindow = ParseUsageWindow(secondary);
-            }
-
-            if (primaryWindow is null)
-            {
-                return null;
-            }
-
-            var planType = rateLimits.TryGetProperty("plan_type", out var planElement)
-                ? planElement.GetString()
-                : null;
-
-            return new CodexRateLimitSnapshot(
-                observedAt,
-                planType,
-                primaryWindow,
-                secondaryWindow,
-                sourcePath);
-        }
-        catch (JsonException)
-        {
-            return null;
-        }
-    }
-
-    private static UsageWindow? ParseUsageWindow(JsonElement element)
-    {
-        if (!element.TryGetProperty("used_percent", out var usedPercentElement) ||
-            !element.TryGetProperty("window_minutes", out var windowMinutesElement) ||
-            !element.TryGetProperty("resets_at", out var resetsAtElement))
-        {
-            return null;
-        }
-
-        var usedPercent = usedPercentElement.GetDouble();
-        var windowMinutes = windowMinutesElement.GetInt32();
-        var resetsAt = DateTimeOffset.FromUnixTimeSeconds(resetsAtElement.GetInt64()).ToLocalTime();
-
-        return new UsageWindow(usedPercent, windowMinutes, resetsAt);
     }
 
     private static string? ResolveCodexExecutable(string? explicitPath)
@@ -506,13 +302,5 @@ public sealed class CodexUsageReader
         {
             // Best effort cleanup for a short-lived local RPC process.
         }
-    }
-
-    private static bool IsSkippableIoException(Exception exception)
-    {
-        return exception is UnauthorizedAccessException
-            or IOException
-            or System.Security.SecurityException
-            or System.ComponentModel.Win32Exception;
     }
 }

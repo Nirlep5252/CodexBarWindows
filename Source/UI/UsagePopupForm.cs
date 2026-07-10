@@ -559,7 +559,7 @@ public sealed class UsagePopupForm : Form
         planLabel.Text = provider.IsCursor
             ? CursorPlanText(snapshot)
             : string.IsNullOrWhiteSpace(snapshot.PlanType)
-                ? provider.IsClaude ? "Claude Code usage data" : "Local Codex session data"
+                ? provider.IsClaude ? "Claude Code usage data" : "Codex CLI usage data"
                 : $"{ToTitleCase(snapshot.PlanType)} plan";
 
         fiveHourSection.SetUsage(snapshot.Primary);
@@ -584,7 +584,9 @@ public sealed class UsagePopupForm : Form
             }
         }
 
-        statusLabel.Text = provider.IsCursor ? CursorStatusText(snapshot) : string.Empty;
+        statusLabel.Text = !string.IsNullOrWhiteSpace(result.Error)
+            ? result.Error
+            : provider.IsCursor ? CursorStatusText(snapshot) : string.Empty;
     }
 
     private ProviderUsageLookupResult GetProviderUsage(string providerKey)

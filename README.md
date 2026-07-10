@@ -159,7 +159,7 @@ If the repository is made public later, no token is required.
 
 ## How Usage Is Read
 
-For Codex, the app first asks the local Codex CLI for rate limits using the CLI app-server RPC endpoint. If live RPC data is unavailable, it falls back to local Codex session data where possible.
+For Codex, the app asks the local Codex CLI for live rate limits using the CLI app-server RPC endpoint. It establishes an initial consensus across independent live samples, rejects isolated conflicting windows, and retains the last confirmed snapshot when a refresh fails. Session logs are not used as a rate-limit fallback because they cannot be reliably attributed to the currently selected Codex account.
 
 Codex history charts are local estimates from `%USERPROFILE%\.codex\sessions` and `%USERPROFILE%\.codex\archived_sessions`, or from `%CODEX_HOME%` when set. They also include pi agent sessions from `%USERPROFILE%\.pi\agent\sessions`, or `%PI_HOME%\agent\sessions` when set, for `openai-codex` usage. They summarize recent token rows into a 30 day spend chart and model usage breakdown. Cost values use built-in API-rate estimates and may differ from billing.
 

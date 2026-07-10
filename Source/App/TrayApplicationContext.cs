@@ -17,6 +17,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private IReadOnlyList<CodexCliEntry> codexCliEntries;
     private readonly Dictionary<string, ProviderUsageLookupResult> latestCodexUsage = [];
     private readonly Dictionary<string, ProviderUsageInsightsLookupResult> latestHistory = [];
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, CodexRateLimitStabilizer> codexStabilizers = [];
     private ProviderUsageLookupResult latestClaudeUsage = new(null, "Usage has not been loaded yet.");
     private ProviderUsageLookupResult latestCursorUsage = new(null, "Usage has not been loaded yet.");
     private CancellationTokenSource? refreshCancellation;
@@ -33,6 +34,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
             latestCodexUsage[providerKey] = new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
             latestHistory[providerKey] = new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet.");
+            codexStabilizers[providerKey] = new CodexRateLimitStabilizer();
         }
 
         latestHistory[UsagePopupForm.ClaudeProviderKey] = new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet.");
@@ -209,10 +211,14 @@ public sealed class TrayApplicationContext : ApplicationContext
                         {
                             try
                             {
-                                var reader = new CodexUsageReader(entry.BinaryPath);
+                                var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
+                                var stabilizer = codexStabilizers.GetOrAdd(
+                                    providerKey,
+                                    _ => new CodexRateLimitStabilizer());
+                                var reader = new CodexUsageReader(entry.BinaryPath, stabilizer);
                                 return new KeyValuePair<string, ProviderUsageLookupResult>(
-                                    UsagePopupForm.CodexProviderKey(entry.Id),
-                                    reader.ReadLatest().ToProviderResult());
+                                    providerKey,
+                                    reader.ReadLatest(cancellation.Token).ToProviderResult());
                             }
                             catch (Exception exception)
                             {
@@ -510,14 +516,41 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private void ReloadCodexCliEntries()
     {
+        var previousPaths = codexCliEntries.ToDictionary(
+            entry => UsagePopupForm.CodexProviderKey(entry.Id),
+            entry => entry.BinaryPath ?? string.Empty);
         codexCliEntries = CodexCliSettings.Load();
+        var activeProviderKeys = codexCliEntries
+            .Select(entry => UsagePopupForm.CodexProviderKey(entry.Id))
+            .ToHashSet(StringComparer.Ordinal);
+
         foreach (var entry in codexCliEntries)
         {
             var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
-            latestCodexUsage.TryAdd(providerKey, new ProviderUsageLookupResult(null, "Usage has not been loaded yet."));
+            var binaryPath = entry.BinaryPath ?? string.Empty;
+            var binaryChanged = previousPaths.TryGetValue(providerKey, out var previousPath) &&
+                !string.Equals(previousPath, binaryPath, StringComparison.OrdinalIgnoreCase);
+            if (binaryChanged)
+            {
+                latestCodexUsage[providerKey] = new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
+                codexStabilizers[providerKey] = new CodexRateLimitStabilizer();
+            }
+            else
+            {
+                latestCodexUsage.TryAdd(providerKey, new ProviderUsageLookupResult(null, "Usage has not been loaded yet."));
+                codexStabilizers.GetOrAdd(providerKey, _ => new CodexRateLimitStabilizer());
+            }
+
             latestHistory.TryAdd(
                 providerKey,
                 new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet."));
+        }
+
+        foreach (var providerKey in codexStabilizers.Keys.Where(key => !activeProviderKeys.Contains(key)))
+        {
+            codexStabilizers.TryRemove(providerKey, out _);
+            latestCodexUsage.Remove(providerKey);
+            latestHistory.Remove(providerKey);
         }
 
         popup.ConfigureCodexEntries(codexCliEntries);
@@ -559,17 +592,29 @@ public sealed class TrayApplicationContext : ApplicationContext
                     ? value
                     : null;
                 return result?.Snapshot is { } snapshot
-                    ? $"{entry.Name} {snapshot.Primary.UsedPercent:0.#}%"
+                    ? $"{entry.Name} {snapshot.Primary.UsedPercent:0.#}% {ShortWindow(snapshot.Primary.WindowMinutes)}"
                     : $"{entry.Name} --";
             }));
         var claudeText = claudeUsage.Snapshot is { } claude
-            ? $"Claude {claude.Primary.UsedPercent:0.#}%"
+            ? $"Claude {claude.Primary.UsedPercent:0.#}% {ShortWindow(claude.Primary.WindowMinutes)}"
             : "Claude --";
         var cursorText = cursorUsage.Snapshot is { } cursor
             ? $"Cursor {cursor.Primary.UsedPercent:0.#}%"
             : "Cursor --";
 
-        return TrimTooltip($"{codexText} 5h, {claudeText} 5h, {cursorText}");
+        return TrimTooltip($"{codexText}, {claudeText}, {cursorText}");
+    }
+
+    internal static string ShortWindow(int windowMinutes)
+    {
+        if (windowMinutes >= 1440 && windowMinutes % 1440 == 0)
+        {
+            return $"{windowMinutes / 1440}d";
+        }
+
+        return windowMinutes >= 60 && windowMinutes % 60 == 0
+            ? $"{windowMinutes / 60}h"
+            : $"{windowMinutes}m";
     }
 
     private static string TrimTooltip(string value)

@@ -43,6 +43,13 @@ if (args.Contains("--scan-real-claude", StringComparer.OrdinalIgnoreCase))
 
 var tests = new (string Name, Action Run)[]
 {
+    ("Codex RPC prefers the codex multi-bucket snapshot", CodexRpcPrefersCodexMultiBucketSnapshot),
+    ("Codex RPC rejects a non-codex compatibility bucket", CodexRpcRejectsNonCodexCompatibilityBucket),
+    ("Codex limits establish an initial window consensus", CodexLimitsEstablishInitialConsensus),
+    ("Codex limits reject an isolated conflicting window", CodexLimitsRejectIsolatedConflict),
+    ("Codex limits accept a repeatedly confirmed replacement", CodexLimitsAcceptConfirmedReplacement),
+    ("Codex limits retain the last snapshot on refresh failure", CodexLimitsRetainLastSnapshotOnFailure),
+    ("Usage tooltip windows reflect their actual duration", UsageTooltipWindowsReflectDuration),
     ("Codex history aggregates token_count rows", CodexHistoryAggregatesTokenCountRows),
     ("Codex history counts premium token_count rows as fast", CodexHistoryCountsPremiumTokenCountRowsAsFast),
     ("Codex history treats prolite token_count rows as regular", CodexHistoryTreatsProliteTokenCountRowsAsRegular),
@@ -61,6 +68,167 @@ var tests = new (string Name, Action Run)[]
     ("Cursor legacy request usage drives primary", CursorLegacyRequestsDrivePrimary),
     ("Cursor cookie header normalization trims prefix", CursorCookieHeaderNormalizationTrimsPrefix),
 };
+
+static void CodexRpcPrefersCodexMultiBucketSnapshot()
+{
+    const string response = """
+        {
+          "id": 2,
+          "result": {
+            "rateLimits": {
+              "limitId": "codex_bengalfox",
+              "primary": { "usedPercent": 0, "windowDurationMins": 300, "resetsAt": 1783647000 },
+              "secondary": { "usedPercent": 0, "windowDurationMins": 10080, "resetsAt": 1784234000 }
+            },
+            "rateLimitsByLimitId": {
+              "codex_bengalfox": {
+                "limitId": "codex_bengalfox",
+                "primary": { "usedPercent": 0, "windowDurationMins": 300, "resetsAt": 1783647000 },
+                "secondary": { "usedPercent": 0, "windowDurationMins": 10080, "resetsAt": 1784234000 }
+              },
+              "codex": {
+                "limitId": "codex",
+                "primary": { "usedPercent": 42, "windowDurationMins": 300, "resetsAt": 1783637100 },
+                "secondary": { "usedPercent": 9, "windowDurationMins": 10080, "resetsAt": 1784223900 },
+                "planType": "plus"
+              }
+            }
+          }
+        }
+        """;
+
+    var snapshot = CodexUsageReader.ParseRpcSnapshot(response, "test")
+        ?? throw new InvalidOperationException("expected a parsed Codex snapshot");
+
+    AssertEqual(42d, snapshot.Primary.UsedPercent, "preferred Codex used percent");
+    AssertEqual(300, snapshot.Primary.WindowMinutes, "preferred Codex window length");
+    AssertEqual("plus", snapshot.PlanType ?? string.Empty, "preferred Codex plan");
+}
+
+static void CodexRpcRejectsNonCodexCompatibilityBucket()
+{
+    const string response = """
+        {
+          "id": 2,
+          "result": {
+            "rateLimits": {
+              "limitId": "codex_bengalfox",
+              "primary": { "usedPercent": 0, "windowDurationMins": 300, "resetsAt": 1783647000 },
+              "secondary": null
+            }
+          }
+        }
+        """;
+
+    Assert(
+        CodexUsageReader.ParseRpcSnapshot(response, "test") is null,
+        "a non-codex compatibility bucket must not drive the Codex headline");
+}
+
+static void CodexLimitsEstablishInitialConsensus()
+{
+    var now = DateTimeOffset.Now;
+    var stabilizer = new CodexRateLimitStabilizer();
+    var reset = now.AddHours(2);
+    var weeklyReset = now.AddDays(5);
+    var result = stabilizer.Stabilize(
+        [
+            Success(CodexSnapshot(now, 80, reset, 12, weeklyReset)),
+            Success(CodexSnapshot(now.AddSeconds(1), 13, reset, 2, weeklyReset)),
+            Success(CodexSnapshot(now.AddSeconds(2), 81, reset.AddSeconds(1), 12, weeklyReset.AddSeconds(1)))
+        ],
+        now);
+
+    AssertEqual(81d, result.Snapshot?.Primary.UsedPercent ?? -1, "consensus used percent");
+    Assert(result.Error is null, $"unexpected consensus warning: {result.Error}");
+}
+
+static void CodexLimitsRejectIsolatedConflict()
+{
+    var now = DateTimeOffset.Now;
+    var stabilizer = InitializedStabilizer(now, usedPercent: 80);
+    var conflict = Success(CodexSnapshot(now.AddMinutes(1), 13, now.AddHours(3), 2, now.AddDays(6)));
+
+    var result = stabilizer.Stabilize([conflict], now.AddMinutes(1));
+
+    AssertEqual(80d, result.Snapshot?.Primary.UsedPercent ?? -1, "last confirmed percent");
+    Assert(result.Error?.Contains("conflicting", StringComparison.OrdinalIgnoreCase) == true, "conflict warning");
+    AssertEqual(result.Error ?? string.Empty, result.ToProviderResult().Error ?? string.Empty, "provider warning propagation");
+}
+
+static void CodexLimitsAcceptConfirmedReplacement()
+{
+    var now = DateTimeOffset.Now;
+    var stabilizer = InitializedStabilizer(now, usedPercent: 80);
+    var replacementReset = now.AddHours(3);
+    UsageLookupResult? result = null;
+
+    for (var attempt = 1; attempt <= 3; attempt++)
+    {
+        result = stabilizer.Stabilize(
+            [Success(CodexSnapshot(now.AddMinutes(attempt), 13 + attempt, replacementReset, 2, now.AddDays(6)))],
+            now.AddMinutes(attempt));
+    }
+
+    AssertEqual(16d, result?.Snapshot?.Primary.UsedPercent ?? -1, "confirmed replacement percent");
+    Assert(result?.Error is null, $"unexpected replacement warning: {result?.Error}");
+}
+
+static void CodexLimitsRetainLastSnapshotOnFailure()
+{
+    var now = DateTimeOffset.Now;
+    var stabilizer = InitializedStabilizer(now, usedPercent: 80);
+
+    var result = stabilizer.Stabilize([new UsageLookupResult(null, "RPC timeout")], now.AddMinutes(1));
+
+    AssertEqual(80d, result.Snapshot?.Primary.UsedPercent ?? -1, "retained percent");
+    Assert(result.Error?.Contains("RPC timeout", StringComparison.Ordinal) == true, "refresh failure warning");
+}
+
+static void UsageTooltipWindowsReflectDuration()
+{
+    AssertEqual("5h", TrayApplicationContext.ShortWindow(300), "five-hour tooltip label");
+    AssertEqual("7d", TrayApplicationContext.ShortWindow(10080), "weekly tooltip label");
+    AssertEqual("30d", TrayApplicationContext.ShortWindow(43200), "monthly tooltip label");
+}
+
+static CodexRateLimitStabilizer InitializedStabilizer(DateTimeOffset now, double usedPercent)
+{
+    var stabilizer = new CodexRateLimitStabilizer();
+    var reset = now.AddHours(2);
+    var weeklyReset = now.AddDays(5);
+    var samples = Enumerable.Range(0, 3)
+        .Select(index => Success(CodexSnapshot(
+            now.AddSeconds(index),
+            usedPercent,
+            reset.AddSeconds(index),
+            12,
+            weeklyReset.AddSeconds(index))))
+        .ToArray();
+    var initial = stabilizer.Stabilize(samples, now);
+    Assert(initial.HasSnapshot, "stabilizer initialization");
+    return stabilizer;
+}
+
+static UsageLookupResult Success(CodexRateLimitSnapshot snapshot)
+{
+    return new UsageLookupResult(snapshot, null);
+}
+
+static CodexRateLimitSnapshot CodexSnapshot(
+    DateTimeOffset observedAt,
+    double usedPercent,
+    DateTimeOffset reset,
+    double weeklyUsedPercent,
+    DateTimeOffset weeklyReset)
+{
+    return new CodexRateLimitSnapshot(
+        observedAt,
+        "prolite",
+        new UsageWindow(usedPercent, 300, reset),
+        new UsageWindow(weeklyUsedPercent, 10080, weeklyReset),
+        "test");
+}
 
 var failures = new List<string>();
 foreach (var test in tests)

@@ -44,7 +44,7 @@ public sealed record UsageLookupResult(CodexRateLimitSnapshot? Snapshot, string?
                         secondary.ResetsAt)
                     : null,
                 snapshot.Source),
-            null);
+            Error);
     }
 
     private static string WindowTitle(int windowMinutes)
