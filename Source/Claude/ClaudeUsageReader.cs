@@ -38,7 +38,7 @@ public sealed class ClaudeUsageReader
             var usage = await FetchUsageAsync(httpClient, credentials.AccessToken, cancellationToken)
                 .ConfigureAwait(false);
 
-            var snapshot = MapUsage(usage, PlanLabel(credentials));
+            var snapshot = MapUsage(usage, credentials);
             return new ProviderUsageLookupResult(snapshot, null);
         }
         catch (Exception exception)
@@ -157,7 +157,7 @@ public sealed class ClaudeUsageReader
             ?? throw new InvalidOperationException("Claude usage response was empty.");
     }
 
-    internal static ProviderUsageSnapshot MapUsage(OAuthUsageResponse usage, string? planLabel)
+    private static ProviderUsageSnapshot MapUsage(OAuthUsageResponse usage, ClaudeOAuthCredentials credentials)
     {
         var primary = MakeWindow("5 hour limit", usage.FiveHour, 5 * 60)
             ?? throw new InvalidOperationException("Claude usage response did not include 5 hour data.");
@@ -166,17 +166,13 @@ public sealed class ClaudeUsageReader
             ?? MakeWindow("Weekly limit", usage.SevenDaySonnet, 7 * 24 * 60)
             ?? MakeWindow("Weekly limit", usage.SevenDayOpus, 7 * 24 * 60);
 
-        var fable = MakeWindow("Fable 5 limit", usage.SevenDayOverageIncluded, 7 * 24 * 60)
-            ?? MakeFableWindow(usage.Limits);
-
         return new ProviderUsageSnapshot(
             UsageProvider.Claude,
             DateTimeOffset.Now,
-            planLabel,
+            PlanLabel(credentials),
             primary,
             weekly,
-            "Claude Code OAuth",
-            fable);
+            "Claude Code OAuth");
     }
 
     private static ProviderUsageWindow? MakeWindow(string title, OAuthUsageWindow? window, int windowMinutes)
@@ -191,24 +187,6 @@ public sealed class ClaudeUsageReader
             Math.Clamp(utilization, 0, 100),
             windowMinutes,
             ParseIsoDate(window.ResetsAt));
-    }
-
-    private static ProviderUsageWindow? MakeFableWindow(IReadOnlyList<OAuthUsageLimit>? limits)
-    {
-        var limit = limits?.FirstOrDefault(candidate =>
-            string.Equals(candidate.Kind, "weekly_scoped", StringComparison.OrdinalIgnoreCase) &&
-            candidate.Scope?.Model?.DisplayName?.StartsWith("Fable", StringComparison.OrdinalIgnoreCase) == true);
-
-        if (limit?.Percent is not { } percent)
-        {
-            return null;
-        }
-
-        return new ProviderUsageWindow(
-            "Fable 5 limit",
-            Math.Clamp(percent, 0, 100),
-            7 * 24 * 60,
-            ParseIsoDate(limit.ResetsAt));
     }
 
     private static string? PlanLabel(ClaudeOAuthCredentials credentials)
@@ -316,27 +294,13 @@ public sealed class ClaudeUsageReader
         [property: JsonPropertyName("refresh_token")] string? RefreshToken,
         [property: JsonPropertyName("expires_in")] int ExpiresIn);
 
-    internal sealed record OAuthUsageResponse(
+    private sealed record OAuthUsageResponse(
         [property: JsonPropertyName("five_hour")] OAuthUsageWindow? FiveHour,
         [property: JsonPropertyName("seven_day")] OAuthUsageWindow? SevenDay,
         [property: JsonPropertyName("seven_day_sonnet")] OAuthUsageWindow? SevenDaySonnet,
-        [property: JsonPropertyName("seven_day_opus")] OAuthUsageWindow? SevenDayOpus,
-        [property: JsonPropertyName("seven_day_overage_included")] OAuthUsageWindow? SevenDayOverageIncluded,
-        [property: JsonPropertyName("limits")] OAuthUsageLimit[]? Limits);
+        [property: JsonPropertyName("seven_day_opus")] OAuthUsageWindow? SevenDayOpus);
 
-    internal sealed record OAuthUsageWindow(
+    private sealed record OAuthUsageWindow(
         [property: JsonPropertyName("utilization")] double? Utilization,
         [property: JsonPropertyName("resets_at")] string? ResetsAt);
-
-    internal sealed record OAuthUsageLimit(
-        [property: JsonPropertyName("kind")] string? Kind,
-        [property: JsonPropertyName("percent")] double? Percent,
-        [property: JsonPropertyName("resets_at")] string? ResetsAt,
-        [property: JsonPropertyName("scope")] OAuthUsageLimitScope? Scope);
-
-    internal sealed record OAuthUsageLimitScope(
-        [property: JsonPropertyName("model")] OAuthUsageLimitModel? Model);
-
-    internal sealed record OAuthUsageLimitModel(
-        [property: JsonPropertyName("display_name")] string? DisplayName);
 }
