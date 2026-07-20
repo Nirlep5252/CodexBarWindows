@@ -25,9 +25,7 @@ public sealed class UsagePopupForm : Form
     private readonly Label planLabel;
     private readonly Label statusLabel;
     private readonly UsageCardPanel usageCard;
-    private readonly UsageSection fiveHourSection;
-    private readonly UsageSection weeklySection;
-    private readonly UsageSection tertiarySection;
+    private readonly List<UsageSection> usageSections = [];
     private readonly GlyphButton graphsButton;
     private readonly GlyphButton closeButton;
     private readonly List<Font> ownedFonts = [];
@@ -101,12 +99,7 @@ public sealed class UsagePopupForm : Form
         };
 
         usageCard = new UsageCardPanel();
-        fiveHourSection = new UsageSection("5 hour limit");
-        weeklySection = new UsageSection("Weekly limit") { ShowSeparator = true };
-        tertiarySection = new UsageSection("API") { ShowSeparator = true };
-        usageCard.Controls.Add(fiveHourSection);
-        usageCard.Controls.Add(weeklySection);
-        usageCard.Controls.Add(tertiarySection);
+        EnsureUsageSectionCount(3);
 
         statusLabel = new FluentLabel
         {
@@ -129,9 +122,6 @@ public sealed class UsagePopupForm : Form
         EnableDragMove(planLabel);
         EnableDragMove(statusLabel);
         EnableDragMove(usageCard);
-        fiveHourSection.EnableDragMove();
-        weeklySection.EnableDragMove();
-        tertiarySection.EnableDragMove();
 
         Deactivate += (_, _) => Hide();
         FormClosing += OnFormClosing;
@@ -393,8 +383,8 @@ public sealed class UsagePopupForm : Form
     {
         var scale = DpiScale;
         var selectedProvider = GetProvider(selectedProviderKey);
-        var showTertiary = ShouldShowTertiary(selectedProvider);
-        var rowCount = showTertiary ? 3 : 2;
+        var rowCount = GetUsageRowCount(selectedProvider);
+        EnsureUsageSectionCount(rowCount);
 
         var rowHeight = ScaleInt(UsageRowHeight, scale);
         var cardTop = ScaleInt(UsageCardTop, scale);
@@ -428,10 +418,13 @@ public sealed class UsagePopupForm : Form
             ScaleInt(BaseWidth - (OuterMargin * 2), scale),
             cardHeight);
         var cardWidth = usageCard.Width;
-        fiveHourSection.Bounds = new Rectangle(0, 0, cardWidth, rowHeight);
-        weeklySection.Bounds = new Rectangle(0, rowHeight, cardWidth, rowHeight);
-        tertiarySection.Visible = showTertiary;
-        tertiarySection.Bounds = new Rectangle(0, rowHeight * 2, cardWidth, rowHeight);
+        for (var index = 0; index < usageSections.Count; index++)
+        {
+            var section = usageSections[index];
+            section.Visible = index < rowCount;
+            section.Bounds = new Rectangle(0, rowHeight * index, cardWidth, rowHeight);
+            section.ApplyLayoutScale(scale);
+        }
 
         statusLabel.Bounds = new Rectangle(
             ScaleInt(OuterMargin + 4, scale),
@@ -440,9 +433,6 @@ public sealed class UsagePopupForm : Form
             ScaleInt(StatusHeight, scale));
 
         usageCard.ApplyLayoutScale(scale);
-        fiveHourSection.ApplyLayoutScale(scale);
-        weeklySection.ApplyLayoutScale(scale);
-        tertiarySection.ApplyLayoutScale(scale);
 
         ResumeLayout(performLayout: true);
         Invalidate(true);
@@ -507,10 +497,11 @@ public sealed class UsagePopupForm : Form
         if (providerKey == selectedProviderKey)
         {
             planLabel.Text = $"Fetching {provider.Name} limits...";
-            fiveHourSection.SetLoading(provider.IsCursor ? "Total" : "5 hour limit");
-            weeklySection.SetLoading(provider.IsCursor ? "Auto" : "Weekly limit");
-            tertiarySection.SetLoading(provider.IsCursor ? "API" : "Fable 5 limit");
-            tertiarySection.Visible = ShouldShowTertiary(provider);
+            var titles = DefaultUsageTitles(provider);
+            for (var index = 0; index < GetUsageRowCount(provider); index++)
+            {
+                usageSections[index].SetLoading(titles[index]);
+            }
             statusLabel.Text = provider.IsClaude
                 ? "Reading from Claude Code OAuth..."
                 : provider.IsCursor
@@ -540,7 +531,6 @@ public sealed class UsagePopupForm : Form
         }
 
         var provider = GetProvider(selectedProviderKey);
-        tertiarySection.Visible = ShouldShowTertiary(provider);
         titleLabel.Text = $"{provider.Name} rate limits";
         var result = GetProviderUsage(selectedProviderKey);
 
@@ -549,9 +539,11 @@ public sealed class UsagePopupForm : Form
             planLabel.Text = provider.IsCursor
                 ? "Waiting for Cursor usage data"
                 : $"Waiting for local {provider.Name} usage data";
-            fiveHourSection.SetUnavailable(provider.IsCursor ? "Total" : "5 hour limit");
-            weeklySection.SetUnavailable(provider.IsCursor ? "Auto" : "Weekly limit");
-            tertiarySection.SetUnavailable(provider.IsCursor ? "API" : "Fable 5 limit");
+            var titles = DefaultUsageTitles(provider);
+            for (var index = 0; index < GetUsageRowCount(provider); index++)
+            {
+                usageSections[index].SetUnavailable(titles[index]);
+            }
             statusLabel.Text = result.Error ?? "No usage data found.";
             return;
         }
@@ -560,28 +552,12 @@ public sealed class UsagePopupForm : Form
             ? CursorPlanText(snapshot)
             : string.IsNullOrWhiteSpace(snapshot.PlanType)
                 ? provider.IsClaude ? "Claude Code usage data" : "Codex CLI usage data"
-                : $"{ToTitleCase(snapshot.PlanType)} plan";
+                : $"{ProviderPlanFormatter.DisplayName(provider.Provider, snapshot.PlanType)} plan";
 
-        fiveHourSection.SetUsage(snapshot.Primary);
-        if (snapshot.Secondary is { } secondary)
+        var windows = snapshot.Windows;
+        for (var index = 0; index < windows.Count; index++)
         {
-            weeklySection.SetUsage(secondary);
-        }
-        else
-        {
-            weeklySection.SetUnavailable(provider.IsCursor ? "Auto" : snapshot.Primary.WindowMinutes == 10080 ? "5 hour limit" : "Weekly limit");
-        }
-
-        if (provider.IsCursor || provider.IsClaude)
-        {
-            if (snapshot.Tertiary is { } tertiary)
-            {
-                tertiarySection.SetUsage(tertiary);
-            }
-            else
-            {
-                tertiarySection.SetUnavailable(provider.IsCursor ? "API" : "Fable 5 limit");
-            }
+            usageSections[index].SetUsage(windows[index]);
         }
 
         statusLabel.Text = !string.IsNullOrWhiteSpace(result.Error)
@@ -596,10 +572,33 @@ public sealed class UsagePopupForm : Form
             : new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
     }
 
-    private bool ShouldShowTertiary(ProviderDescriptor provider)
+    private int GetUsageRowCount(ProviderDescriptor provider)
     {
-        return provider.IsCursor ||
-            (provider.IsClaude && GetProviderUsage(provider.Key).Snapshot?.Tertiary is not null);
+        return GetProviderUsage(provider.Key).Snapshot is { } snapshot
+            ? snapshot.Windows.Count
+            : provider.IsCursor ? 3 : 2;
+    }
+
+    private static IReadOnlyList<string> DefaultUsageTitles(ProviderDescriptor provider)
+    {
+        return provider.IsCursor
+            ? ["Total", "Auto", "API"]
+            : ["5 hour limit", "Weekly limit"];
+    }
+
+    private void EnsureUsageSectionCount(int count)
+    {
+        while (usageSections.Count < count)
+        {
+            var section = new UsageSection("Usage limit")
+            {
+                ShowSeparator = usageSections.Count > 0
+            };
+            section.EnableDragMove();
+            section.ApplyTheme(tokens);
+            usageSections.Add(section);
+            usageCard.Controls.Add(section);
+        }
     }
 
     private ProviderDescriptor GetProvider(string providerKey)
@@ -711,16 +710,6 @@ public sealed class UsagePopupForm : Form
         return local.ToString("ddd, dd MMM h:mm tt");
     }
 
-    private static string ToTitleCase(string value)
-    {
-        if (value.Length == 0)
-        {
-            return value;
-        }
-
-        return char.ToUpperInvariant(value[0]) + value[1..].ToLowerInvariant();
-    }
-
     private static string CursorPlanText(ProviderUsageSnapshot snapshot)
     {
         var plan = string.IsNullOrWhiteSpace(snapshot.PlanType) ? "Cursor usage data" : snapshot.PlanType;
@@ -791,9 +780,10 @@ public sealed class UsagePopupForm : Form
         }
 
         usageCard.ApplyTheme(tokens);
-        fiveHourSection.ApplyTheme(tokens);
-        weeklySection.ApplyTheme(tokens);
-        tertiarySection.ApplyTheme(tokens);
+        foreach (var section in usageSections)
+        {
+            section.ApplyTheme(tokens);
+        }
 
         if (IsHandleCreated)
         {

@@ -45,6 +45,8 @@ var tests = new (string Name, Action Run)[]
 {
     ("Codex RPC prefers the codex multi-bucket snapshot", CodexRpcPrefersCodexMultiBucketSnapshot),
     ("Codex RPC rejects a non-codex compatibility bucket", CodexRpcRejectsNonCodexCompatibilityBucket),
+    ("Codex RPC accepts a weekly-only payload", CodexRpcAcceptsWeeklyOnlyPayload),
+    ("Codex RPC discovers dynamically named windows", CodexRpcDiscoversDynamicWindows),
     ("Codex limits establish an initial window consensus", CodexLimitsEstablishInitialConsensus),
     ("Codex limits reject an isolated conflicting window", CodexLimitsRejectIsolatedConflict),
     ("Codex limits accept a repeatedly confirmed replacement", CodexLimitsAcceptConfirmedReplacement),
@@ -65,6 +67,8 @@ var tests = new (string Name, Action Run)[]
     ("Claude usage maps Fable from scoped limits", ClaudeUsageMapsScopedFableLimit),
     ("Claude usage maps Fable from the legacy window", ClaudeUsageMapsLegacyFableLimit),
     ("Claude usage omits Fable when Anthropic omits it", ClaudeUsageOmitsMissingFableLimit),
+    ("Claude plan includes the dynamic Max multiplier", ClaudePlanIncludesMultiplier),
+    ("Provider plan labels map Codex Pro tiers", ProviderPlanLabelsMapCodexTiers),
     ("Cursor usage keeps fractional percent fields", CursorUsageKeepsFractionalPercents),
     ("Cursor enterprise overall drives headline", CursorEnterpriseOverallDrivesHeadline),
     ("Cursor legacy request usage drives primary", CursorLegacyRequestsDrivePrimary),
@@ -125,6 +129,84 @@ static void CodexRpcRejectsNonCodexCompatibilityBucket()
     Assert(
         CodexUsageReader.ParseRpcSnapshot(response, "test") is null,
         "a non-codex compatibility bucket must not drive the Codex headline");
+}
+
+static void CodexRpcAcceptsWeeklyOnlyPayload()
+{
+    const string response = """
+        {
+          "id": 2,
+          "result": {
+            "rateLimitsByLimitId": {
+              "codex": {
+                "limitId": "codex",
+                "weekly": {
+                  "usedPercent": 23,
+                  "windowDurationMins": 10080,
+                  "resetsAt": 1784234000
+                },
+                "planType": "prolite"
+              }
+            }
+          }
+        }
+        """;
+
+    var snapshot = CodexUsageReader.ParseRpcSnapshot(response, "test")
+        ?? throw new InvalidOperationException("expected a weekly-only Codex snapshot");
+    var providerSnapshot = new UsageLookupResult(snapshot, null).ToProviderResult().Snapshot
+        ?? throw new InvalidOperationException("expected a provider snapshot");
+
+    AssertEqual(1, snapshot.Windows.Count, "weekly-only window count");
+    AssertEqual(10080, snapshot.Primary.WindowMinutes, "weekly-only primary duration");
+    AssertEqual(1, providerSnapshot.Windows.Count, "weekly-only provider row count");
+    AssertEqual("Weekly limit", providerSnapshot.Windows[0].Title, "weekly-only row title");
+}
+
+static void CodexRpcDiscoversDynamicWindows()
+{
+    const string response = """
+        {
+          "id": 2,
+          "result": {
+            "rateLimitsByLimitId": {
+              "codex": {
+                "limitId": "codex",
+                "primary": {
+                  "usedPercent": 8,
+                  "windowDurationMins": 300,
+                  "resetsAt": 1783647000
+                },
+                "windows": [
+                  {
+                    "used_percent": "23",
+                    "window_minutes": "10080",
+                    "resets_at": "1784234000"
+                  },
+                  {
+                    "utilization": 4.5,
+                    "windowDurationMins": 43200
+                  }
+                ],
+                "planType": "pro"
+              }
+            }
+          }
+        }
+        """;
+
+    var snapshot = CodexUsageReader.ParseRpcSnapshot(response, "test")
+        ?? throw new InvalidOperationException("expected a dynamic Codex snapshot");
+    var providerSnapshot = new UsageLookupResult(snapshot, null).ToProviderResult().Snapshot
+        ?? throw new InvalidOperationException("expected a provider snapshot");
+
+    AssertEqual(3, snapshot.Windows.Count, "dynamic window count");
+    AssertEqual(300, snapshot.Windows[0].WindowMinutes, "first dynamic window");
+    AssertEqual(10080, snapshot.Windows[1].WindowMinutes, "second dynamic window");
+    AssertEqual(43200, snapshot.Windows[2].WindowMinutes, "third dynamic window");
+    AssertEqual(3, providerSnapshot.Windows.Count, "dynamic provider row count");
+    AssertEqual("30d", TrayApplicationContext.ShortWindow(providerSnapshot.Windows[2].WindowMinutes), "dynamic monthly duration");
+    Assert(providerSnapshot.Windows[2].ResetsAt is null, "missing reset should remain optional");
 }
 
 static void CodexLimitsEstablishInitialConsensus()
@@ -597,6 +679,30 @@ static ClaudeUsageReader.OAuthUsageResponse DeserializeClaudeUsage(string json)
 {
     return JsonSerializer.Deserialize<ClaudeUsageReader.OAuthUsageResponse>(json)
         ?? throw new InvalidOperationException("Claude usage response should deserialize");
+}
+
+static void ClaudePlanIncludesMultiplier()
+{
+    AssertEqual(
+        "max 5x",
+        ProviderPlanFormatter.ClaudePlanType("max", "default_claude_max_5x")!,
+        "Claude Max 5x plan");
+    AssertEqual(
+        "max 20x",
+        ProviderPlanFormatter.ClaudePlanType("max", "default_claude_max_20x")!,
+        "Claude Max 20x plan");
+    AssertEqual(
+        "max",
+        ProviderPlanFormatter.ClaudePlanType("max", null)!,
+        "Claude plan fallback without a tier");
+}
+
+static void ProviderPlanLabelsMapCodexTiers()
+{
+    AssertEqual("Pro 5x", ProviderPlanFormatter.DisplayName(UsageProvider.Codex, "prolite"), "Codex ProLite plan");
+    AssertEqual("Pro 20x", ProviderPlanFormatter.DisplayName(UsageProvider.Codex, "pro"), "Codex Pro plan");
+    AssertEqual("Pro 40x", ProviderPlanFormatter.DisplayName(UsageProvider.Codex, "pro_40x"), "future Codex Pro multiplier");
+    AssertEqual("Plus", ProviderPlanFormatter.DisplayName(UsageProvider.Codex, "plus"), "unmapped Codex plan");
 }
 
 static void CursorUsageKeepsFractionalPercents()

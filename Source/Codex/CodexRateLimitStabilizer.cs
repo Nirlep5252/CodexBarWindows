@@ -67,7 +67,7 @@ internal sealed class CodexRateLimitStabilizer
 
             if (pendingConflictCount >= RequiredConflictConfirmations)
             {
-                if (candidate.Primary.ResetsAt <= now)
+                if (candidate.Primary.ResetsAt is { } candidateReset && candidateReset <= now)
                 {
                     return new UsageLookupResult(
                         accepted,
@@ -123,7 +123,10 @@ internal sealed class CodexRateLimitStabilizer
         CodexRateLimitSnapshot candidate,
         DateTimeOffset now)
     {
-        if (previous.Primary.ResetsAt <= now && candidate.Primary.ResetsAt > now)
+        if (previous.Primary.ResetsAt is { } previousReset &&
+            candidate.Primary.ResetsAt is { } candidateReset &&
+            previousReset <= now &&
+            candidateReset > now)
         {
             return true;
         }
@@ -133,48 +136,47 @@ internal sealed class CodexRateLimitStabilizer
             return false;
         }
 
-        if (candidate.Primary.UsedPercent + PercentRegressionTolerance < previous.Primary.UsedPercent)
-        {
-            return false;
-        }
-
-        return previous.Secondary is not { } previousSecondary ||
-               candidate.Secondary is not { } candidateSecondary ||
-               candidateSecondary.UsedPercent + PercentRegressionTolerance >= previousSecondary.UsedPercent;
+        return previous.Windows
+            .Zip(candidate.Windows)
+            .All(pair => pair.Second.UsedPercent + PercentRegressionTolerance >= pair.First.UsedPercent);
     }
 
     internal static bool EquivalentWindows(CodexRateLimitSnapshot left, CodexRateLimitSnapshot right)
     {
-        return EquivalentWindow(left.Primary, right.Primary) &&
-               (left.Secondary, right.Secondary) switch
-               {
-                   (null, null) => true,
-                   ({ } leftSecondary, { } rightSecondary) => EquivalentWindow(leftSecondary, rightSecondary),
-                   _ => false
-               };
+        return left.Windows.Count == right.Windows.Count &&
+               left.Windows.Zip(right.Windows).All(pair => EquivalentWindow(pair.First, pair.Second));
     }
 
     private static bool EquivalentInitialSamples(CodexRateLimitSnapshot left, CodexRateLimitSnapshot right)
     {
-        if (!EquivalentWindows(left, right) ||
-            Math.Abs(left.Primary.UsedPercent - right.Primary.UsedPercent) > InitialPrimaryPercentTolerance)
+        if (!EquivalentWindows(left, right))
         {
             return false;
         }
 
-        return (left.Secondary, right.Secondary) switch
-        {
-            (null, null) => true,
-            ({ } leftSecondary, { } rightSecondary) =>
-                Math.Abs(leftSecondary.UsedPercent - rightSecondary.UsedPercent) <= InitialSecondaryPercentTolerance,
-            _ => false
-        };
+        return left.Windows
+            .Zip(right.Windows)
+            .Select((pair, index) => new
+            {
+                Difference = Math.Abs(pair.First.UsedPercent - pair.Second.UsedPercent),
+                Tolerance = index == 0 ? InitialPrimaryPercentTolerance : InitialSecondaryPercentTolerance
+            })
+            .All(comparison => comparison.Difference <= comparison.Tolerance);
     }
 
     private static bool EquivalentWindow(UsageWindow left, UsageWindow right)
     {
-        return left.WindowMinutes == right.WindowMinutes &&
-               (left.ResetsAt - right.ResetsAt).Duration() <= ResetTimeTolerance;
+        if (left.WindowMinutes != right.WindowMinutes)
+        {
+            return false;
+        }
+
+        return (left.ResetsAt, right.ResetsAt) switch
+        {
+            (null, null) => true,
+            ({ } leftReset, { } rightReset) => (leftReset - rightReset).Duration() <= ResetTimeTolerance,
+            _ => false
+        };
     }
 
     private void Accept(CodexRateLimitSnapshot snapshot)

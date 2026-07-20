@@ -213,12 +213,9 @@ public sealed class ClaudeUsageReader
 
     private static string? PlanLabel(ClaudeOAuthCredentials credentials)
     {
-        if (!string.IsNullOrWhiteSpace(credentials.SubscriptionType))
-        {
-            return credentials.SubscriptionType;
-        }
-
-        return credentials.RateLimitTier;
+        return ProviderPlanFormatter.ClaudePlanType(
+            credentials.SubscriptionType,
+            credentials.RateLimitTier);
     }
 
     private static DateTimeOffset ParseExpiresAt(long expiresAt)

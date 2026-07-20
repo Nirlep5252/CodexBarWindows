@@ -188,9 +188,8 @@ public sealed class CodexUsageReader
             return null;
         }
 
-        var primary = ParseRpcWindow(rateLimits, "primary");
-        var secondary = ParseRpcWindow(rateLimits, "secondary");
-        if (primary is null)
+        var windows = ParseRpcWindows(rateLimits);
+        if (windows.Count == 0)
         {
             return null;
         }
@@ -202,9 +201,10 @@ public sealed class CodexUsageReader
         return new CodexRateLimitSnapshot(
             DateTimeOffset.Now,
             planType,
-            primary,
-            secondary,
-            source);
+            windows[0],
+            windows.Count > 1 ? windows[1] : null,
+            source,
+            windows.Count > 2 ? windows.Skip(2).ToArray() : null);
     }
 
     private static bool TryGetCodexRateLimits(JsonElement result, out JsonElement rateLimits)
@@ -229,21 +229,133 @@ public sealed class CodexUsageReader
         return false;
     }
 
-    private static UsageWindow? ParseRpcWindow(JsonElement rateLimits, string propertyName)
+    private static IReadOnlyList<UsageWindow> ParseRpcWindows(JsonElement rateLimits)
     {
-        if (!rateLimits.TryGetProperty(propertyName, out var element) ||
-            element.ValueKind == JsonValueKind.Null ||
-            !element.TryGetProperty("usedPercent", out var usedPercentElement) ||
-            !element.TryGetProperty("windowDurationMins", out var windowMinutesElement) ||
-            !element.TryGetProperty("resetsAt", out var resetsAtElement))
+        var windows = new List<UsageWindow>();
+        foreach (var property in rateLimits.EnumerateObject())
+        {
+            if (property.Value.ValueKind == JsonValueKind.Object && ParseRpcWindow(property.Value) is { } window)
+            {
+                windows.Add(window);
+            }
+            else if (property.Value.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in property.Value.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.Object && ParseRpcWindow(item) is { } arrayWindow)
+                    {
+                        windows.Add(arrayWindow);
+                    }
+                }
+            }
+        }
+
+        return windows
+            .GroupBy(window => new { window.WindowMinutes, window.ResetsAt })
+            .Select(group => group.First())
+            .OrderBy(window => window.WindowMinutes)
+            .ThenBy(window => window.ResetsAt)
+            .ToArray();
+    }
+
+    private static UsageWindow? ParseRpcWindow(JsonElement element)
+    {
+        if (!TryReadDouble(element, ["usedPercent", "used_percent", "utilization"], out var usedPercent) ||
+            !TryReadInt32(element, ["windowDurationMins", "window_duration_mins", "windowMinutes", "window_minutes"], out var windowMinutes) ||
+            windowMinutes <= 0)
         {
             return null;
         }
 
-        return new UsageWindow(
-            usedPercentElement.GetDouble(),
-            windowMinutesElement.GetInt32(),
-            DateTimeOffset.FromUnixTimeSeconds(resetsAtElement.GetInt64()).ToLocalTime());
+        DateTimeOffset? resetsAt = null;
+        if (TryReadInt64(element, ["resetsAt", "resets_at"], out var resetSeconds))
+        {
+            try
+            {
+                resetsAt = DateTimeOffset.FromUnixTimeSeconds(resetSeconds).ToLocalTime();
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                // Keep the otherwise valid window and show an unknown reset time.
+            }
+        }
+
+        return new UsageWindow(Math.Clamp(usedPercent, 0, 100), windowMinutes, resetsAt);
+    }
+
+    private static bool TryReadDouble(JsonElement element, IReadOnlyList<string> names, out double value)
+    {
+        foreach (var name in names)
+        {
+            if (!element.TryGetProperty(name, out var candidate))
+            {
+                continue;
+            }
+
+            if (candidate.ValueKind == JsonValueKind.Number && candidate.TryGetDouble(out value))
+            {
+                return true;
+            }
+
+            if (candidate.ValueKind == JsonValueKind.String &&
+                double.TryParse(candidate.GetString(), System.Globalization.CultureInfo.InvariantCulture, out value))
+            {
+                return true;
+            }
+        }
+
+        value = 0;
+        return false;
+    }
+
+    private static bool TryReadInt32(JsonElement element, IReadOnlyList<string> names, out int value)
+    {
+        foreach (var name in names)
+        {
+            if (!element.TryGetProperty(name, out var candidate))
+            {
+                continue;
+            }
+
+            if (candidate.ValueKind == JsonValueKind.Number && candidate.TryGetInt32(out value))
+            {
+                return true;
+            }
+
+            if (candidate.ValueKind == JsonValueKind.String &&
+                int.TryParse(candidate.GetString(), System.Globalization.CultureInfo.InvariantCulture, out value))
+            {
+                return true;
+            }
+        }
+
+        value = 0;
+        return false;
+    }
+
+    private static bool TryReadInt64(JsonElement element, IReadOnlyList<string> names, out long value)
+    {
+        foreach (var name in names)
+        {
+            if (!element.TryGetProperty(name, out var candidate))
+            {
+                continue;
+            }
+
+            if (candidate.ValueKind == JsonValueKind.Number && candidate.TryGetInt64(out value))
+            {
+                return true;
+            }
+
+            if (candidate.ValueKind == JsonValueKind.String &&
+                long.TryParse(candidate.GetString(), System.Globalization.CultureInfo.InvariantCulture, out value))
+            {
+                return true;
+            }
+        }
+
+        value = 0;
+        return false;
     }
 
     private static string? ResolveCodexExecutable(string? explicitPath)

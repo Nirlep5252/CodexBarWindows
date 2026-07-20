@@ -16,7 +16,33 @@ public sealed record ProviderUsageSnapshot(
     string Source,
     ProviderUsageWindow? Tertiary = null,
     ProviderUsageCost? Cost = null,
-    string? AccountEmail = null);
+    string? AccountEmail = null,
+    IReadOnlyList<ProviderUsageWindow>? AdditionalWindows = null)
+{
+    public IReadOnlyList<ProviderUsageWindow> Windows
+    {
+        get
+        {
+            var windows = new List<ProviderUsageWindow> { Primary };
+            if (Secondary is not null)
+            {
+                windows.Add(Secondary);
+            }
+
+            if (Tertiary is not null)
+            {
+                windows.Add(Tertiary);
+            }
+
+            if (AdditionalWindows is not null)
+            {
+                windows.AddRange(AdditionalWindows);
+            }
+
+            return windows;
+        }
+    }
+}
 
 public sealed record ProviderUsageWindow(
     string Title,

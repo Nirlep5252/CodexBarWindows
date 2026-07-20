@@ -5,12 +5,33 @@ public sealed record CodexRateLimitSnapshot(
     string? PlanType,
     UsageWindow Primary,
     UsageWindow? Secondary,
-    string Source);
+    string Source,
+    IReadOnlyList<UsageWindow>? AdditionalWindows = null)
+{
+    public IReadOnlyList<UsageWindow> Windows
+    {
+        get
+        {
+            var windows = new List<UsageWindow> { Primary };
+            if (Secondary is not null)
+            {
+                windows.Add(Secondary);
+            }
+
+            if (AdditionalWindows is not null)
+            {
+                windows.AddRange(AdditionalWindows);
+            }
+
+            return windows;
+        }
+    }
+}
 
 public sealed record UsageWindow(
     double UsedPercent,
     int WindowMinutes,
-    DateTimeOffset ResetsAt)
+    DateTimeOffset? ResetsAt)
 {
     public double RemainingPercent => Math.Max(0, 100 - UsedPercent);
 }
@@ -43,7 +64,14 @@ public sealed record UsageLookupResult(CodexRateLimitSnapshot? Snapshot, string?
                         secondary.WindowMinutes,
                         secondary.ResetsAt)
                     : null,
-                snapshot.Source),
+                snapshot.Source,
+                AdditionalWindows: snapshot.AdditionalWindows?
+                    .Select(window => new ProviderUsageWindow(
+                        WindowTitle(window.WindowMinutes),
+                        window.UsedPercent,
+                        window.WindowMinutes,
+                        window.ResetsAt))
+                    .ToArray()),
             Error);
     }
 
