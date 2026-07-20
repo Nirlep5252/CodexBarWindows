@@ -62,6 +62,9 @@ var tests = new (string Name, Action Run)[]
     ("Claude history dedupes streaming and subagent rows", ClaudeHistoryDedupesRows),
     ("Claude history reports incomplete cost for unknown models", ClaudeHistoryReportsIncompleteCost),
     ("Claude history is usable without Claude credentials", ClaudeHistoryDoesNotRequireCredentials),
+    ("Claude usage maps Fable from scoped limits", ClaudeUsageMapsScopedFableLimit),
+    ("Claude usage maps Fable from the legacy window", ClaudeUsageMapsLegacyFableLimit),
+    ("Claude usage omits Fable when Anthropic omits it", ClaudeUsageOmitsMissingFableLimit),
     ("Cursor usage keeps fractional percent fields", CursorUsageKeepsFractionalPercents),
     ("Cursor enterprise overall drives headline", CursorEnterpriseOverallDrivesHeadline),
     ("Cursor legacy request usage drives primary", CursorLegacyRequestsDrivePrimary),
@@ -532,6 +535,68 @@ static void ClaudeHistoryDoesNotRequireCredentials()
     var result = fixture.Read();
     Assert(result.Insights is not null, "history should be read from files only");
     AssertEqual(15L, Today(result).TotalTokens, "local tokens");
+}
+
+static void ClaudeUsageMapsScopedFableLimit()
+{
+    var usage = DeserializeClaudeUsage("""
+        {
+          "five_hour": { "utilization": 12.5, "resets_at": "2026-07-10T12:30:00Z" },
+          "seven_day": { "utilization": 34.5, "resets_at": "2026-07-13T12:30:00Z" },
+          "limits": [
+            {
+              "kind": "weekly_scoped",
+              "percent": 56.75,
+              "resets_at": "2026-07-13T12:30:00Z",
+              "scope": { "model": { "display_name": "Fable" } }
+            }
+          ]
+        }
+        """);
+
+    var snapshot = ClaudeUsageReader.MapUsage(usage, planLabel: "max");
+
+    Assert(snapshot.Tertiary is not null, "scoped Fable limit should be present");
+    AssertEqual("Fable 5 limit", snapshot.Tertiary!.Title, "Fable limit title");
+    AssertClose(56.75m, (decimal)snapshot.Tertiary.UsedPercent, "Fable utilization");
+    AssertEqual(10080, snapshot.Tertiary.WindowMinutes, "Fable weekly window minutes");
+    Assert(snapshot.Tertiary.ResetsAt is not null, "Fable reset should be parsed");
+}
+
+static void ClaudeUsageMapsLegacyFableLimit()
+{
+    var usage = DeserializeClaudeUsage("""
+        {
+          "five_hour": { "utilization": 12.5 },
+          "seven_day": { "utilization": 34.5 },
+          "seven_day_overage_included": { "utilization": 78.25 }
+        }
+        """);
+
+    var snapshot = ClaudeUsageReader.MapUsage(usage, planLabel: "max");
+
+    Assert(snapshot.Tertiary is not null, "legacy Fable limit should be present");
+    AssertClose(78.25m, (decimal)snapshot.Tertiary!.UsedPercent, "legacy Fable utilization");
+}
+
+static void ClaudeUsageOmitsMissingFableLimit()
+{
+    var usage = DeserializeClaudeUsage("""
+        {
+          "five_hour": { "utilization": 12.5 },
+          "seven_day": { "utilization": 34.5 }
+        }
+        """);
+
+    var snapshot = ClaudeUsageReader.MapUsage(usage, planLabel: "max");
+
+    Assert(snapshot.Tertiary is null, "Fable limit should remain optional");
+}
+
+static ClaudeUsageReader.OAuthUsageResponse DeserializeClaudeUsage(string json)
+{
+    return JsonSerializer.Deserialize<ClaudeUsageReader.OAuthUsageResponse>(json)
+        ?? throw new InvalidOperationException("Claude usage response should deserialize");
 }
 
 static void CursorUsageKeepsFractionalPercents()

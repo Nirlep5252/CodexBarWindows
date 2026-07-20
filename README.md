@@ -13,7 +13,7 @@ CodexBarWindows stays in the system tray. Left-click the tray icon to open a com
 - Shows loading state while usage limits are fetched.
 - Displays 5 hour and weekly usage windows for one or more Codex CLI accounts.
 - Shows Codex local history charts for estimated 30 day spend and model usage breakdowns from session logs.
-- Displays 5 hour and weekly usage windows for Claude Code when local Claude credentials are available.
+- Displays 5 hour and weekly usage windows for Claude Code, plus the Fable 5 limit when Anthropic provides it.
 - Displays Cursor Total, Auto, and API usage from cursor.com when a Cursor Cookie header is configured.
 - Follows the Windows light/dark system theme.
 - Draggable popup.

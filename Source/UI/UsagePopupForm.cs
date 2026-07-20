@@ -393,7 +393,8 @@ public sealed class UsagePopupForm : Form
     {
         var scale = DpiScale;
         var selectedProvider = GetProvider(selectedProviderKey);
-        var rowCount = selectedProvider.IsCursor ? 3 : 2;
+        var showTertiary = ShouldShowTertiary(selectedProvider);
+        var rowCount = showTertiary ? 3 : 2;
 
         var rowHeight = ScaleInt(UsageRowHeight, scale);
         var cardTop = ScaleInt(UsageCardTop, scale);
@@ -429,7 +430,7 @@ public sealed class UsagePopupForm : Form
         var cardWidth = usageCard.Width;
         fiveHourSection.Bounds = new Rectangle(0, 0, cardWidth, rowHeight);
         weeklySection.Bounds = new Rectangle(0, rowHeight, cardWidth, rowHeight);
-        tertiarySection.Visible = selectedProvider.IsCursor;
+        tertiarySection.Visible = showTertiary;
         tertiarySection.Bounds = new Rectangle(0, rowHeight * 2, cardWidth, rowHeight);
 
         statusLabel.Bounds = new Rectangle(
@@ -487,6 +488,7 @@ public sealed class UsagePopupForm : Form
 
         if (providerKey == selectedProviderKey)
         {
+            ApplyScaledLayout();
             RenderSelectedProvider();
         }
     }
@@ -507,8 +509,8 @@ public sealed class UsagePopupForm : Form
             planLabel.Text = $"Fetching {provider.Name} limits...";
             fiveHourSection.SetLoading(provider.IsCursor ? "Total" : "5 hour limit");
             weeklySection.SetLoading(provider.IsCursor ? "Auto" : "Weekly limit");
-            tertiarySection.SetLoading("API");
-            tertiarySection.Visible = provider.IsCursor;
+            tertiarySection.SetLoading(provider.IsCursor ? "API" : "Fable 5 limit");
+            tertiarySection.Visible = ShouldShowTertiary(provider);
             statusLabel.Text = provider.IsClaude
                 ? "Reading from Claude Code OAuth..."
                 : provider.IsCursor
@@ -538,7 +540,7 @@ public sealed class UsagePopupForm : Form
         }
 
         var provider = GetProvider(selectedProviderKey);
-        tertiarySection.Visible = provider.IsCursor;
+        tertiarySection.Visible = ShouldShowTertiary(provider);
         titleLabel.Text = $"{provider.Name} rate limits";
         var result = GetProviderUsage(selectedProviderKey);
 
@@ -549,7 +551,7 @@ public sealed class UsagePopupForm : Form
                 : $"Waiting for local {provider.Name} usage data";
             fiveHourSection.SetUnavailable(provider.IsCursor ? "Total" : "5 hour limit");
             weeklySection.SetUnavailable(provider.IsCursor ? "Auto" : "Weekly limit");
-            tertiarySection.SetUnavailable("API");
+            tertiarySection.SetUnavailable(provider.IsCursor ? "API" : "Fable 5 limit");
             statusLabel.Text = result.Error ?? "No usage data found.";
             return;
         }
@@ -570,7 +572,7 @@ public sealed class UsagePopupForm : Form
             weeklySection.SetUnavailable(provider.IsCursor ? "Auto" : snapshot.Primary.WindowMinutes == 10080 ? "5 hour limit" : "Weekly limit");
         }
 
-        if (provider.IsCursor)
+        if (provider.IsCursor || provider.IsClaude)
         {
             if (snapshot.Tertiary is { } tertiary)
             {
@@ -578,7 +580,7 @@ public sealed class UsagePopupForm : Form
             }
             else
             {
-                tertiarySection.SetUnavailable("API");
+                tertiarySection.SetUnavailable(provider.IsCursor ? "API" : "Fable 5 limit");
             }
         }
 
@@ -592,6 +594,12 @@ public sealed class UsagePopupForm : Form
         return usageByProvider.TryGetValue(providerKey, out var result)
             ? result
             : new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
+    }
+
+    private bool ShouldShowTertiary(ProviderDescriptor provider)
+    {
+        return provider.IsCursor ||
+            (provider.IsClaude && GetProviderUsage(provider.Key).Snapshot?.Tertiary is not null);
     }
 
     private ProviderDescriptor GetProvider(string providerKey)
