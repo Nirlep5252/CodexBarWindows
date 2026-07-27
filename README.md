@@ -12,6 +12,7 @@ CodexBarWindows stays in the system tray. Left-click the tray icon to open a com
 - Opens instantly and refreshes usage in the background.
 - Shows loading state while usage limits are fetched.
 - Dynamically displays every usage window returned for one or more Codex CLI accounts.
+- Shows banked Codex reset credits with their expiry, and can redeem one per account when a usage window is nearly exhausted.
 - Shows Codex local history charts for estimated 30 day spend and model usage breakdowns from session logs.
 - Displays 5 hour and weekly usage windows for Claude Code, plus the Fable 5 limit when Anthropic provides it.
 - Displays Cursor Total, Auto, and API usage from cursor.com when a Cursor Cookie header is configured.

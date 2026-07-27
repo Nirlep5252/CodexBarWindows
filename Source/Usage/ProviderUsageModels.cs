@@ -17,7 +17,10 @@ public sealed record ProviderUsageSnapshot(
     ProviderUsageWindow? Tertiary = null,
     ProviderUsageCost? Cost = null,
     string? AccountEmail = null,
-    IReadOnlyList<ProviderUsageWindow>? AdditionalWindows = null)
+    IReadOnlyList<ProviderUsageWindow>? AdditionalWindows = null,
+    // Codex-only: no other provider banks redeemable window resets, so this stays a
+    // nullable provider-specific field rather than a shared abstraction.
+    CodexResetCredits? ResetCredits = null)
 {
     public IReadOnlyList<ProviderUsageWindow> Windows
     {

@@ -23,6 +23,37 @@ if (args.Contains("--scan-real-codex", StringComparer.OrdinalIgnoreCase))
     return;
 }
 
+if (args.Contains("--scan-real-reset-credits", StringComparer.OrdinalIgnoreCase))
+{
+    // Read-only: prints the banked reset inventory the popup renders from.
+    var result = new CodexUsageReader().ReadLatest();
+    Console.WriteLine($"error={result.Error ?? "<none>"}");
+    var credits = result.Snapshot?.ResetCredits;
+    Console.WriteLine($"hasResetCredits={credits is not null}");
+    if (credits is not null)
+    {
+        Console.WriteLine($"availableCount={credits.AvailableCount}");
+        Console.WriteLine($"redeemable={credits.AvailableByExpiry.Count}");
+        Console.WriteLine($"next={credits.NextExpiring?.Id ?? "<none>"} expires={credits.NextExpiring?.ExpiresAt?.ToString("u") ?? "<never>"}");
+        foreach (var credit in credits.Credits)
+        {
+            Console.WriteLine($"  {credit.Id} status={credit.Status} title={credit.DisplayTitle} expires={credit.ExpiresAt?.ToString("u") ?? "<never>"}");
+        }
+    }
+
+    return;
+}
+
+if (args.Contains("--probe-reset-rejection", StringComparer.OrdinalIgnoreCase))
+{
+    // Exercises the whole redeem path — spawn, handshake, request shape, outcome parsing —
+    // against an id that cannot exist, so no real credit can be spent.
+    var probe = new CodexResetCreditRedeemer("probe-account", null)
+        .Redeem("RateLimitResetCredit_definitely_not_real_probe");
+    Console.WriteLine($"outcome={probe.Outcome} error={probe.Error ?? "<none>"} changedUsage={probe.ChangedUsage}");
+    return;
+}
+
 if (args.Contains("--scan-real-claude", StringComparer.OrdinalIgnoreCase))
 {
     var result = new ClaudeUsageInsightsReader(null, refreshModelsDevPricing: false).ReadLatest();
@@ -51,6 +82,12 @@ var tests = new (string Name, Action Run)[]
     ("Codex limits reject an isolated conflicting window", CodexLimitsRejectIsolatedConflict),
     ("Codex limits accept a repeatedly confirmed replacement", CodexLimitsAcceptConfirmedReplacement),
     ("Codex limits retain the last snapshot on refresh failure", CodexLimitsRetainLastSnapshotOnFailure),
+    ("Codex limits accept a post-reset drop once invalidated", CodexLimitsAcceptPostResetDropOnceInvalidated),
+    ("Codex RPC parses banked reset credits", CodexRpcParsesBankedResetCredits),
+    ("Codex reset credits fall back to the available count", CodexResetCreditsFallBackToAvailableCount),
+    ("Codex reset credits drop rows without a redeemable id", CodexResetCreditsDropRowsWithoutId),
+    ("Codex reset credits are absent on older CLI builds", CodexResetCreditsAbsentOnOlderCli),
+    ("Codex reset outcomes map every documented value", CodexResetOutcomesMapDocumentedValues),
     ("Usage tooltip windows reflect their actual duration", UsageTooltipWindowsReflectDuration),
     ("Codex history aggregates token_count rows", CodexHistoryAggregatesTokenCountRows),
     ("Codex history prices gpt-5.6 at its published rates", CodexHistoryPricesGpt56AtPublishedRates),
@@ -271,6 +308,210 @@ static void CodexLimitsRetainLastSnapshotOnFailure()
 
     AssertEqual(80d, result.Snapshot?.Primary.UsedPercent ?? -1, "retained percent");
     Assert(result.Error?.Contains("RPC timeout", StringComparison.Ordinal) == true, "refresh failure warning");
+}
+
+static void CodexLimitsAcceptPostResetDropOnceInvalidated()
+{
+    var now = DateTimeOffset.Now;
+    var stabilizer = InitializedStabilizer(now, usedPercent: 98);
+
+    // A redeemed reset drops usage and moves the reset time, which is exactly the shape the
+    // stabilizer suppresses as a conflicting sample.
+    var later = now.AddMinutes(1);
+    var postReset = Success(CodexSnapshot(later, 0, later.AddHours(5), 0, later.AddDays(7)));
+    var suppressed = stabilizer.Stabilize([postReset], later);
+    AssertEqual(98d, suppressed.Snapshot?.Primary.UsedPercent ?? -1, "pre-invalidation percent");
+
+    stabilizer.InvalidateAcceptedSnapshot();
+    Assert(stabilizer.NeedsInitialConsensus, "invalidated stabilizer re-samples for consensus");
+
+    var accepted = stabilizer.Stabilize(
+        [
+            Success(CodexSnapshot(later, 0, later.AddHours(5), 0, later.AddDays(7))),
+            Success(CodexSnapshot(later.AddSeconds(1), 0, later.AddHours(5), 0, later.AddDays(7))),
+            Success(CodexSnapshot(later.AddSeconds(2), 0, later.AddHours(5), 0, later.AddDays(7)))
+        ],
+        later);
+
+    AssertEqual(0d, accepted.Snapshot?.Primary.UsedPercent ?? -1, "post-reset percent");
+    Assert(accepted.Error is null, $"unexpected post-reset warning: {accepted.Error}");
+}
+
+static void CodexRpcParsesBankedResetCredits()
+{
+    const string response = """
+        {
+          "id": 2,
+          "result": {
+            "rateLimitsByLimitId": {
+              "codex": {
+                "limitId": "codex",
+                "primary": { "usedPercent": 97, "windowDurationMins": 10080, "resetsAt": 1785675498 },
+                "planType": "prolite"
+              }
+            },
+            "rateLimitResetCredits": {
+              "availableCount": 3,
+              "credits": [
+                {
+                  "id": "RateLimitResetCredit_later",
+                  "resetType": "codexRateLimits",
+                  "status": "available",
+                  "grantedAt": 1783965917,
+                  "expiresAt": 1786557917,
+                  "title": "Full reset",
+                  "description": "You've been granted one free rate limit reset."
+                },
+                {
+                  "id": "RateLimitResetCredit_soonest",
+                  "resetType": "codexRateLimits",
+                  "status": "available",
+                  "grantedAt": 1782938127,
+                  "expiresAt": 1785530127,
+                  "title": "Full reset",
+                  "description": "You've been granted one free rate limit reset."
+                },
+                {
+                  "id": "RateLimitResetCredit_spent",
+                  "resetType": "codexRateLimits",
+                  "status": "redeemed",
+                  "grantedAt": 1781000000,
+                  "expiresAt": 1783000000,
+                  "title": "Full reset",
+                  "description": null
+                }
+              ]
+            }
+          }
+        }
+        """;
+
+    var snapshot = CodexUsageReader.ParseRpcSnapshot(response, "test")
+        ?? throw new InvalidOperationException("expected a parsed Codex snapshot");
+    var credits = snapshot.ResetCredits
+        ?? throw new InvalidOperationException("expected banked reset credits");
+
+    AssertEqual(3, credits.AvailableCount, "available reset count");
+    AssertEqual(3, credits.Credits.Count, "parsed reset detail rows");
+    AssertEqual(2, credits.AvailableByExpiry.Count, "redeemed credits are not redeemable");
+    AssertEqual("RateLimitResetCredit_soonest", credits.NextExpiring?.Id ?? "", "soonest-expiring credit wins");
+    AssertEqual("Full reset", credits.NextExpiring?.DisplayTitle ?? "", "credit display title");
+    Assert(credits.NextExpiring?.ExpiresAt is not null, "credit expiry is parsed");
+    Assert(credits.Find("RateLimitResetCredit_later") is not null, "credits are addressable by id");
+    Assert(credits.Find("RateLimitResetCredit_missing") is null, "unknown credit ids do not resolve");
+
+    var providerSnapshot = new UsageLookupResult(snapshot, null).ToProviderResult().Snapshot
+        ?? throw new InvalidOperationException("expected a provider snapshot");
+    AssertEqual(3, providerSnapshot.ResetCredits?.AvailableCount ?? -1, "credits reach the provider snapshot");
+}
+
+static void CodexResetCreditsFallBackToAvailableCount()
+{
+    // The backend may report only a count; there is then no id to redeem explicitly.
+    const string response = """
+        {
+          "id": 2,
+          "result": {
+            "rateLimitsByLimitId": {
+              "codex": {
+                "limitId": "codex",
+                "primary": { "usedPercent": 12, "windowDurationMins": 300, "resetsAt": 1785675498 }
+              }
+            },
+            "rateLimitResetCredits": { "availableCount": 2, "credits": null }
+          }
+        }
+        """;
+
+    var credits = CodexUsageReader.ParseRpcSnapshot(response, "test")?.ResetCredits
+        ?? throw new InvalidOperationException("expected banked reset credits");
+
+    AssertEqual(2, credits.AvailableCount, "count-only available resets");
+    AssertEqual(0, credits.Credits.Count, "count-only detail rows");
+    Assert(credits.HasAny, "count-only inventory still reports availability");
+    Assert(credits.NextExpiring is null, "count-only inventory offers no redeemable id");
+}
+
+static void CodexResetCreditsDropRowsWithoutId()
+{
+    const string response = """
+        {
+          "id": 2,
+          "result": {
+            "rateLimitsByLimitId": {
+              "codex": {
+                "limitId": "codex",
+                "primary": { "usedPercent": 99, "windowDurationMins": 300, "resetsAt": 1785675498 }
+              }
+            },
+            "rateLimitResetCredits": {
+              "availableCount": 2,
+              "credits": [
+                { "status": "available", "expiresAt": 1785530127, "title": "Full reset" },
+                { "id": "RateLimitResetCredit_ok", "status": "available", "expiresAt": 1786557917 }
+              ]
+            }
+          }
+        }
+        """;
+
+    var credits = CodexUsageReader.ParseRpcSnapshot(response, "test")?.ResetCredits
+        ?? throw new InvalidOperationException("expected banked reset credits");
+
+    AssertEqual(1, credits.Credits.Count, "rows without an id are unusable");
+    AssertEqual("RateLimitResetCredit_ok", credits.NextExpiring?.Id ?? "", "only addressable credits are offered");
+    AssertEqual(2, credits.AvailableCount, "backend count is preserved when rows are capped");
+}
+
+static void CodexResetCreditsAbsentOnOlderCli()
+{
+    const string response = """
+        {
+          "id": 2,
+          "result": {
+            "rateLimitsByLimitId": {
+              "codex": {
+                "limitId": "codex",
+                "primary": { "usedPercent": 42, "windowDurationMins": 300, "resetsAt": 1785675498 }
+              }
+            }
+          }
+        }
+        """;
+
+    var snapshot = CodexUsageReader.ParseRpcSnapshot(response, "test")
+        ?? throw new InvalidOperationException("expected a parsed Codex snapshot");
+
+    Assert(snapshot.ResetCredits is null, "a CLI without reset credits must not fabricate an inventory");
+}
+
+static void CodexResetOutcomesMapDocumentedValues()
+{
+    Assert(
+        CodexResetCreditRedeemer.ParseOutcome("""{"id":2,"result":{"outcome":"reset"}}""") == CodexResetOutcome.Reset,
+        "reset outcome");
+    Assert(
+        CodexResetCreditRedeemer.ParseOutcome("""{"id":2,"result":{"outcome":"nothingToReset"}}""") == CodexResetOutcome.NothingToReset,
+        "nothingToReset outcome");
+    Assert(
+        CodexResetCreditRedeemer.ParseOutcome("""{"id":2,"result":{"outcome":"noCredit"}}""") == CodexResetOutcome.NoCredit,
+        "noCredit outcome");
+    Assert(
+        CodexResetCreditRedeemer.ParseOutcome("""{"id":2,"result":{"outcome":"alreadyRedeemed"}}""") == CodexResetOutcome.AlreadyRedeemed,
+        "alreadyRedeemed outcome");
+
+    // Only a Reset actually moved the usage windows, so only it should trigger a re-read.
+    Assert(new CodexResetRedeemResult(CodexResetOutcome.Reset).ChangedUsage, "a reset changes usage");
+    Assert(!new CodexResetRedeemResult(CodexResetOutcome.NothingToReset).ChangedUsage, "nothingToReset leaves usage alone");
+    Assert(!new CodexResetRedeemResult(CodexResetOutcome.Failed, "boom").ChangedUsage, "a failure leaves usage alone");
+
+    // An unreadable reply must stay indefinite so the idempotency key is retained.
+    Assert(
+        CodexResetCreditRedeemer.ParseOutcome("""{"id":2,"result":{"outcome":"somethingNew"}}""") is null,
+        "unknown outcomes are not treated as definitive");
+    Assert(
+        CodexResetCreditRedeemer.ParseOutcome("""{"id":2,"result":{}}""") is null,
+        "a missing outcome is not treated as definitive");
 }
 
 static void UsageTooltipWindowsReflectDuration()

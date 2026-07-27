@@ -55,6 +55,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             }
         };
         popup.UsageGraphsRequested += (_, _) => ShowUsageGraphs();
+        popup.ResetCreditRedeemRequested += (_, request) => BeginResetCreditRedeem(request);
 
         refreshTimer.Interval = (int)TimeSpan.FromMinutes(1).TotalMilliseconds;
         refreshTimer.Tick += (_, _) => BeginRefresh(showLoading: false);
@@ -488,6 +489,65 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         checkForUpdatesItem.Enabled = !isChecking;
         checkForUpdatesItem.Text = isChecking ? "Checking for updates..." : "Check for updates";
+    }
+
+    /// <summary>
+    /// Spends one banked reset credit for the Codex account that owns <paramref name="request"/>.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not tied to <see cref="refreshCancellation"/>: a consume that has reached the
+    /// backend cannot be recalled, so cancelling it would only lose the outcome, not the charge.
+    /// </remarks>
+    private void BeginResetCreditRedeem(CodexResetRedeemRequest request)
+    {
+        var entry = codexCliEntries.FirstOrDefault(
+            candidate => UsagePopupForm.CodexProviderKey(candidate.Id) == request.ProviderKey);
+        if (entry is null)
+        {
+            popup.SetResetCreditMessage(request.ProviderKey, "That Codex account is no longer configured.");
+            return;
+        }
+
+        // The credit id came from this entry's own snapshot, and the redeemer runs this
+        // entry's own binary, so the charge cannot land on another configured account.
+        var redeemer = new CodexResetCreditRedeemer(entry.Id, entry.BinaryPath);
+        var creditId = request.Credit.Id;
+
+        _ = Task.Run(() => redeemer.Redeem(creditId)).ContinueWith(
+            task =>
+            {
+                var result = task.IsFaulted
+                    ? new CodexResetRedeemResult(
+                        CodexResetOutcome.Failed,
+                        task.Exception?.GetBaseException().Message)
+                    : task.Result;
+
+                uiContext.Post(
+                    _ =>
+                    {
+                        if (disposed)
+                        {
+                            return;
+                        }
+
+                        popup.SetResetCreditMessage(
+                            request.ProviderKey,
+                            CodexResetCreditRedeemer.DescribeOutcome(result),
+                            clearOnNextSnapshot: result.ChangedUsage);
+
+                        if (result.ChangedUsage &&
+                            codexStabilizers.TryGetValue(request.ProviderKey, out var stabilizer))
+                        {
+                            // Usage drops and the reset time moves, which the stabilizer reads
+                            // as a conflict; without this the pre-reset numbers would stick.
+                            stabilizer.InvalidateAcceptedSnapshot();
+                        }
+
+                        BeginRefresh(showLoading: false);
+                    },
+                    null);
+            },
+            TaskScheduler.Default);
     }
 
     private ProviderUsageLookupResult GetLatestUsage(string providerKey)

@@ -6,7 +6,8 @@ public sealed record CodexRateLimitSnapshot(
     UsageWindow Primary,
     UsageWindow? Secondary,
     string Source,
-    IReadOnlyList<UsageWindow>? AdditionalWindows = null)
+    IReadOnlyList<UsageWindow>? AdditionalWindows = null,
+    CodexResetCredits? ResetCredits = null)
 {
     public IReadOnlyList<UsageWindow> Windows
     {
@@ -71,7 +72,8 @@ public sealed record UsageLookupResult(CodexRateLimitSnapshot? Snapshot, string?
                         window.UsedPercent,
                         window.WindowMinutes,
                         window.ResetsAt))
-                    .ToArray()),
+                    .ToArray(),
+                ResetCredits: snapshot.ResetCredits),
             Error);
     }
 

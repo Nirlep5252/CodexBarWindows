@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Text.Json;
 
 namespace CodexBarWindows;
@@ -47,7 +46,7 @@ public sealed class CodexUsageReader
 
     private UsageLookupResult ReadLatestFromRpc()
     {
-        var resolvedCodexPath = ResolveCodexExecutable(codexPath);
+        var resolvedCodexPath = CodexAppServerSession.ResolveExecutable(codexPath);
         if (resolvedCodexPath is null)
         {
             return new UsageLookupResult(
@@ -57,24 +56,10 @@ public sealed class CodexUsageReader
                     : $"Codex CLI was not found: {codexPath}");
         }
 
-        Process? process = null;
         try
         {
-            process = StartCodexRpc(resolvedCodexPath);
-            process.ErrorDataReceived += (_, _) => { };
-            process.BeginErrorReadLine();
-
-            SendRpcRequest(
-                process,
-                1,
-                "initialize",
-                "\"params\":{\"clientInfo\":{\"name\":\"codexbarwindows\",\"version\":\"0.1.0\"}}");
-            _ = ReadRpcResponse(process, 1, RpcTimeout);
-            SendRpcNotification(process, "initialized");
-            SendRpcRequest(process, 2, "account/rateLimits/read");
-
-            var response = ReadRpcResponse(process, 2, RpcTimeout);
-            TryKill(process);
+            using var session = CodexAppServerSession.Start(resolvedCodexPath, RpcTimeout);
+            var response = session.Request("account/rateLimits/read");
 
             var snapshot = ParseRpcSnapshot(response, $"Codex CLI RPC ({resolvedCodexPath})");
             return snapshot is null
@@ -85,98 +70,6 @@ public sealed class CodexUsageReader
         {
             return new UsageLookupResult(null, $"Codex CLI RPC failed: {exception.Message}");
         }
-        finally
-        {
-            if (process is not null)
-            {
-                TryKill(process);
-                process.Dispose();
-            }
-        }
-    }
-
-    private static Process StartCodexRpc(string codexPath)
-    {
-        var process = new Process
-        {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName = codexPath,
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            }
-        };
-
-        process.StartInfo.ArgumentList.Add("-s");
-        process.StartInfo.ArgumentList.Add("read-only");
-        process.StartInfo.ArgumentList.Add("-a");
-        process.StartInfo.ArgumentList.Add("untrusted");
-        process.StartInfo.ArgumentList.Add("app-server");
-
-        if (!process.Start())
-        {
-            throw new InvalidOperationException("Could not start codex app-server.");
-        }
-
-        return process;
-    }
-
-    private static void SendRpcRequest(Process process, int id, string method, string? extraFields = null)
-    {
-        var payload = extraFields is null
-            ? $"{{\"id\":{id},\"method\":\"{method}\",\"params\":{{}}}}"
-            : $"{{\"id\":{id},\"method\":\"{method}\",{extraFields}}}";
-        process.StandardInput.WriteLine(payload);
-        process.StandardInput.Flush();
-    }
-
-    private static void SendRpcNotification(Process process, string method)
-    {
-        process.StandardInput.WriteLine($"{{\"method\":\"{method}\",\"params\":{{}}}}");
-        process.StandardInput.Flush();
-    }
-
-    private static string ReadRpcResponse(Process process, int expectedId, TimeSpan timeout)
-    {
-        var deadline = DateTimeOffset.UtcNow + timeout;
-
-        while (DateTimeOffset.UtcNow < deadline)
-        {
-            var remaining = deadline - DateTimeOffset.UtcNow;
-            var lineTask = process.StandardOutput.ReadLineAsync();
-            if (!lineTask.Wait(remaining))
-            {
-                break;
-            }
-
-            var line = lineTask.Result;
-            if (line is null)
-            {
-                throw new InvalidOperationException("codex app-server closed stdout.");
-            }
-
-            using var document = JsonDocument.Parse(line);
-            var root = document.RootElement;
-            if (!root.TryGetProperty("id", out var idElement) ||
-                idElement.ValueKind != JsonValueKind.Number ||
-                idElement.GetInt32() != expectedId)
-            {
-                continue;
-            }
-
-            if (root.TryGetProperty("error", out var error) &&
-                error.TryGetProperty("message", out var messageElement))
-            {
-                throw new InvalidOperationException(messageElement.GetString() ?? "Codex RPC request failed.");
-            }
-
-            return line;
-        }
-
-        throw new TimeoutException("Timed out waiting for codex app-server.");
     }
 
     internal static CodexRateLimitSnapshot? ParseRpcSnapshot(string json, string source)
@@ -204,7 +97,76 @@ public sealed class CodexUsageReader
             windows[0],
             windows.Count > 1 ? windows[1] : null,
             source,
-            windows.Count > 2 ? windows.Skip(2).ToArray() : null);
+            windows.Count > 2 ? windows.Skip(2).ToArray() : null,
+            ParseResetCredits(result));
+    }
+
+    /// <summary>
+    /// Reads the banked reset-credit inventory, which the app-server reports alongside
+    /// (not inside) the rate-limit buckets. Absent on older CLI builds.
+    /// </summary>
+    internal static CodexResetCredits? ParseResetCredits(JsonElement result)
+    {
+        if (!result.TryGetProperty("rateLimitResetCredits", out var summary) ||
+            summary.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        if (!TryReadInt32(summary, ["availableCount", "available_count"], out var availableCount))
+        {
+            availableCount = 0;
+        }
+
+        var credits = new List<CodexResetCredit>();
+        if (summary.TryGetProperty("credits", out var rows) && rows.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var row in rows.EnumerateArray())
+            {
+                if (row.ValueKind == JsonValueKind.Object && ParseResetCredit(row) is { } credit)
+                {
+                    credits.Add(credit);
+                }
+            }
+        }
+
+        return new CodexResetCredits(Math.Max(0, availableCount), credits);
+    }
+
+    private static CodexResetCredit? ParseResetCredit(JsonElement element)
+    {
+        if (!element.TryGetProperty("id", out var idElement) ||
+            idElement.GetString() is not { Length: > 0 } id)
+        {
+            // Without an opaque id the credit cannot be redeemed explicitly, and an
+            // implicit redeem could spend from the wrong account.
+            return null;
+        }
+
+        return new CodexResetCredit(
+            id,
+            element.TryGetProperty("status", out var status) ? status.GetString() : null,
+            ReadUnixSeconds(element, ["grantedAt", "granted_at"]),
+            ReadUnixSeconds(element, ["expiresAt", "expires_at"]),
+            element.TryGetProperty("title", out var title) ? title.GetString() : null,
+            element.TryGetProperty("description", out var description) ? description.GetString() : null);
+    }
+
+    private static DateTimeOffset? ReadUnixSeconds(JsonElement element, IReadOnlyList<string> names)
+    {
+        if (!TryReadInt64(element, names, out var seconds))
+        {
+            return null;
+        }
+
+        try
+        {
+            return DateTimeOffset.FromUnixTimeSeconds(seconds).ToLocalTime();
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return null;
+        }
     }
 
     private static bool TryGetCodexRateLimits(JsonElement result, out JsonElement rateLimits)
@@ -358,61 +320,4 @@ public sealed class CodexUsageReader
         return false;
     }
 
-    private static string? ResolveCodexExecutable(string? explicitPath)
-    {
-        if (!string.IsNullOrWhiteSpace(explicitPath) && File.Exists(explicitPath))
-        {
-            return explicitPath;
-        }
-
-        var environmentPath = Environment.GetEnvironmentVariable("CODEX_BINARY");
-        if (explicitPath is null && !string.IsNullOrWhiteSpace(environmentPath) && File.Exists(environmentPath))
-        {
-            return environmentPath;
-        }
-
-        var path = Environment.GetEnvironmentVariable("PATH");
-        if (string.IsNullOrWhiteSpace(path))
-        {
-            return null;
-        }
-
-        var candidateNames = OperatingSystem.IsWindows()
-            ? new[] { "codex.cmd", "codex.exe", "codex.bat", "codex" }
-            : new[] { "codex" };
-
-        foreach (var directory in path.Split(Path.PathSeparator))
-        {
-            if (string.IsNullOrWhiteSpace(directory))
-            {
-                continue;
-            }
-
-            foreach (var name in candidateNames)
-            {
-                var candidate = Path.Combine(directory.Trim('"'), name);
-                if (File.Exists(candidate))
-                {
-                    return candidate;
-                }
-            }
-        }
-
-        return null;
-    }
-
-    private static void TryKill(Process process)
-    {
-        try
-        {
-            if (!process.HasExited)
-            {
-                process.Kill(entireProcessTree: true);
-            }
-        }
-        catch
-        {
-            // Best effort cleanup for a short-lived local RPC process.
-        }
-    }
 }

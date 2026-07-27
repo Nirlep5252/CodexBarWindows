@@ -17,6 +17,17 @@ public sealed class UsagePopupForm : Form
     private const int CardGap = 8;
     private const int StatusHeight = 16;
     private const int BottomMargin = 12;
+    private const int ResetRowHeight = 56;
+
+    /// <summary>
+    /// Used-percent above which a reset clearly has something to reset. This only adapts the
+    /// wording — redeeming stays available at any usage, because whether a credit is worth
+    /// spending is the account holder's call, not ours.
+    /// </summary>
+    private const double ResetEligibleUsedPercent = 95;
+
+    /// <summary>Window within which an unspent credit is close enough to expiry to flag.</summary>
+    private static readonly TimeSpan ResetExpiryWarningWindow = TimeSpan.FromDays(2);
 
     private readonly Label titleLabel;
     private readonly List<ProviderTabButton> tabButtons = [];
@@ -26,6 +37,7 @@ public sealed class UsagePopupForm : Form
     private readonly Label statusLabel;
     private readonly UsageCardPanel usageCard;
     private readonly List<UsageSection> usageSections = [];
+    private readonly ResetCreditSection resetCreditRow;
     private readonly GlyphButton graphsButton;
     private readonly GlyphButton closeButton;
     private readonly List<Font> ownedFonts = [];
@@ -35,11 +47,21 @@ public sealed class UsagePopupForm : Form
     private bool backdropActive;
     private bool anchorToBottom = true;
     private string selectedProviderKey = CodexProviderKey("default");
+    // Keyed per Codex account: two accounts can each have a redeem in flight, and neither
+    // may drop the other's guard or overwrite its outcome.
+    private readonly HashSet<string> resetCreditBusyKeys = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (string Message, bool ClearOnNextSnapshot)> resetCreditMessages = new(StringComparer.Ordinal);
 
     public event EventHandler<string>? SelectedProviderChanged;
 
     /// <summary>Raised when the user clicks the header history button to open the usage graphs window.</summary>
     public event EventHandler? UsageGraphsRequested;
+
+    /// <summary>
+    /// Raised once the user has confirmed spending a specific banked reset credit on a
+    /// specific Codex account. Acting on this consumes a real, non-refundable credit.
+    /// </summary>
+    public event EventHandler<CodexResetRedeemRequest>? ResetCreditRedeemRequested;
 
     public UsagePopupForm()
     {
@@ -100,6 +122,13 @@ public sealed class UsagePopupForm : Form
 
         usageCard = new UsageCardPanel();
         EnsureUsageSectionCount(3);
+
+        // Lives inside the usage card as its final row, so the flyout stays one grouped
+        // surface instead of stacking a second card underneath the first.
+        resetCreditRow = new ResetCreditSection { Visible = false };
+        resetCreditRow.RedeemConfirmed += OnResetCreditConfirmed;
+        resetCreditRow.EnableDragMove();
+        usageCard.Controls.Add(resetCreditRow);
 
         statusLabel = new FluentLabel
         {
@@ -216,6 +245,11 @@ public sealed class UsagePopupForm : Form
             // animation timer keeps running behind an invisible window.
             entranceAnimation?.Dispose();
             entranceAnimation = null;
+
+            // A pending "spend this credit?" confirm must not be waiting one click away
+            // the next time the flyout opens, and last session's outcome notes are stale.
+            resetCreditRow.Reset();
+            resetCreditMessages.Clear();
         }
     }
 
@@ -388,8 +422,11 @@ public sealed class UsagePopupForm : Form
 
         var rowHeight = ScaleInt(UsageRowHeight, scale);
         var cardTop = ScaleInt(UsageCardTop, scale);
-        var cardHeight = rowHeight * rowCount;
         var gap = ScaleInt(CardGap, scale);
+        var showResetCredits = ShouldShowResetCredits(selectedProvider);
+        var usageHeight = rowHeight * rowCount;
+        var resetHeight = showResetCredits ? ScaleInt(ResetRowHeight, scale) : 0;
+        var cardHeight = usageHeight + resetHeight;
         var statusTop = cardTop + cardHeight + gap;
         var clientHeight = statusTop + ScaleInt(StatusHeight, scale) + ScaleInt(BottomMargin, scale);
 
@@ -424,6 +461,14 @@ public sealed class UsagePopupForm : Form
             section.Visible = index < rowCount;
             section.Bounds = new Rectangle(0, rowHeight * index, cardWidth, rowHeight);
             section.ApplyLayoutScale(scale);
+        }
+
+        resetCreditRow.Visible = showResetCredits;
+        if (showResetCredits)
+        {
+            resetCreditRow.ShowSeparator = rowCount > 0;
+            resetCreditRow.Bounds = new Rectangle(0, usageHeight, cardWidth, resetHeight);
+            resetCreditRow.ApplyLayoutScale(scale);
         }
 
         statusLabel.Bounds = new Rectangle(
@@ -476,6 +521,14 @@ public sealed class UsagePopupForm : Form
     {
         usageByProvider[providerKey] = result;
 
+        if (result.HasSnapshot &&
+            resetCreditMessages.TryGetValue(providerKey, out var pending) &&
+            pending.ClearOnNextSnapshot)
+        {
+            // The post-reset numbers have landed; the row's own inventory is now the report.
+            resetCreditMessages.Remove(providerKey);
+        }
+
         if (providerKey == selectedProviderKey)
         {
             ApplyScaledLayout();
@@ -518,6 +571,7 @@ public sealed class UsagePopupForm : Form
         }
 
         selectedProviderKey = providerKey;
+        resetCreditRow.Reset();
         ApplyScaledLayout();
         RenderSelectedProvider();
         SelectedProviderChanged?.Invoke(this, providerKey);
@@ -533,6 +587,7 @@ public sealed class UsagePopupForm : Form
         var provider = GetProvider(selectedProviderKey);
         titleLabel.Text = $"{provider.Name} rate limits";
         var result = GetProviderUsage(selectedProviderKey);
+        RenderResetCredits(provider);
 
         if (result.Snapshot is not { } snapshot)
         {
@@ -570,6 +625,101 @@ public sealed class UsagePopupForm : Form
         return usageByProvider.TryGetValue(providerKey, out var result)
             ? result
             : new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
+    }
+
+    /// <summary>
+    /// Marks a Codex account's reset redemption as in flight, so its row stays visible and
+    /// non-interactive across the refreshes the redeem triggers.
+    /// </summary>
+    public void SetResetCreditBusy(string providerKey)
+    {
+        resetCreditBusyKeys.Add(providerKey);
+        resetCreditMessages.Remove(providerKey);
+        ApplyScaledLayout();
+        RenderSelectedProvider();
+    }
+
+    /// <summary>Reports the outcome of a finished redemption on the owning account's row.</summary>
+    /// <param name="clearOnNextSnapshot">
+    /// True when refreshed usage tells the story better than the message does — the case after a
+    /// reset actually lands. False keeps an explanation on screen that the numbers cannot give.
+    /// </param>
+    public void SetResetCreditMessage(string providerKey, string message, bool clearOnNextSnapshot = false)
+    {
+        resetCreditBusyKeys.Remove(providerKey);
+        resetCreditMessages[providerKey] = (message, clearOnNextSnapshot);
+        ApplyScaledLayout();
+        RenderSelectedProvider();
+    }
+
+    private CodexResetCredits? GetResetCredits(string providerKey)
+    {
+        return GetProviderUsage(providerKey).Snapshot?.ResetCredits;
+    }
+
+    private bool ShouldShowResetCredits(ProviderDescriptor provider)
+    {
+        if (provider.Provider != UsageProvider.Codex)
+        {
+            return false;
+        }
+
+        return resetCreditBusyKeys.Contains(provider.Key) ||
+               resetCreditMessages.ContainsKey(provider.Key) ||
+               GetResetCredits(provider.Key) is { HasAny: true };
+    }
+
+    private void RenderResetCredits(ProviderDescriptor provider)
+    {
+        if (!ShouldShowResetCredits(provider))
+        {
+            return;
+        }
+
+        if (resetCreditBusyKeys.Contains(provider.Key))
+        {
+            resetCreditRow.ShowBusy();
+            return;
+        }
+
+        var credits = GetResetCredits(provider.Key) ?? CodexResetCredits.None;
+        var message = resetCreditMessages.TryGetValue(provider.Key, out var pending)
+            ? pending.Message
+            : null;
+
+        resetCreditRow.ShowInventory(credits, IsNearLimit(provider.Key), message);
+    }
+
+    /// <summary>
+    /// Whether any usage window is close enough to exhaustion for a reset to have something
+    /// to reset. Every window matters: the weekly cap blocks work just as the 5 hour one does.
+    /// </summary>
+    private bool IsNearLimit(string providerKey)
+    {
+        return GetProviderUsage(providerKey).Snapshot is { } snapshot &&
+               snapshot.Windows.Any(window => window.UsedPercent >= ResetEligibleUsedPercent);
+    }
+
+    private void OnResetCreditConfirmed(object? sender, CodexResetCredit credit)
+    {
+        var providerKey = selectedProviderKey;
+
+        if (resetCreditBusyKeys.Contains(providerKey))
+        {
+            return;
+        }
+
+        // Re-check against the snapshot the row was rendered from: a refresh may have landed
+        // between render and confirm, and the credit must belong to the account being charged.
+        if (GetProvider(providerKey).Provider != UsageProvider.Codex ||
+            GetResetCredits(providerKey)?.Find(credit.Id) is null)
+        {
+            SetResetCreditMessage(providerKey, "That reset is no longer available. Refreshing…");
+            return;
+        }
+
+        SetResetCreditBusy(providerKey);
+        ResetCreditRedeemRequested?.Invoke(this, new CodexResetRedeemRequest(providerKey, credit));
     }
 
     private int GetUsageRowCount(ProviderDescriptor provider)
@@ -784,6 +934,8 @@ public sealed class UsagePopupForm : Form
         {
             section.ApplyTheme(tokens);
         }
+
+        resetCreditRow.ApplyTheme(tokens);
 
         if (IsHandleCreated)
         {
@@ -1183,6 +1335,542 @@ public sealed class UsagePopupForm : Form
                 line3Top,
                 Math.Max(ScaleInt(120, layoutScale), (Width / 2) - pad),
                 line3Height);
+        }
+    }
+
+    /// <summary>
+    /// The banked-reset row, rendered as the usage card's final row: an accent count badge and
+    /// inventory on the left, the redeem action on the right. Spending a credit is irreversible,
+    /// so the action always takes a second deliberate click through an inline confirm — a modal
+    /// would blur the popup and dismiss it.
+    /// </summary>
+    private sealed class ResetCreditSection : Panel
+    {
+        private readonly Label titleLabel;
+        private readonly Label detailLabel;
+        private readonly PillButton redeemButton;
+        private readonly PillButton confirmButton;
+        private readonly PillButton cancelButton;
+        private readonly Font strongFont = FluentTheme.BodyStrongFont(1f);
+        private readonly Font detailFont = FluentTheme.CaptionFont(1f);
+        private FluentTokens tokens = FluentTheme.Get(IsSystemDarkTheme(), onBackdrop: false);
+        private float layoutScale = 1f;
+        private CodexResetCredit? selectedCredit;
+        private CodexResetCredits inventory = CodexResetCredits.None;
+        private string? outcomeMessage;
+        private bool nearLimit;
+        private bool expiringSoon;
+        private bool confirming;
+        private bool busy;
+        private bool showSeparator;
+        private bool showBadge = true;
+
+        /// <summary>Raised only after the user confirms; the argument is the credit to spend.</summary>
+        public event EventHandler<CodexResetCredit>? RedeemConfirmed;
+
+        public ResetCreditSection()
+        {
+            BackColor = Color.Transparent;
+            DoubleBuffered = true;
+
+            titleLabel = new FluentLabel
+            {
+                AutoSize = false,
+                AutoEllipsis = true,
+                Font = strongFont
+            };
+
+            detailLabel = new FluentLabel
+            {
+                AutoSize = false,
+                AutoEllipsis = true,
+                Font = detailFont
+            };
+
+            // Neutral, not accent: this opens a confirm rather than committing, and a loud
+            // primary button next to an irreversible spend invites the click we do not want.
+            redeemButton = new PillButton("Use reset");
+            redeemButton.Click += (_, _) =>
+            {
+                if (selectedCredit is not null)
+                {
+                    confirming = true;
+                    UpdateContent();
+                }
+            };
+
+            confirmButton = new PillButton("Use it") { Accent = true, Visible = false };
+            confirmButton.Click += (_, _) =>
+            {
+                if (selectedCredit is { } credit)
+                {
+                    RedeemConfirmed?.Invoke(this, credit);
+                }
+            };
+
+            cancelButton = new PillButton("Cancel") { Visible = false };
+            cancelButton.Click += (_, _) =>
+            {
+                confirming = false;
+                UpdateContent();
+            };
+
+            Controls.Add(titleLabel);
+            Controls.Add(detailLabel);
+            Controls.Add(redeemButton);
+            Controls.Add(confirmButton);
+            Controls.Add(cancelButton);
+            ApplyTheme(tokens);
+        }
+
+        /// <summary>Drops any half-finished confirm, e.g. when the user switches account tabs.</summary>
+        public void Reset()
+        {
+            if (IsDisposed || !confirming)
+            {
+                return;
+            }
+
+            confirming = false;
+            UpdateContent();
+        }
+
+        /// <summary>
+        /// Lets the row's chrome drag the flyout like the rest of the popup. The buttons are
+        /// deliberately excluded so a click on them can never be swallowed by a drag.
+        /// </summary>
+        public void EnableDragMove()
+        {
+            HandleCreated += (_, _) =>
+            {
+                if (FindForm() is not UsagePopupForm popup)
+                {
+                    return;
+                }
+
+                popup.EnableDragMove(this);
+                popup.EnableDragMove(titleLabel);
+                popup.EnableDragMove(detailLabel);
+            };
+        }
+
+        /// <summary>Draws the same 1px separator the usage rows use along the row's top edge.</summary>
+        public bool ShowSeparator
+        {
+            get => showSeparator;
+            set
+            {
+                if (showSeparator == value)
+                {
+                    return;
+                }
+
+                showSeparator = value;
+                Invalidate();
+            }
+        }
+
+        public void ShowInventory(CodexResetCredits credits, bool isNearLimit, string? message)
+        {
+            var previous = selectedCredit;
+            busy = false;
+            inventory = credits;
+            nearLimit = isNearLimit;
+            outcomeMessage = message;
+            selectedCredit = credits.NextExpiring;
+            expiringSoon = selectedCredit?.ExpiresAt is { } expiry &&
+                           expiry - DateTimeOffset.Now <= ResetExpiryWarningWindow;
+
+            // A refresh that replaces the offered credit must not leave a confirm on screen
+            // naming one credit while a different one would actually be spent.
+            if (confirming && (selectedCredit is null || previous?.Id != selectedCredit.Id))
+            {
+                confirming = false;
+            }
+
+            UpdateContent();
+        }
+
+        public void ShowBusy()
+        {
+            confirming = false;
+            busy = true;
+            showBadge = false;
+            titleLabel.Text = "Applying reset…";
+            detailLabel.Text = "Asking Codex to redeem this credit";
+            detailLabel.ForeColor = tokens.TextSecondary;
+            redeemButton.Visible = false;
+            confirmButton.Visible = false;
+            cancelButton.Visible = false;
+            UpdateChildLayout();
+            Invalidate();
+        }
+
+        public void ApplyTheme(FluentTokens palette)
+        {
+            tokens = palette;
+
+            BackColor = Color.Transparent;
+            titleLabel.BackColor = Color.Transparent;
+            detailLabel.BackColor = Color.Transparent;
+            titleLabel.ForeColor = tokens.TextPrimary;
+
+            redeemButton.ApplyTheme(tokens);
+            confirmButton.ApplyTheme(tokens);
+            cancelButton.ApplyTheme(tokens);
+
+            // Re-derives the detail colour, which is warning-tinted in some states.
+            UpdateContent();
+            Invalidate(true);
+        }
+
+        public void ApplyLayoutScale(float scale)
+        {
+            layoutScale = Math.Max(1f, scale);
+            UpdateChildLayout();
+        }
+
+        private void UpdateContent()
+        {
+            if (busy)
+            {
+                // A refresh or theme change must not pull the in-flight state off screen.
+                ShowBusy();
+                return;
+            }
+
+            if (confirming && selectedCredit is { } pending)
+            {
+                showBadge = false;
+                titleLabel.Text = $"Use \"{pending.DisplayTitle}\"?";
+
+                // Below the eligibility mark the spend may reset nothing, which is the one
+                // thing worth saying at the moment of commitment.
+                detailLabel.Text = nearLimit
+                    ? "This can't be undone"
+                    : "Nothing's near a limit — may reset nothing";
+                detailLabel.ForeColor = nearLimit ? tokens.TextSecondary : tokens.Warning;
+
+                redeemButton.Visible = false;
+                confirmButton.Visible = true;
+                cancelButton.Visible = true;
+                UpdateChildLayout();
+                return;
+            }
+
+            showBadge = true;
+            titleLabel.Text = inventory.AvailableCount == 1 ? "reset available" : "resets available";
+            detailLabel.Text = outcomeMessage ?? DescribeInventory();
+            detailLabel.ForeColor = outcomeMessage is null && expiringSoon
+                ? tokens.Warning
+                : tokens.TextSecondary;
+
+            redeemButton.Visible = true;
+            confirmButton.Visible = false;
+            cancelButton.Visible = false;
+
+            // Spending below the eligibility mark is the account holder's call, so the only
+            // thing that can disable this is having no id to charge.
+            redeemButton.Enabled = selectedCredit is not null;
+            redeemButton.AccessibleDescription = "Spend one banked reset to clear this account's usage windows";
+            UpdateChildLayout();
+        }
+
+        private string DescribeInventory()
+        {
+            if (selectedCredit is null)
+            {
+                // Count without detail rows: there is no id to charge, so redeeming has to
+                // happen in the Codex CLI rather than here.
+                return "Redeem these from the Codex CLI";
+            }
+
+            return selectedCredit.ExpiresAt is { } expiry
+                ? $"Next expires {FormatExpiry(expiry)}"
+                : "These don't expire";
+        }
+
+        private static string FormatExpiry(DateTimeOffset expiresAt)
+        {
+            var remaining = expiresAt - DateTimeOffset.Now;
+            if (remaining.TotalSeconds <= 0)
+            {
+                return "now";
+            }
+
+            if (remaining.TotalDays >= 1)
+            {
+                return $"in {(int)remaining.TotalDays}d";
+            }
+
+            return remaining.TotalHours >= 1
+                ? $"in {(int)remaining.TotalHours}h"
+                : $"in {Math.Max(1, (int)Math.Ceiling(remaining.TotalMinutes))}m";
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                strongFont.Dispose();
+                detailFont.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+
+        protected override void OnSizeChanged(EventArgs e)
+        {
+            base.OnSizeChanged(e);
+            UpdateChildLayout();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+            if (showSeparator)
+            {
+                var strokeWidth = Math.Max(1f, layoutScale);
+                using var separatorPen = new Pen(tokens.CardStroke, strokeWidth);
+                var y = strokeWidth / 2f;
+                e.Graphics.DrawLine(separatorPen, strokeWidth, y, Width - strokeWidth, y);
+            }
+
+            if (showBadge && BadgeBounds() is { Width: > 0 } badge)
+            {
+                // A WinUI-style accent count badge: the one place a saturated colour reads as
+                // information rather than decoration, and it keeps the number off the button.
+                var fill = expiringSoon ? tokens.Warning : tokens.Accent;
+                using var badgeBrush = new SolidBrush(fill);
+                using var badgePath = FluentTheme.RoundedRect(badge, badge.Height / 2f);
+                e.Graphics.FillPath(badgeBrush, badgePath);
+
+                TextRenderer.DrawText(
+                    e.Graphics,
+                    BadgeText(),
+                    detailFont,
+                    badge,
+                    ContrastingTextOn(fill),
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            }
+
+            base.OnPaint(e);
+        }
+
+        /// <summary>Picks black or white text for a badge fill the user's accent may have made bright.</summary>
+        private static Color ContrastingTextOn(Color fill)
+        {
+            var luminance = ((0.2126f * fill.R) + (0.7152f * fill.G) + (0.0722f * fill.B)) / 255f;
+            return luminance > 0.6f ? Color.FromArgb(0xF2, 0, 0, 0) : Color.White;
+        }
+
+        private string BadgeText()
+        {
+            return inventory.AvailableCount > 99 ? "99+" : inventory.AvailableCount.ToString();
+        }
+
+        private Rectangle BadgeBounds()
+        {
+            if (!showBadge)
+            {
+                return Rectangle.Empty;
+            }
+
+            var height = ScaleInt(18, layoutScale);
+            var baseWidth = BadgeText().Length switch
+            {
+                <= 1 => 20,
+                2 => 26,
+                _ => 32
+            };
+
+            return new Rectangle(
+                ScaleInt(16, layoutScale),
+                ScaleInt(10, layoutScale),
+                ScaleInt(baseWidth, layoutScale),
+                height);
+        }
+
+        private void UpdateChildLayout()
+        {
+            var pad = ScaleInt(16, layoutScale);
+            var buttonHeight = ScaleInt(28, layoutScale);
+            var buttonTop = Math.Max(0, (Height - buttonHeight) / 2);
+            var buttonGap = ScaleInt(6, layoutScale);
+
+            var right = Width - pad;
+            if (confirmButton.Visible)
+            {
+                var cancelWidth = ScaleInt(62, layoutScale);
+                var confirmWidth = ScaleInt(58, layoutScale);
+                cancelButton.Bounds = new Rectangle(right - cancelWidth, buttonTop, cancelWidth, buttonHeight);
+                confirmButton.Bounds = new Rectangle(
+                    right - cancelWidth - buttonGap - confirmWidth,
+                    buttonTop,
+                    confirmWidth,
+                    buttonHeight);
+                right = confirmButton.Left;
+            }
+            else if (redeemButton.Visible)
+            {
+                var redeemWidth = ScaleInt(86, layoutScale);
+                redeemButton.Bounds = new Rectangle(right - redeemWidth, buttonTop, redeemWidth, buttonHeight);
+                right = redeemButton.Left;
+            }
+
+            var badge = BadgeBounds();
+            var textLeft = badge.Width > 0 ? badge.Right + ScaleInt(8, layoutScale) : pad;
+            var textWidth = Math.Max(ScaleInt(80, layoutScale), right - textLeft - ScaleInt(8, layoutScale));
+
+            titleLabel.Bounds = new Rectangle(textLeft, ScaleInt(10, layoutScale), textWidth, ScaleInt(18, layoutScale));
+            detailLabel.Bounds = new Rectangle(pad, ScaleInt(30, layoutScale), Math.Max(ScaleInt(80, layoutScale), right - pad - ScaleInt(8, layoutScale)), ScaleInt(16, layoutScale));
+            Invalidate();
+        }
+    }
+
+    /// <summary>Compact Fluent-styled text button used inside the reset-credit row.</summary>
+    private sealed class PillButton : Control
+    {
+        private readonly Font font = FluentTheme.CaptionFont(1f);
+        private FluentTokens tokens = FluentTheme.Get(IsSystemDarkTheme(), onBackdrop: false);
+        private bool hovering;
+        private bool pressing;
+
+        public PillButton(string text)
+        {
+            Text = text;
+            AccessibleName = text;
+            AccessibleRole = AccessibleRole.PushButton;
+            Cursor = Cursors.Hand;
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.OptimizedDoubleBuffer |
+                ControlStyles.ResizeRedraw |
+                ControlStyles.Selectable |
+                ControlStyles.SupportsTransparentBackColor |
+                ControlStyles.UserPaint,
+                true);
+            BackColor = Color.Transparent;
+        }
+
+        /// <summary>Draws as the accent (primary) button rather than a neutral one.</summary>
+        public bool Accent { get; init; }
+
+        public void ApplyTheme(FluentTokens palette)
+        {
+            tokens = palette;
+            Invalidate();
+        }
+
+        protected override void OnEnabledChanged(EventArgs e)
+        {
+            hovering = false;
+            pressing = false;
+            Cursor = Enabled ? Cursors.Hand : Cursors.Default;
+            Invalidate();
+            base.OnEnabledChanged(e);
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            hovering = true;
+            Invalidate();
+            base.OnMouseEnter(e);
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            hovering = false;
+            pressing = false;
+            Invalidate();
+            base.OnMouseLeave(e);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            pressing = true;
+            Invalidate();
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            pressing = false;
+            Invalidate();
+            base.OnMouseUp(e);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (Enabled && e.KeyCode is Keys.Enter or Keys.Space)
+            {
+                OnClick(EventArgs.Empty);
+                e.Handled = true;
+            }
+
+            base.OnKeyDown(e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+            var scale = DeviceDpi / 96f;
+            var strokeWidth = Math.Max(1f, scale);
+            var bounds = new RectangleF(
+                strokeWidth / 2f,
+                strokeWidth / 2f,
+                Width - strokeWidth,
+                Height - strokeWidth);
+            using var path = FluentTheme.RoundedRect(bounds, FluentTheme.ControlCornerRadius * scale);
+
+            var (fill, text) = ResolveColors();
+            using var fillBrush = new SolidBrush(fill);
+            e.Graphics.FillPath(fillBrush, path);
+
+            if (!Accent || !Enabled)
+            {
+                using var borderPen = new Pen(Enabled ? tokens.ControlStroke : tokens.ControlFillDisabled, strokeWidth);
+                e.Graphics.DrawPath(borderPen, path);
+            }
+
+            TextRenderer.DrawText(
+                e.Graphics,
+                Text,
+                font,
+                ClientRectangle,
+                text,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+        }
+
+        private (Color Fill, Color Text) ResolveColors()
+        {
+            if (!Enabled)
+            {
+                return (tokens.ControlFillDisabled, tokens.TextDisabled);
+            }
+
+            if (Accent)
+            {
+                var fill = pressing ? tokens.AccentPressed : hovering ? tokens.AccentHover : tokens.Accent;
+                return (fill, tokens.TextOnAccent);
+            }
+
+            var neutral = pressing
+                ? tokens.ControlFillPressed
+                : hovering ? tokens.ControlFillHover : tokens.ControlFill;
+            return (neutral, tokens.TextPrimary);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                font.Dispose();
+            }
+
+            base.Dispose(disposing);
         }
     }
 

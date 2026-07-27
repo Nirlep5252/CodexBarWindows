@@ -24,6 +24,22 @@ internal sealed class CodexRateLimitStabilizer
         }
     }
 
+    /// <summary>
+    /// Drops the accepted snapshot so the next read re-establishes consensus from scratch.
+    /// Required after redeeming a reset credit: usage drops and the reset time moves, which
+    /// <see cref="IsExpectedProgression"/> treats as a conflict and would otherwise suppress
+    /// for <see cref="RequiredConflictConfirmations"/> refreshes.
+    /// </summary>
+    public void InvalidateAcceptedSnapshot()
+    {
+        lock (sync)
+        {
+            accepted = null;
+            pendingConflict = null;
+            pendingConflictCount = 0;
+        }
+    }
+
     public UsageLookupResult Stabilize(IReadOnlyList<UsageLookupResult> samples, DateTimeOffset now)
     {
         lock (sync)
