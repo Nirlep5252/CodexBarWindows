@@ -53,6 +53,10 @@ var tests = new (string Name, Action Run)[]
     ("Codex limits retain the last snapshot on refresh failure", CodexLimitsRetainLastSnapshotOnFailure),
     ("Usage tooltip windows reflect their actual duration", UsageTooltipWindowsReflectDuration),
     ("Codex history aggregates token_count rows", CodexHistoryAggregatesTokenCountRows),
+    ("Codex history prices gpt-5.6 at its published rates", CodexHistoryPricesGpt56AtPublishedRates),
+    ("Codex history skips a replayed subagent prefix", CodexHistorySkipsReplayedSubagentPrefix),
+    ("Codex history ignores repeated cumulative snapshots", CodexHistoryIgnoresRepeatedCumulativeSnapshots),
+    ("Codex history suppresses an unowned copied prefix", CodexHistorySuppressesUnownedCopiedPrefix),
     ("Codex history counts premium token_count rows as fast", CodexHistoryCountsPremiumTokenCountRowsAsFast),
     ("Codex history treats prolite token_count rows as regular", CodexHistoryTreatsProliteTokenCountRowsAsRegular),
     ("Codex history counts priority service tier turns as fast", CodexHistoryCountsPriorityServiceTierTurnsAsFast),
@@ -354,6 +358,80 @@ static void CodexHistoryAggregatesTokenCountRows()
     AssertClose(0.002575m, today.EstimatedCostUsd, "regular codex estimated cost");
     AssertEqual(0m, today.FastEstimatedCostUsd, "regular codex fast cost");
     Assert(result.Error is null, $"unexpected warning: {result.Error}");
+}
+
+static void CodexHistoryPricesGpt56AtPublishedRates()
+{
+    using var fixture = new CodexFixture();
+    fixture.WriteSessionLog("session.jsonl", CodexTokenCountLine(
+        model: "gpt-5.6-sol",
+        input: 1000,
+        cacheRead: 100,
+        output: 20,
+        limitId: "codex"));
+
+    // 900 uncached input at $5/M, 100 cached at $0.50/M, 20 output at $30/M.
+    AssertClose(0.00515m, Today(fixture.Read()).EstimatedCostUsd, "gpt-5.6-sol must not borrow gpt-5 rates");
+
+    using var aliasFixture = new CodexFixture();
+    aliasFixture.WriteSessionLog("session.jsonl", CodexTokenCountLine(
+        model: "gpt-5.6",
+        input: 1000,
+        cacheRead: 100,
+        output: 20,
+        limitId: "codex"));
+
+    AssertClose(0.00515m, Today(aliasFixture.Read()).EstimatedCostUsd, "the bare gpt-5.6 alias routes to Sol");
+}
+
+static void CodexHistorySkipsReplayedSubagentPrefix()
+{
+    using var fixture = new CodexFixture();
+    fixture.WriteSessionLog(
+        "session.jsonl",
+        CodexSessionMetaLine("leaf-session", forkedFromId: "parent-session"),
+        CodexCumulativeTokenCountLine(totalInput: 1000, totalCached: 100, totalOutput: 20, lastInput: 1000, lastCached: 100, lastOutput: 20),
+        CodexSessionMetaLine("ancestor-session"),
+        CodexCumulativeTokenCountLine(totalInput: 6000, totalCached: 600, totalOutput: 120, lastInput: 5000, lastCached: 500, lastOutput: 100),
+        CodexTurnContextLine("gpt-5.4"),
+        CodexInterAgentTriggerLine(),
+        CodexCumulativeTokenCountLine(totalInput: 7000, totalCached: 700, totalOutput: 140, lastInput: 1000, lastCached: 100, lastOutput: 20));
+
+    var today = Today(fixture.Read());
+
+    AssertEqual(1000L, today.InputTokens, "only the turns after the owned-suffix boundary count");
+    AssertEqual(100L, today.CachedInputTokens, "replayed cached input must not be counted again");
+    AssertEqual(20L, today.OutputTokens, "replayed output must not be counted again");
+    AssertClose(0.002575m, today.EstimatedCostUsd, "replayed ancestor turns must not be billed");
+}
+
+static void CodexHistoryIgnoresRepeatedCumulativeSnapshots()
+{
+    using var fixture = new CodexFixture();
+    fixture.WriteSessionLog(
+        "session.jsonl",
+        CodexTurnContextLine("gpt-5.4"),
+        CodexCumulativeTokenCountLine(totalInput: 1000, totalCached: 100, totalOutput: 20, lastInput: 1000, lastCached: 100, lastOutput: 20),
+        CodexCumulativeTokenCountLine(totalInput: 1000, totalCached: 100, totalOutput: 20, lastInput: 1000, lastCached: 100, lastOutput: 20));
+
+    var today = Today(fixture.Read());
+
+    AssertEqual(1020L, today.TotalTokens, "an exact cumulative re-emission is a replay, not new usage");
+}
+
+static void CodexHistorySuppressesUnownedCopiedPrefix()
+{
+    using var fixture = new CodexFixture();
+    fixture.WriteSessionLog(
+        "session.jsonl",
+        CodexSessionMetaLine("leaf-session"),
+        CodexCumulativeTokenCountLine(totalInput: 1000, totalCached: 100, totalOutput: 20, lastInput: 1000, lastCached: 100, lastOutput: 20),
+        CodexSessionMetaLine("ancestor-session"),
+        CodexCumulativeTokenCountLine(totalInput: 6000, totalCached: 600, totalOutput: 120, lastInput: 5000, lastCached: 500, lastOutput: 100));
+
+    var result = fixture.Read();
+
+    AssertEqual(0L, result.Insights!.Last30DaysTokens, "a copied prefix with no owned turns belongs to the rollout it was copied from");
 }
 
 static void CodexHistoryCountsPremiumTokenCountRowsAsFast()
@@ -840,6 +918,80 @@ static string CodexTurnContextLine(string model, string? turnId = null)
         {
             turn_id = turnId,
             model
+        }
+    };
+
+    return JsonSerializer.Serialize(payload);
+}
+
+static string CodexSessionMetaLine(string sessionId, string? forkedFromId = null)
+{
+    var payload = new
+    {
+        timestamp = DateTimeOffset.Now.ToString("O", CultureInfo.InvariantCulture),
+        type = "session_meta",
+        payload = new
+        {
+            id = sessionId,
+            forked_from_id = forkedFromId
+        }
+    };
+
+    return JsonSerializer.Serialize(payload);
+}
+
+static string CodexInterAgentTriggerLine()
+{
+    var payload = new
+    {
+        timestamp = DateTimeOffset.Now.ToString("O", CultureInfo.InvariantCulture),
+        type = "inter_agent_communication_metadata",
+        payload = new
+        {
+            trigger_turn = true
+        }
+    };
+
+    return JsonSerializer.Serialize(payload);
+}
+
+static string CodexCumulativeTokenCountLine(
+    long totalInput,
+    long totalCached,
+    long totalOutput,
+    long lastInput,
+    long lastCached,
+    long lastOutput)
+{
+    var payload = new
+    {
+        timestamp = DateTimeOffset.Now.ToString("O", CultureInfo.InvariantCulture),
+        type = "event_msg",
+        payload = new
+        {
+            type = "token_count",
+            info = new
+            {
+                total_token_usage = new
+                {
+                    input_tokens = totalInput,
+                    cached_input_tokens = totalCached,
+                    output_tokens = totalOutput,
+                    total_tokens = totalInput + totalOutput
+                },
+                last_token_usage = new
+                {
+                    input_tokens = lastInput,
+                    cached_input_tokens = lastCached,
+                    output_tokens = lastOutput,
+                    total_tokens = lastInput + lastOutput
+                }
+            },
+            rate_limits = new
+            {
+                limit_id = "codex",
+                plan_type = "plus"
+            }
         }
     };
 
