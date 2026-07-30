@@ -41,6 +41,9 @@
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260710003" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.7175" />
     <PackageReference Include="H.NotifyIcon.WinUI" Version="2.4.1" />
+    <!-- SettingsCard / SettingsExpander: the idiomatic Windows 11 settings surface. Verified
+         to restore, compile AND run unpackaged against WindowsAppSDK 1.8 before it was adopted. -->
+    <PackageReference Include="CommunityToolkit.WinUI.Controls.SettingsControls" Version="8.2.251219" />
     <Manifest Include="$(ApplicationManifest)" />
   </ItemGroup>
 

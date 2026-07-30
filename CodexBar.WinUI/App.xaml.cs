@@ -23,7 +23,7 @@ public partial class App : Application
     private UsageRefreshService? usage;
     private TaskbarIcon? trayIcon;
     private FlyoutWindow? flyout;
-    private ToolWindow? settingsWindow;
+    private SettingsWindow? settingsWindow;
     private ToolWindow? graphsWindow;
     private MenuFlyoutItem? checkForUpdatesItem;
     private int updateCheckInProgress;
@@ -126,14 +126,18 @@ public partial class App : Application
 
     private void ShowSettings()
     {
-        settingsWindow = ShowToolWindow(
-            settingsWindow,
-            window => settingsWindow = window,
-            "Settings",
-            "Settings",
-            "The WinUI settings surface is built in a later phase. This window exists so the flyout's dismiss logic can be exercised against a real sibling window.",
-            widthDip: 520,
-            heightDip: 420);
+        if (settingsWindow is not null)
+        {
+            settingsWindow.ShowAndFocus();
+            return;
+        }
+
+        var window = new SettingsWindow(usage!);
+        settingsWindow = window;
+        window.Closed += (_, _) => settingsWindow = null;
+        // A sibling window losing focus is invisible to the flyout, so it re-arms the check.
+        window.ActivationChanged += (_, _) => flyout?.ReArmDismissCheck();
+        window.ShowAndFocus();
     }
 
     private void ShowGraphs()
@@ -281,6 +285,15 @@ public partial class App : Application
             showTimer.IsRepeating = false;
             showTimer.Tick += (_, _) => ShowFlyout();
             showTimer.Start();
+        }
+
+        if (Environment.GetEnvironmentVariable("CODEXBAR_WINUI_AUTOSETTINGS") == "1")
+        {
+            var settingsTimer = queue.CreateTimer();
+            settingsTimer.Interval = TimeSpan.FromSeconds(1.5);
+            settingsTimer.IsRepeating = false;
+            settingsTimer.Tick += (_, _) => ShowSettings();
+            settingsTimer.Start();
         }
 
         if (int.TryParse(Environment.GetEnvironmentVariable("CODEXBAR_WINUI_AUTOEXIT"), out var seconds) && seconds > 0)
