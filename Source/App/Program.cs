@@ -13,6 +13,8 @@ static class Program
         }
 
         ApplicationConfiguration.Initialize();
+        // Prime FluentTheme.VibesActive before any UI (including the tray icon) is created.
+        _ = UiSettings.Load();
         using var context = new TrayApplicationContext();
         instanceGuard.ActivationRequested += context.NotifyAlreadyRunning;
         Application.Run(context);

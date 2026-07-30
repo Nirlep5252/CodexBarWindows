@@ -20,6 +20,7 @@ public sealed class SettingsForm : Form
     private const string CursorGlyph = "\uE774";      // Globe
     private const string StartupGlyph = "\uE7E8";     // Power button
     private const string MaterialGlyph = "\uE771";    // Personalize
+    private const string VibesGlyph = "\uE945";       // Lightning bolt
 
     private readonly Font subtitleFont;
     private readonly Font bodyFont;
@@ -50,6 +51,8 @@ public sealed class SettingsForm : Form
     private Panel opacityPanel = null!;
     private FluentSlider opacitySlider = null!;
     private Label opacityValueLabel = null!;
+    private SettingsCard vibesCard = null!;
+    private FluentToggle vibesToggle = null!;
 
     private Label accountsTitleLabel = null!;
     private Label accountsCaptionLabel = null!;
@@ -252,7 +255,7 @@ public sealed class SettingsForm : Form
 
         opacitySlider = new FluentSlider(tokens)
         {
-            Enabled = uiSettings.Material != BackdropMaterial.Solid,
+            Enabled = uiSettings.EffectiveMaterial != BackdropMaterial.Solid,
             Location = new Point(0, 0),
             Maximum = 100,
             Minimum = 0,
@@ -287,12 +290,34 @@ public sealed class SettingsForm : Form
         opacityRow.ActionControl = opacityPanel;
         materialExpander.AddRow(opacityRow);
 
+        vibesToggle = new FluentToggle(tokens)
+        {
+            Checked = uiSettings.VibesEnabled,
+            Size = new Size(40, 20)
+        };
+
+        vibesCard = new SettingsCard(tokens)
+        {
+            Description = "V3 Code theme, animated meters, and little celebrations.",
+            Glyph = VibesGlyph,
+            Location = new Point(24, 278),
+            Size = new Size(532, 64),
+            Title = "Turn on the vibes"
+        };
+        vibesCard.ActionControl = vibesToggle;
+
+        // Vibes always rides the stock Acrylic backdrop: the material picker is inert while
+        // the toggle is on, but the tint opacity slider stays live so translucency remains
+        // adjustable.
+        materialCombo.Enabled = !uiSettings.VibesEnabled;
+
         // Subscribed after the initial values are set so construction never writes settings.
         themeCombo.SelectedIndexChanged += (_, _) => OnThemeSelectionChanged();
         materialCombo.SelectedIndexChanged += (_, _) => OnMaterialSelectionChanged();
         opacitySlider.ValueChanged += (_, _) => OnOpacityChanged();
+        vibesToggle.CheckedChanged += (_, _) => OnVibesToggled();
 
-        appearancePage.Controls.AddRange([appearanceTitleLabel, themeCard, materialExpander]);
+        appearancePage.Controls.AddRange([appearanceTitleLabel, themeCard, materialExpander, vibesCard]);
     }
 
     private void BuildAccountsPage()
@@ -454,6 +479,20 @@ public sealed class SettingsForm : Form
         uiSettings.Save();
     }
 
+    private void OnVibesToggled()
+    {
+        if (vibesToggle.Checked == uiSettings.VibesEnabled)
+        {
+            return;
+        }
+
+        uiSettings = uiSettings with { VibesEnabled = vibesToggle.Checked };
+        uiSettings.Save();
+        materialCombo.Enabled = !uiSettings.VibesEnabled;
+        opacitySlider.Enabled = uiSettings.EffectiveMaterial != BackdropMaterial.Solid;
+        ApplyThemeToTree();
+    }
+
     /// <summary>
     /// Re-resolves the token set from the current <see cref="UiSettings"/> and restyles the
     /// whole control tree in place (single pass; no controls are rebuilt).
@@ -486,6 +525,7 @@ public sealed class SettingsForm : Form
         versionCard.ApplyTheme(tokens);
         themeCard.ApplyTheme(tokens);
         materialExpander.ApplyTheme(tokens);
+        vibesCard.ApplyTheme(tokens);
         cursorCard.ApplyTheme(tokens);
 
         accountListBox.ApplyTheme(tokens);

@@ -5,7 +5,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly ClaudeUsageReader claudeUsageReader = new();
     private readonly CursorUsageReader cursorUsageReader = new();
     private readonly GitHubReleaseUpdater releaseUpdater = new();
-    private readonly Icon trayIcon = TrayIconFactory.Create();
+    private Icon trayIcon = TrayIconFactory.Create();
     private readonly NotifyIcon notifyIcon;
     private readonly UsagePopupForm popup = new();
     private SettingsForm? settingsForm;
@@ -55,6 +55,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             }
         };
         popup.UsageGraphsRequested += (_, _) => ShowUsageGraphs();
+        popup.SettingsRequested += (_, _) => ShowSettings();
         popup.ResetCreditRedeemRequested += (_, request) => BeginResetCreditRedeem(request);
         popup.VisibleChanged += (_, _) => UpdateRefreshTimerState();
 
@@ -68,7 +69,24 @@ public sealed class TrayApplicationContext : ApplicationContext
         updateTimer.Tick += (_, _) => BeginUpdateCheck();
         updateTimer.Start();
 
+        UiSettings.Changed += OnUiSettingsChanged;
+
         _ = Task.Delay(TimeSpan.FromSeconds(10)).ContinueWith(_ => BeginUpdateCheck(), TaskScheduler.Default);
+    }
+
+    private void OnUiSettingsChanged(object? sender, EventArgs e)
+    {
+        if (disposed)
+        {
+            return;
+        }
+
+        // The tray glyph is vibe-gradient-tinted while vibes are on; rebuild it so toggling
+        // the setting restyles the taskbar too.
+        var refreshed = TrayIconFactory.Create();
+        notifyIcon.Icon = refreshed;
+        trayIcon.Dispose();
+        trayIcon = refreshed;
     }
 
     protected override void Dispose(bool disposing)
@@ -76,6 +94,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         if (disposing)
         {
             disposed = true;
+            UiSettings.Changed -= OnUiSettingsChanged;
             refreshCancellation?.Cancel();
             refreshCancellation?.Dispose();
             refreshTimer.Dispose();

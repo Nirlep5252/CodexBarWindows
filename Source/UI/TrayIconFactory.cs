@@ -21,6 +21,10 @@ public static class TrayIconFactory
     {
         using var source = LoadOfficialLogoBitmap();
         using var iconBitmap = RenderIconBitmap(source, 64);
+        if (FluentTheme.VibesActive)
+        {
+            ApplyVibeGradient(iconBitmap);
+        }
 
         var handle = iconBitmap.GetHicon();
         try
@@ -34,8 +38,49 @@ public static class TrayIconFactory
         }
     }
 
+    /// <summary>
+    /// Recolors the rendered glyph with the vibe gradient, using each pixel's alpha as a mask
+    /// so the logo shape becomes a magenta-to-blue sweep.
+    /// </summary>
+    private static void ApplyVibeGradient(Bitmap bitmap)
+    {
+        for (var y = 0; y < bitmap.Height; y++)
+        {
+            for (var x = 0; x < bitmap.Width; x++)
+            {
+                var pixel = bitmap.GetPixel(x, y);
+                if (pixel.A == 0)
+                {
+                    continue;
+                }
+
+                var t = (x + y) / (float)(bitmap.Width + bitmap.Height - 2);
+                var tint = t < 0.5f
+                    ? Lerp(VibeTheme.GradientStart, VibeTheme.GradientMid, t * 2f)
+                    : Lerp(VibeTheme.GradientMid, VibeTheme.GradientEnd, (t - 0.5f) * 2f);
+                bitmap.SetPixel(x, y, Color.FromArgb(pixel.A, tint));
+            }
+        }
+    }
+
+    private static Color Lerp(Color from, Color to, float amount)
+    {
+        amount = Math.Clamp(amount, 0f, 1f);
+        return Color.FromArgb(
+            0xFF,
+            (int)(from.R + ((to.R - from.R) * amount)),
+            (int)(from.G + ((to.G - from.G) * amount)),
+            (int)(from.B + ((to.B - from.B) * amount)));
+    }
+
     private static Bitmap LoadOfficialLogoBitmap()
     {
+        if (FluentTheme.VibesActive && File.Exists(WhiteLogoPath))
+        {
+            // Vibes are always dark; the white glyph is the base for the gradient recolor.
+            return new Bitmap(WhiteLogoPath);
+        }
+
         var preferredPath = IsLightSystemTheme() ? BlackLogoPath : WhiteLogoPath;
         var fallbackPath = preferredPath == BlackLogoPath ? WhiteLogoPath : BlackLogoPath;
 

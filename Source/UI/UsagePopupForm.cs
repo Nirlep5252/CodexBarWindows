@@ -39,11 +39,18 @@ public sealed class UsagePopupForm : Form
     private readonly List<UsageSection> usageSections = [];
     private readonly ResetCreditSection resetCreditRow;
     private readonly GlyphButton graphsButton;
+    private readonly GlyphButton settingsButton;
     private readonly GlyphButton closeButton;
     private readonly List<Font> ownedFonts = [];
     private UiSettings uiSettings;
     private FluentTokens tokens;
     private IDisposable? entranceAnimation;
+    private IDisposable? entranceFade;
+    private IDisposable? paletteAnimation;
+    // Vibes only: the provider-identity palette currently on screen. During a provider
+    // switch this is a blend of the outgoing and incoming palettes; ConfigureProviders
+    // snaps it to the selected provider, so the Codex default here never survives long.
+    private ProviderVibe blendedVibe = VibeTheme.CodexVibe;
     private bool backdropActive;
     private bool anchorToBottom = true;
     private string selectedProviderKey = CodexProviderKey("default");
@@ -56,6 +63,9 @@ public sealed class UsagePopupForm : Form
 
     /// <summary>Raised when the user clicks the header history button to open the usage graphs window.</summary>
     public event EventHandler? UsageGraphsRequested;
+
+    /// <summary>Raised when the user clicks the header settings button.</summary>
+    public event EventHandler? SettingsRequested;
 
     /// <summary>
     /// Raised once the user has confirmed spending a specific banked reset credit on a
@@ -95,11 +105,16 @@ public sealed class UsagePopupForm : Form
             Anchor = AnchorStyles.Top | AnchorStyles.Right,
             TabIndex = 1
         };
-        graphsButton.Click += (_, _) =>
+        // The popup stays open on purpose so changes made in the graphs or settings windows
+        // can be watched live side by side.
+        graphsButton.Click += (_, _) => UsageGraphsRequested?.Invoke(this, EventArgs.Empty);
+
+        settingsButton = new GlyphButton(FluentIcons.Settings, "Settings")
         {
-            Hide();
-            UsageGraphsRequested?.Invoke(this, EventArgs.Empty);
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            TabIndex = 2
         };
+        settingsButton.Click += (_, _) => SettingsRequested?.Invoke(this, EventArgs.Empty);
 
         titleLabel = new FluentLabel
         {
@@ -144,6 +159,7 @@ public sealed class UsagePopupForm : Form
         Controls.Add(usageCard);
         Controls.Add(statusLabel);
         Controls.Add(graphsButton);
+        Controls.Add(settingsButton);
         Controls.Add(closeButton);
 
         EnableDragMove(this);
@@ -152,7 +168,20 @@ public sealed class UsagePopupForm : Form
         EnableDragMove(statusLabel);
         EnableDragMove(usageCard);
 
-        Deactivate += (_, _) => Hide();
+        // Losing focus to another window of THIS process (settings, graphs, combo dropdown
+        // flyouts, slider thumbs...) keeps the popup open so changes can be watched live;
+        // losing focus to anything else dismisses it like a normal flyout. Form.ActiveForm is
+        // NOT usable here: combo dropdowns are top-level non-Form windows, so it reads null
+        // mid-interaction and would hide the popup while the user is changing settings. The
+        // foreground window's owning process is the reliable signal, checked after the
+        // activation change settles (hence BeginInvoke).
+        Deactivate += (_, _) => BeginInvoke(new Action(() =>
+        {
+            if (!IsDisposed && Visible && !ForegroundWindowBelongsToThisProcess())
+            {
+                Hide();
+            }
+        }));
         FormClosing += OnFormClosing;
         UiSettings.Changed += OnUiSettingsChanged;
 
@@ -208,6 +237,23 @@ public sealed class UsagePopupForm : Form
             Height - strokeWidth);
         using var path = FluentTheme.RoundedRect(borderRect, FluentTheme.OverlayCornerRadius * DpiScale);
         e.Graphics.DrawPath(borderPen, path);
+
+        if (FluentTheme.VibesActive)
+        {
+            // Signature-sweep hairline separating the header from the usage card.
+            var scale = DpiScale;
+            var hairline = new RectangleF(
+                ScaleInt(OuterMargin, scale),
+                ScaleInt(62, scale),
+                Width - (ScaleInt(OuterMargin, scale) * 2),
+                Math.Max(2f, 2f * scale));
+            using var hairlineBrush = new System.Drawing.Drawing2D.LinearGradientBrush(
+                RectangleF.Inflate(hairline, 1f, 0f),
+                VibeTheme.WithOpacity(blendedVibe.GradientStart, 0.6),
+                VibeTheme.WithOpacity(blendedVibe.GradientEnd, 0.6),
+                System.Drawing.Drawing2D.LinearGradientMode.Horizontal);
+            e.Graphics.FillRectangle(hairlineBrush, hairline);
+        }
     }
 
     protected override void OnPaintBackground(PaintEventArgs e)
@@ -245,6 +291,23 @@ public sealed class UsagePopupForm : Form
             // animation timer keeps running behind an invisible window.
             entranceAnimation?.Dispose();
             entranceAnimation = null;
+            entranceFade?.Dispose();
+            entranceFade = null;
+            if (paletteAnimation is not null)
+            {
+                // A palette tween mid-flight when the flyout hides must not keep ticking
+                // behind an invisible window; land on the selected provider's identity.
+                paletteAnimation.Dispose();
+                paletteAnimation = null;
+                SetBlendedVibe(VibeTheme.ForProvider(selectedProviderKey));
+            }
+
+            if (Opacity < 1d)
+            {
+                // Only the vibes fade ever lowers Opacity; hiding mid-fade must not leave
+                // the window translucent (or stuck layered) on its next open.
+                Opacity = 1d;
+            }
 
             // A pending "spend this credit?" confirm must not be waiting one click away
             // the next time the flyout opens, and last session's outcome notes are stale.
@@ -299,10 +362,35 @@ public sealed class UsagePopupForm : Form
                 }
             });
 
+        // Vibes only, and only on the solid-material path: fading Opacity makes the window
+        // layered, which would strip the DWM backdrop mid-show. Off-path stays untouched.
+        entranceFade?.Dispose();
+        entranceFade = null;
+        if (Visible && Opacity < 1d)
+        {
+            // A re-entrant show mid-fade must land fully opaque, not restart from zero.
+            Opacity = 1d;
+        }
+
+        if (FluentTheme.VibesActive && !Visible && uiSettings.EffectiveMaterial == BackdropMaterial.Solid)
+        {
+            entranceFade = FluentAnimator.Animate(
+                0d,
+                1d,
+                160,
+                opacity =>
+                {
+                    if (!IsDisposed)
+                    {
+                        Opacity = opacity;
+                    }
+                });
+        }
+
         Show();
         Activate();
 
-        if (uiSettings.Material != BackdropMaterial.Solid)
+        if (uiSettings.EffectiveMaterial != BackdropMaterial.Solid)
         {
             ApplyBackdropMaterial();
             NudgeSizeForBackdrop();
@@ -375,11 +463,25 @@ public sealed class UsagePopupForm : Form
         }
 
         uiSettings = UiSettings.Load();
-        ApplyBackdropMaterial();
+
+        // Re-attaching the DWM backdrop forces a visible recomposition (the window flashes
+        // solid, then glassy again), so it only happens when the effective material actually
+        // changed. Theme/tint/vibe changes repaint in place without touching the backdrop.
+        var materialChanged = appliedMaterial != uiSettings.EffectiveMaterial;
+        if (materialChanged)
+        {
+            ApplyBackdropMaterial();
+        }
+
         RefreshTheme(force: true);
         ApplyScaledLayout();
-        NudgeSizeForBackdrop();
+        if (materialChanged)
+        {
+            NudgeSizeForBackdrop();
+        }
     }
+
+    private BackdropMaterial? appliedMaterial;
 
     private void ApplyBackdropMaterial()
     {
@@ -388,7 +490,9 @@ public sealed class UsagePopupForm : Form
             return;
         }
 
-        if (uiSettings.Material == BackdropMaterial.Solid)
+        appliedMaterial = uiSettings.EffectiveMaterial;
+
+        if (uiSettings.EffectiveMaterial == BackdropMaterial.Solid)
         {
             // Solid keeps the DWM material off and paints an opaque themed body.
             WindowEffects.TryApplyBackdrop(Handle, SystemBackdrop.None);
@@ -396,7 +500,7 @@ public sealed class UsagePopupForm : Form
             return;
         }
 
-        var backdrop = uiSettings.Material switch
+        var backdrop = uiSettings.EffectiveMaterial switch
         {
             BackdropMaterial.Mica => SystemBackdrop.Mica,
             BackdropMaterial.MicaAlt => SystemBackdrop.Tabbed,
@@ -432,17 +536,22 @@ public sealed class UsagePopupForm : Form
 
         SuspendLayout();
 
-        var previousBottom = Top + Height;
         ClientSize = new Size(ScaleInt(BaseWidth, scale), clientHeight);
         if (Visible && IsHandleCreated && anchorToBottom)
         {
-            // Keep the flyout's bottom edge pinned to the taskbar anchor while
-            // expanding/collapsing content; it grows upward like system flyouts.
-            Top = previousBottom - Height;
+            // The top edge stays fixed while content expands/collapses from the bottom;
+            // CalculateLocation reserved room for the tallest provider, so growth normally
+            // cannot reach the taskbar. Shift up only if a live data change outgrows that.
+            var maxBottom = Screen.FromControl(this).WorkingArea.Bottom - 8;
+            if (Top + Height > maxBottom)
+            {
+                Top = maxBottom - Height;
+            }
         }
 
         closeButton.Bounds = ScaleRect(374, 14, 32, 32, scale);
-        graphsButton.Bounds = ScaleRect(338, 14, 32, 32, scale);
+        settingsButton.Bounds = ScaleRect(338, 14, 32, 32, scale);
+        graphsButton.Bounds = ScaleRect(302, 14, 32, 32, scale);
         var firstTabLeft = LayoutTabButtons(scale);
         var titleLeft = ScaleInt(OuterMargin, scale);
         var headerTextWidth = Math.Max(ScaleInt(140, scale), firstTabLeft - titleLeft - ScaleInt(8, scale));
@@ -519,6 +628,7 @@ public sealed class UsagePopupForm : Form
 
     public void UpdateUsage(string providerKey, ProviderUsageLookupResult result)
     {
+        var previousSnapshot = FluentTheme.VibesActive ? GetProviderUsage(providerKey).Snapshot : null;
         usageByProvider[providerKey] = result;
 
         if (result.HasSnapshot &&
@@ -533,6 +643,30 @@ public sealed class UsagePopupForm : Form
         {
             ApplyScaledLayout();
             RenderSelectedProvider();
+            CelebrateIfReset(previousSnapshot, result.Snapshot);
+        }
+    }
+
+    /// <summary>
+    /// Fires a sparkle burst on the primary meter when a fresh snapshot shows its window
+    /// dropping sharply — the signature of a rate-limit window reset landing. Vibes only,
+    /// and never on the first snapshot after opening: there is nothing to compare against.
+    /// </summary>
+    private void CelebrateIfReset(ProviderUsageSnapshot? previous, ProviderUsageSnapshot? current)
+    {
+        if (!FluentTheme.VibesActive || !Visible || previous is null || current is null)
+        {
+            return;
+        }
+
+        if (previous.Windows.Count == 0 || current.Windows.Count == 0 || usageSections.Count == 0)
+        {
+            return;
+        }
+
+        if (previous.Windows[0].UsedPercent - current.Windows[0].UsedPercent > 15d)
+        {
+            usageSections[0].Celebrate();
         }
     }
 
@@ -572,9 +706,96 @@ public sealed class UsagePopupForm : Form
 
         selectedProviderKey = providerKey;
         resetCreditRow.Reset();
+        TransitionVibePalette(providerKey);
         ApplyScaledLayout();
         RenderSelectedProvider();
+        ReplayVisibleMeters();
         SelectedProviderChanged?.Invoke(this, providerKey);
+    }
+
+    /// <summary>
+    /// Vibes only: glides the on-screen palette from wherever it currently sits to the new
+    /// provider's identity, retinting the hairline, tab indicators and percent labels each
+    /// tick. While the flyout is hidden there is nothing to glide, so the palette snaps.
+    /// </summary>
+    private void TransitionVibePalette(string providerKey)
+    {
+        if (!FluentTheme.VibesActive)
+        {
+            return;
+        }
+
+        paletteAnimation?.Dispose();
+        paletteAnimation = null;
+
+        var target = VibeTheme.ForProvider(providerKey);
+        if (target == blendedVibe)
+        {
+            return;
+        }
+
+        if (!Visible || !IsHandleCreated)
+        {
+            SetBlendedVibe(target);
+            return;
+        }
+
+        // A mid-flight restart tweens from the current blend, not the old provider,
+        // so rapid tab clicks glide instead of jumping back.
+        var from = blendedVibe;
+        paletteAnimation = FluentAnimator.Animate(
+            0d,
+            1d,
+            VibeTheme.PaletteTransitionMs,
+            amount =>
+            {
+                if (!IsDisposed)
+                {
+                    SetBlendedVibe(VibeTheme.Lerp(from, target, amount));
+                }
+            });
+    }
+
+    /// <summary>Applies the blended palette to every surface that renders it. Vibes only.</summary>
+    private void SetBlendedVibe(ProviderVibe vibe)
+    {
+        blendedVibe = vibe;
+
+        // The hairline is drawn by the form itself; tabs and sections invalidate themselves.
+        Invalidate();
+        foreach (var tabButton in tabButtons)
+        {
+            tabButton.VibeAccent = vibe.Accent;
+        }
+
+        // Lightened toward white for legibility: the raw accent is tuned for fills,
+        // and small percent digits need more contrast against the dark canvas.
+        var accentText = VibeTheme.LerpColor(vibe.Accent, Color.White, 0.25);
+        foreach (var section in usageSections)
+        {
+            section.SetVibeAccentText(accentText);
+        }
+    }
+
+    /// <summary>
+    /// Vibes only: re-grows the newly shown provider's meters from zero so the bars sweep
+    /// in wearing the incoming identity. Skipped while hidden — ReplayFromZero would start
+    /// timers nothing can see.
+    /// </summary>
+    private void ReplayVisibleMeters()
+    {
+        if (!FluentTheme.VibesActive || !Visible)
+        {
+            return;
+        }
+
+        foreach (var section in usageSections)
+        {
+            if (section.Visible)
+            {
+                section.ReplayMeter();
+            }
+        }
     }
 
     private void RenderSelectedProvider()
@@ -585,6 +806,17 @@ public sealed class UsagePopupForm : Form
         }
 
         var provider = GetProvider(selectedProviderKey);
+        if (FluentTheme.VibesActive)
+        {
+            // Meters wear the target identity outright (not the blend): they are only
+            // visible for the selected provider, so there is nothing to cross-fade from.
+            var vibe = VibeTheme.ForProvider(selectedProviderKey);
+            foreach (var section in usageSections)
+            {
+                section.SetVibePalette(vibe);
+            }
+        }
+
         titleLabel.Text = $"{provider.Name} rate limits";
         var result = GetProviderUsage(selectedProviderKey);
         RenderResetCredits(provider);
@@ -650,6 +882,14 @@ public sealed class UsagePopupForm : Form
         resetCreditMessages[providerKey] = (message, clearOnNextSnapshot);
         ApplyScaledLayout();
         RenderSelectedProvider();
+
+        // clearOnNextSnapshot is only true when a redeem genuinely landed, which makes it
+        // the one clean success signal worth a moment of celebration.
+        if (FluentTheme.VibesActive && clearOnNextSnapshot && Visible &&
+            providerKey == selectedProviderKey && resetCreditRow.Visible)
+        {
+            resetCreditRow.Celebrate();
+        }
     }
 
     private CodexResetCredits? GetResetCredits(string providerKey)
@@ -790,13 +1030,22 @@ public sealed class UsagePopupForm : Form
             selectedProviderKey = providers.FirstOrDefault()?.Key ?? CodexProviderKey("default");
         }
 
+        if (FluentTheme.VibesActive)
+        {
+            // The tab buttons were just recreated (and the selection may have moved), so
+            // snap — never animate — the palette onto the fresh chrome.
+            paletteAnimation?.Dispose();
+            paletteAnimation = null;
+            SetBlendedVibe(VibeTheme.ForProvider(selectedProviderKey));
+        }
+
         ApplyScaledLayout();
         RenderSelectedProvider();
     }
 
     private int LayoutTabButtons(float scale)
     {
-        var right = ScaleInt(330, scale);
+        var right = ScaleInt(294, scale);
         var width = ScaleInt(32, scale);
         var gap = ScaleInt(4, scale);
         var firstLeft = right;
@@ -809,6 +1058,7 @@ public sealed class UsagePopupForm : Form
         }
 
         graphsButton.BringToFront();
+        settingsButton.BringToFront();
         closeButton.BringToFront();
         return firstLeft;
     }
@@ -828,6 +1078,24 @@ public sealed class UsagePopupForm : Form
         public bool IsCursor => Provider == UsageProvider.Cursor;
     }
 
+    private static bool ForegroundWindowBelongsToThisProcess()
+    {
+        var foreground = GetForegroundWindow();
+        if (foreground == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        _ = GetWindowThreadProcessId(foreground, out var processId);
+        return processId == (uint)Environment.ProcessId;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
     private Point CalculateLocation(Point anchor)
     {
         var screen = Screen.FromPoint(anchor);
@@ -835,11 +1103,34 @@ public sealed class UsagePopupForm : Form
 
         var x = Math.Clamp(anchor.X - Width + 20, workingArea.Left + 8, workingArea.Right - Width - 8);
         anchorToBottom = anchor.Y >= workingArea.Top + (workingArea.Height / 2);
+        // Above the taskbar, place the top edge where the TALLEST provider layout fits, so
+        // switching tabs keeps the top fixed and only the bottom edge moves.
         var y = anchorToBottom
-            ? workingArea.Bottom - Height - 8
+            ? workingArea.Bottom - Math.Max(Height, PredictTallestWindowHeight()) - 8
             : workingArea.Top + 8;
 
         return new Point(x, y);
+    }
+
+    /// <summary>
+    /// Window height the flyout would need for its tallest configured provider, using the
+    /// same metrics as <see cref="ApplyScaledLayout"/>.
+    /// </summary>
+    private int PredictTallestWindowHeight()
+    {
+        var scale = DpiScale;
+        var nonClientHeight = Math.Max(0, Height - ClientSize.Height);
+        var tallestClient = ClientSize.Height;
+        foreach (var provider in providers)
+        {
+            var cardHeight = (ScaleInt(UsageRowHeight, scale) * GetUsageRowCount(provider)) +
+                (ShouldShowResetCredits(provider) ? ScaleInt(ResetRowHeight, scale) : 0);
+            var clientHeight = ScaleInt(UsageCardTop, scale) + cardHeight + ScaleInt(CardGap, scale) +
+                ScaleInt(StatusHeight, scale) + ScaleInt(BottomMargin, scale);
+            tallestClient = Math.Max(tallestClient, clientHeight);
+        }
+
+        return tallestClient + nonClientHeight;
     }
 
     private static string FormatObservedAt(DateTimeOffset observedAt)
@@ -923,6 +1214,7 @@ public sealed class UsagePopupForm : Form
         statusLabel.ForeColor = tokens.TextSecondary;
 
         graphsButton.ApplyTheme(tokens);
+        settingsButton.ApplyTheme(tokens);
         closeButton.ApplyTheme(tokens);
         foreach (var tabButton in tabButtons)
         {
@@ -979,6 +1271,10 @@ public sealed class UsagePopupForm : Form
         {
             entranceAnimation?.Dispose();
             entranceAnimation = null;
+            entranceFade?.Dispose();
+            entranceFade = null;
+            paletteAnimation?.Dispose();
+            paletteAnimation = null;
             foreach (var font in ownedFonts)
             {
                 font.Dispose();
@@ -1087,6 +1383,10 @@ public sealed class UsagePopupForm : Form
         private FluentTokens tokens = FluentTheme.Get(IsSystemDarkTheme(), onBackdrop: false);
         private float layoutScale = 1f;
         private bool showSeparator;
+        private SparkleField? sparkles;
+        private bool cascadingInvalidate;
+        private Color? vibeAccentText;
+        private double? lastUsedPercent;
 
         public UsageSection(string name)
         {
@@ -1199,7 +1499,7 @@ public sealed class UsagePopupForm : Form
             }
 
             nameLabel.ForeColor = tokens.TextPrimary;
-            percentLabel.ForeColor = tokens.AccentText;
+            percentLabel.ForeColor = ResolvePercentColor();
             remainingLabel.ForeColor = tokens.TextSecondary;
             resetLabel.ForeColor = tokens.TextSecondary;
 
@@ -1221,6 +1521,7 @@ public sealed class UsagePopupForm : Form
         {
             nameLabel.Text = title;
             percentLabel.Text = "--";
+            lastUsedPercent = null;
             meter.Value = 0;
             remainingLabel.Text = "-- remaining";
             resetLabel.Text = "Reset unknown";
@@ -1230,15 +1531,82 @@ public sealed class UsagePopupForm : Form
         {
             nameLabel.Text = title;
             percentLabel.Text = "…";
+            lastUsedPercent = null;
             meter.Value = 0;
             remainingLabel.Text = "Fetching usage…";
             resetLabel.Text = "Reset pending";
+        }
+
+        /// <summary>Vibes only: the provider-identity gradient the meter fills with.</summary>
+        public void SetVibePalette(ProviderVibe? palette)
+        {
+            meter.VibePalette = palette;
+        }
+
+        /// <summary>
+        /// Vibes only: retints the percent figure with the blended provider accent so the
+        /// number glides between identities alongside the rest of the chrome.
+        /// </summary>
+        public void SetVibeAccentText(Color? accent)
+        {
+            if (vibeAccentText == accent)
+            {
+                return;
+            }
+
+            vibeAccentText = accent;
+            percentLabel.ForeColor = ResolvePercentColor();
+        }
+
+        /// <summary>
+        /// Vibes: the number itself carries limit heat — amber from 70%, red from 90% — a cue
+        /// independent of the provider hue. Off: the stock accent text, untouched.
+        /// </summary>
+        private Color ResolvePercentColor()
+        {
+            if (!FluentTheme.VibesActive)
+            {
+                return tokens.AccentText;
+            }
+
+            return lastUsedPercent switch
+            {
+                { } percent when percent >= 90 => VibeTheme.HeatDanger,
+                { } percent when percent >= 70 => VibeTheme.HeatWarn,
+                _ => vibeAccentText ?? tokens.AccentText
+            };
+        }
+
+        /// <summary>Vibes only: re-grows the meter from zero (no-op when vibes are off).</summary>
+        public void ReplayMeter()
+        {
+            meter.ReplayFromZero();
+        }
+
+        /// <summary>Vibes-only sparkle burst at the meter's far end, e.g. when a window resets.</summary>
+        public void Celebrate()
+        {
+            if (!FluentTheme.VibesActive || !IsHandleCreated || !Visible)
+            {
+                return;
+            }
+
+            sparkles ??= new SparkleField(this);
+            sparkles.Burst(new PointF(
+                meter.Right - ScaleInt(12, layoutScale),
+                meter.Top + (meter.Height / 2f)));
         }
 
         public void SetUsage(ProviderUsageWindow usage)
         {
             nameLabel.Text = usage.Title;
             percentLabel.Text = $"{usage.UsedPercent:0.#}%";
+            lastUsedPercent = usage.UsedPercent;
+            if (FluentTheme.VibesActive)
+            {
+                percentLabel.ForeColor = ResolvePercentColor();
+            }
+
             meter.Value = usage.UsedPercent;
             remainingLabel.Text = $"{usage.RemainingPercent:0.#}% remaining";
             resetLabel.Text = usage.ResetsAt is { } resetAt
@@ -1276,6 +1644,31 @@ public sealed class UsagePopupForm : Form
             }
 
             base.OnPaint(e);
+            sparkles?.Render(e.Graphics);
+        }
+
+        protected override void OnInvalidated(InvalidateEventArgs e)
+        {
+            base.OnInvalidated(e);
+
+            // While sparkles animate over the row, the transparent child labels must
+            // repaint too or they hold stale particle frames. Their Invalidate bounces
+            // back here through the transparency simulation, hence the guard.
+            if (!cascadingInvalidate && sparkles is { IsActive: true })
+            {
+                cascadingInvalidate = true;
+                try
+                {
+                    foreach (Control child in Controls)
+                    {
+                        child.Invalidate();
+                    }
+                }
+                finally
+                {
+                    cascadingInvalidate = false;
+                }
+            }
         }
 
         protected override void OnSizeChanged(EventArgs e)
@@ -1290,6 +1683,8 @@ public sealed class UsagePopupForm : Form
             {
                 strongFont.Dispose();
                 detailFont.Dispose();
+                sparkles?.Dispose();
+                sparkles = null;
             }
 
             base.Dispose(disposing);
@@ -1364,6 +1759,8 @@ public sealed class UsagePopupForm : Form
         private bool busy;
         private bool showSeparator;
         private bool showBadge = true;
+        private SparkleField? sparkles;
+        private bool cascadingInvalidate;
 
         /// <summary>Raised only after the user confirms; the argument is the credit to spend.</summary>
         public event EventHandler<CodexResetCredit>? RedeemConfirmed;
@@ -1530,6 +1927,18 @@ public sealed class UsagePopupForm : Form
             UpdateChildLayout();
         }
 
+        /// <summary>Vibes-only sparkle burst over the row when a redeem genuinely lands.</summary>
+        public void Celebrate()
+        {
+            if (!FluentTheme.VibesActive || !IsHandleCreated || !Visible)
+            {
+                return;
+            }
+
+            sparkles ??= new SparkleField(this);
+            sparkles.Burst(new PointF(ScaleInt(40, layoutScale), Height / 2f));
+        }
+
         private void UpdateContent()
         {
             if (busy)
@@ -1614,6 +2023,8 @@ public sealed class UsagePopupForm : Form
             {
                 strongFont.Dispose();
                 detailFont.Dispose();
+                sparkles?.Dispose();
+                sparkles = null;
             }
 
             base.Dispose(disposing);
@@ -1623,6 +2034,29 @@ public sealed class UsagePopupForm : Form
         {
             base.OnSizeChanged(e);
             UpdateChildLayout();
+        }
+
+        protected override void OnInvalidated(InvalidateEventArgs e)
+        {
+            base.OnInvalidated(e);
+
+            // Same cascade the usage rows use: transparent children must repaint while
+            // sparkles animate, and their Invalidate bounces back here, hence the guard.
+            if (!cascadingInvalidate && sparkles is { IsActive: true })
+            {
+                cascadingInvalidate = true;
+                try
+                {
+                    foreach (Control child in Controls)
+                    {
+                        child.Invalidate();
+                    }
+                }
+                finally
+                {
+                    cascadingInvalidate = false;
+                }
+            }
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -1656,6 +2090,7 @@ public sealed class UsagePopupForm : Form
             }
 
             base.OnPaint(e);
+            sparkles?.Render(e.Graphics);
         }
 
         /// <summary>Picks black or white text for a badge fill the user's accent may have made bright.</summary>
@@ -1895,6 +2330,7 @@ public sealed class UsagePopupForm : Form
         private bool hovering;
         private bool pressing;
         private bool selected;
+        private Color? vibeAccent;
 
         public ProviderTabButton(string text, string providerKey, UsageProvider provider)
         {
@@ -1935,6 +2371,30 @@ public sealed class UsagePopupForm : Form
 
                 selected = value;
                 Invalidate();
+            }
+        }
+
+        /// <summary>
+        /// Vibes only: the blended provider accent for the selection indicator. The form
+        /// retints this every transition tick; unselected tabs never render it.
+        /// </summary>
+        [System.ComponentModel.Browsable(false)]
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public Color? VibeAccent
+        {
+            get => vibeAccent;
+            set
+            {
+                if (vibeAccent == value)
+                {
+                    return;
+                }
+
+                vibeAccent = value;
+                if (selected)
+                {
+                    Invalidate();
+                }
             }
         }
 
@@ -2052,7 +2512,8 @@ public sealed class UsagePopupForm : Form
                 Height - pillHeight - Math.Max(1, ScaleInt(2, dpiScale)),
                 pillWidth,
                 pillHeight);
-            using var pillBrush = new SolidBrush(tokens.Accent);
+            var pillColor = FluentTheme.VibesActive && vibeAccent is { } vibe ? vibe : tokens.Accent;
+            using var pillBrush = new SolidBrush(pillColor);
             using var pillPath = FluentTheme.RoundedRect(pillBounds, pillHeight / 2f);
             graphics.FillPath(pillBrush, pillPath);
         }

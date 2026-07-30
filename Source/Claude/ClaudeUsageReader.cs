@@ -15,6 +15,7 @@ public sealed class ClaudeUsageReader
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
     private readonly string credentialsPath;
     private ClaudeOAuthCredentials? memoryCredentials;
+    private DateTime memoryCredentialsWriteTimeUtc;
 
     public ClaudeUsageReader()
         : this(Path.Combine(
@@ -35,8 +36,21 @@ public sealed class ClaudeUsageReader
         {
             var credentials = await LoadCredentialsAsync(cancellationToken).ConfigureAwait(false);
             using var httpClient = CreateHttpClient();
-            var usage = await FetchUsageAsync(httpClient, credentials.AccessToken, cancellationToken)
-                .ConfigureAwait(false);
+            OAuthUsageResponse usage;
+            try
+            {
+                usage = await FetchUsageAsync(httpClient, credentials.AccessToken, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (ClaudeUnauthorizedException)
+            {
+                // A re-login revokes the old token without moving its local expiry, so a
+                // rejected token means the cache is stale: reload from disk and try once more.
+                memoryCredentials = null;
+                credentials = await LoadCredentialsAsync(cancellationToken).ConfigureAwait(false);
+                usage = await FetchUsageAsync(httpClient, credentials.AccessToken, cancellationToken)
+                    .ConfigureAwait(false);
+            }
 
             var snapshot = MapUsage(usage, PlanLabel(credentials));
             return new ProviderUsageLookupResult(snapshot, null);
@@ -49,7 +63,10 @@ public sealed class ClaudeUsageReader
 
     private async Task<ClaudeOAuthCredentials> LoadCredentialsAsync(CancellationToken cancellationToken)
     {
-        if (memoryCredentials is { } cached && !cached.IsExpired)
+        // A rewritten credentials file (fresh `claude login`) invalidates the memory cache even
+        // when the cached token has not reached its expiry: the login revoked it server-side.
+        var fileWriteTimeUtc = GetCredentialsWriteTimeUtc();
+        if (memoryCredentials is { } cached && !cached.IsExpired && fileWriteTimeUtc == memoryCredentialsWriteTimeUtc)
         {
             return cached;
         }
@@ -61,7 +78,20 @@ public sealed class ClaudeUsageReader
         }
 
         memoryCredentials = credentials;
+        memoryCredentialsWriteTimeUtc = fileWriteTimeUtc;
         return credentials;
+    }
+
+    private DateTime GetCredentialsWriteTimeUtc()
+    {
+        try
+        {
+            return File.GetLastWriteTimeUtc(credentialsPath);
+        }
+        catch
+        {
+            return default;
+        }
     }
 
     private ClaudeOAuthCredentials LoadCredentialsFromFile()
@@ -147,6 +177,12 @@ public sealed class ClaudeUsageReader
 
         using var response = await httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
         var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        if (response.StatusCode is System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.Forbidden)
+        {
+            throw new ClaudeUnauthorizedException(
+                $"Claude usage endpoint rejected the token: HTTP {(int)response.StatusCode}. Run `claude login` if this persists.");
+        }
+
         if (!response.IsSuccessStatusCode)
         {
             throw new InvalidOperationException(
@@ -156,6 +192,8 @@ public sealed class ClaudeUsageReader
         return JsonSerializer.Deserialize<OAuthUsageResponse>(body, JsonOptions())
             ?? throw new InvalidOperationException("Claude usage response was empty.");
     }
+
+    private sealed class ClaudeUnauthorizedException(string message) : Exception(message);
 
     internal static ProviderUsageSnapshot MapUsage(OAuthUsageResponse usage, string? planLabel)
     {

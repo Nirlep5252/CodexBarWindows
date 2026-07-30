@@ -17,6 +17,8 @@ public enum BackdropMaterial
     Solid
 }
 
+
+
 /// <summary>
 /// User-configurable appearance settings, persisted in HKCU\Software\CodexBarWindows.
 /// <see cref="Changed"/> is raised after every <see cref="Save"/> so open windows can
@@ -28,10 +30,23 @@ public sealed record UiSettings
     private const string ThemeValueName = "UiTheme";
     private const string MaterialValueName = "UiMaterial";
     private const string TintOpacityValueName = "UiTintOpacityPercent";
+    private const string VibesValueName = "UiVibes";
 
     public AppThemeMode Theme { get; init; } = AppThemeMode.System;
 
     public BackdropMaterial Material { get; init; } = BackdropMaterial.Acrylic;
+
+    /// <summary>
+    /// Opt-in "vibes" appearance: the V3 Code violet/magenta theme with celebratory motion.
+    /// When false the app renders exactly as it does without the feature.
+    /// </summary>
+    public bool VibesEnabled { get; init; }
+
+    /// <summary>
+    /// The backdrop material actually applied: vibes always rides the stock Acrylic backdrop
+    /// (the Material section is disabled while vibes are on).
+    /// </summary>
+    public BackdropMaterial EffectiveMaterial => VibesEnabled ? BackdropMaterial.Acrylic : Material;
 
     /// <summary>
     /// Strength of the theme-colored tint painted over the backdrop material.
@@ -43,6 +58,13 @@ public sealed record UiSettings
     public static event EventHandler? Changed;
 
     public static UiSettings Load()
+    {
+        var settings = LoadCore();
+        FluentTheme.VibesActive = settings.VibesEnabled;
+        return settings;
+    }
+
+    private static UiSettings LoadCore()
     {
         try
         {
@@ -66,11 +88,14 @@ public sealed record UiSettings
                 ? Math.Clamp(tintValue, 0, 100)
                 : 45;
 
+            var vibes = key.GetValue(VibesValueName) is int vibesValue && vibesValue != 0;
+
             return new UiSettings
             {
                 Theme = theme,
                 Material = material,
-                TintOpacityPercent = tint
+                TintOpacityPercent = tint,
+                VibesEnabled = vibes
             };
         }
         catch
@@ -87,13 +112,18 @@ public sealed record UiSettings
             key.SetValue(ThemeValueName, Theme.ToString(), RegistryValueKind.String);
             key.SetValue(MaterialValueName, Material.ToString(), RegistryValueKind.String);
             key.SetValue(TintOpacityValueName, Math.Clamp(TintOpacityPercent, 0, 100), RegistryValueKind.DWord);
+            key.SetValue(VibesValueName, VibesEnabled ? 1 : 0, RegistryValueKind.DWord);
         }
 
+        FluentTheme.VibesActive = VibesEnabled;
         Changed?.Invoke(this, EventArgs.Empty);
     }
 
-    /// <summary>Resolves the effective dark/light mode, honoring the System theme setting.</summary>
-    public bool ResolveIsDark() => Theme switch
+    /// <summary>
+    /// Resolves the effective dark/light mode, honoring the System theme setting.
+    /// The vibes appearance is inherently dark and overrides the theme choice while enabled.
+    /// </summary>
+    public bool ResolveIsDark() => VibesEnabled || Theme switch
     {
         AppThemeMode.Light => false,
         AppThemeMode.Dark => true,

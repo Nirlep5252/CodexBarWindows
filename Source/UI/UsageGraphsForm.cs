@@ -39,6 +39,8 @@ public sealed class UsageGraphsForm : Form
     private string selectedProviderKey = UsagePopupForm.CodexProviderKey("default");
     private float loadingPhase;
     private bool suppressComboEvents;
+    private ProviderVibe vibePalette = VibeTheme.SignatureVibe;
+    private IDisposable? vibeTransition;
 
     public event EventHandler<string>? SelectedProviderChanged;
 
@@ -104,6 +106,7 @@ public sealed class UsageGraphsForm : Form
 
         UiSettings.Changed += OnUiSettingsChanged;
 
+        SyncVibePalette(animate: false);
         ConfigureCodexEntries([]);
         ApplyTheme();
         LayoutContent();
@@ -142,6 +145,7 @@ public sealed class UsageGraphsForm : Form
         suppressComboEvents = false;
 
         selectedProviderKey = providerKeys[Math.Max(0, providerCombo.SelectedIndex)];
+        SyncVibePalette(animate: false);
         RenderSelected();
     }
 
@@ -251,6 +255,8 @@ public sealed class UsageGraphsForm : Form
         base.Dispose(disposing);
         if (disposing)
         {
+            vibeTransition?.Dispose();
+            vibeTransition = null;
             loadingTimer.Dispose();
             foreach (var font in ownedFonts)
             {
@@ -292,6 +298,13 @@ public sealed class UsageGraphsForm : Form
         }
 
         selectedProviderKey = providerKeys[index];
+        if (FluentTheme.VibesActive)
+        {
+            // Provider switch: collapse the old bars, glide the palette, regrow.
+            dailyChart.BeginVibeProviderSwitch();
+            SyncVibePalette(animate: true);
+        }
+
         RenderSelected();
         SelectedProviderChanged?.Invoke(this, selectedProviderKey);
     }
@@ -335,6 +348,60 @@ public sealed class UsageGraphsForm : Form
         monthCard.SetValue("--", string.Empty);
         dailyChart.SetData([], "No history yet");
         modelChart.SetData([], "No model breakdown yet");
+    }
+
+    /// <summary>
+    /// Vibes-only: retargets the blended provider palette at the selected provider's identity.
+    /// Animated switches glide over <see cref="VibeTheme.PaletteTransitionMs"/>; hidden windows
+    /// and programmatic reselects snap so no timer runs off-screen. A retarget mid-flight
+    /// restarts the tween from the current blend, so colors never jump.
+    /// </summary>
+    private void SyncVibePalette(bool animate)
+    {
+        if (!FluentTheme.VibesActive)
+        {
+            return;
+        }
+
+        var target = VibeTheme.ForProvider(selectedProviderKey);
+        if (target == vibePalette && vibeTransition is null)
+        {
+            return;
+        }
+
+        vibeTransition?.Dispose();
+        vibeTransition = null;
+
+        if (!animate || !Visible || !FluentAnimator.AnimationsEnabled)
+        {
+            vibePalette = target;
+            PushVibePalette();
+            return;
+        }
+
+        var from = vibePalette;
+        vibeTransition = FluentAnimator.Animate(
+            0d,
+            1d,
+            VibeTheme.PaletteTransitionMs,
+            value =>
+            {
+                vibePalette = VibeTheme.Lerp(from, target, value);
+                PushVibePalette();
+            },
+            completed: () => vibeTransition = null);
+    }
+
+    /// <summary>Hands the current blended palette to every vibe-painted surface.</summary>
+    private void PushVibePalette()
+    {
+        if (IsDisposed)
+        {
+            return;
+        }
+
+        dailyChart.VibePalette = vibePalette;
+        modelChart.VibePalette = vibePalette;
     }
 
     private ProviderUsageInsightsLookupResult GetHistory(string providerKey)
@@ -654,6 +721,7 @@ public sealed class UsageGraphsForm : Form
         using var borderPen = new Pen(tokens.CardStroke, strokeWidth);
         using var path = FluentTheme.RoundedRect(bounds, FluentTheme.CardCornerRadius * scale);
         graphics.FillPath(fillBrush, path);
+
         graphics.DrawPath(borderPen, path);
     }
 
@@ -888,6 +956,19 @@ public sealed class UsageGraphsForm : Form
         private string? lastToolTipText;
         private double animationProgress = 1d;
         private IDisposable? entranceAnimation;
+        private double vibeRevealProgress = 1d;
+        private IDisposable? vibeRevealAnimation;
+        private int vibeRevealedDataKey;
+        private SparkleField? sparkles;
+        private ProviderVibe vibePalette = VibeTheme.SignatureVibe;
+        private bool vibeForceReveal;
+        private bool vibeCollapsePending;
+        private IReadOnlyList<ProviderDailyUsage>? vibePendingData;
+        private string? vibePendingMessage;
+        private bool vibeHasPendingData;
+
+        /// <summary>Old bars collapse to the baseline over this before the new provider's grow.</summary>
+        private const int VibeCollapseDurationMs = 200;
 
         public DailySpendChart()
         {
@@ -914,6 +995,22 @@ public sealed class UsageGraphsForm : Form
             }
         }
 
+        /// <summary>Blended provider palette; the form retargets it on provider switches.</summary>
+        public ProviderVibe VibePalette
+        {
+            get => vibePalette;
+            set
+            {
+                if (vibePalette == value)
+                {
+                    return;
+                }
+
+                vibePalette = value;
+                Invalidate();
+            }
+        }
+
         public void ApplyTheme(FluentTokens palette)
         {
             tokens = palette;
@@ -927,16 +1024,56 @@ public sealed class UsageGraphsForm : Form
             daily = [];
             emptyMessage = null;
             ResetHover();
+            if (FluentTheme.VibesActive && vibeCollapsePending)
+            {
+                // The skeleton takes over; drop the collapse so its landing does not
+                // resurrect stale pending data over the loading state.
+                vibeRevealAnimation?.Dispose();
+                vibeRevealAnimation = null;
+                vibeCollapsePending = false;
+                vibeHasPendingData = false;
+                vibePendingData = null;
+                vibePendingMessage = null;
+                vibeRevealProgress = 1d;
+            }
+
             Invalidate();
         }
 
         public void SetData(IReadOnlyList<ProviderDailyUsage> data, string? message)
         {
+            if (FluentTheme.VibesActive && vibeCollapsePending)
+            {
+                // Old bars are still collapsing; park the new provider's data so the
+                // grow-reveal picks it up the moment the collapse lands.
+                vibePendingData = data;
+                vibePendingMessage = message;
+                vibeHasPendingData = true;
+                return;
+            }
+
             var hadData = !loading && daily.Count > 0;
             loading = false;
             daily = data;
             emptyMessage = message;
             ResetHover();
+
+            if (FluentTheme.VibesActive)
+            {
+                // Vibes replace the plain entrance with a staggered growth reveal,
+                // replayed only when the data identity actually changes.
+                animationProgress = 1d;
+                var key = VibeDataKey(data);
+                if (vibeForceReveal || key != vibeRevealedDataKey)
+                {
+                    vibeForceReveal = false;
+                    vibeRevealedDataKey = key;
+                    StartVibeReveal();
+                }
+
+                Invalidate();
+                return;
+            }
 
             // Animate only on first reveal (loading -> data); silent refreshes
             // while the window is open must not replay the entrance.
@@ -970,10 +1107,47 @@ public sealed class UsageGraphsForm : Form
             if (disposing)
             {
                 entranceAnimation?.Dispose();
+                vibeRevealAnimation?.Dispose();
+                sparkles?.Dispose();
                 toolTip.Dispose();
             }
 
             base.Dispose(disposing);
+        }
+
+        protected override void OnVisibleChanged(EventArgs e)
+        {
+            base.OnVisibleChanged(e);
+            if (!FluentTheme.VibesActive)
+            {
+                return;
+            }
+
+            if (Visible && !loading && daily.Count > 0)
+            {
+                StartVibeReveal();
+            }
+            else if (!Visible)
+            {
+                vibeRevealAnimation?.Dispose();
+                vibeRevealAnimation = null;
+                vibeRevealProgress = 1d;
+                if (vibeCollapsePending)
+                {
+                    // Disposing the collapse skips its completion callback; apply any
+                    // parked data now (snapped — no animation while hidden).
+                    vibeCollapsePending = false;
+                    if (vibeHasPendingData)
+                    {
+                        var pendingData = vibePendingData!;
+                        var pendingMessage = vibePendingMessage;
+                        vibeHasPendingData = false;
+                        vibePendingData = null;
+                        vibePendingMessage = null;
+                        SetData(pendingData, pendingMessage);
+                    }
+                }
+            }
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -1058,6 +1232,11 @@ public sealed class UsageGraphsForm : Form
             DrawGridAndAxis(graphics, plot, axisMax);
             DrawBars(graphics, plot, axisMax);
             DrawDateLabels(graphics, plot);
+
+            if (FluentTheme.VibesActive)
+            {
+                sparkles?.Render(graphics);
+            }
         }
 
         private void DrawLegend(Graphics graphics, int pad)
@@ -1084,9 +1263,14 @@ public sealed class UsageGraphsForm : Form
 
             var total = widths.Sum(item => item.Width) + (itemGap * (widths.Count - 1));
             var x = Width - pad - total;
+            var vibes = FluentTheme.VibesActive;
             for (var index = 0; index < categories.Count; index++)
             {
-                using var dotBrush = new SolidBrush(SpendCategoryColor(categories[index].Label, tokens));
+                // Vibes: legend dots sample the provider sweep so the whole card reads
+                // as one hue family; default keeps the semantic category colors.
+                using var dotBrush = new SolidBrush(vibes
+                    ? VibeTheme.SeriesColor(vibePalette, index, categories.Count)
+                    : SpendCategoryColor(categories[index].Label, tokens));
                 graphics.FillEllipse(dotBrush, x, y + ScaleInt(2, LayoutScale), dot, dot);
                 graphics.DrawString(widths[index].Label, SharedSmallCaptionFont, textBrush, x + dot + ScaleInt(5, LayoutScale), y);
                 x += widths[index].Width + itemGap;
@@ -1150,6 +1334,11 @@ public sealed class UsageGraphsForm : Form
             var topRadius = Math.Min(barWidth / 2f, 3f * LayoutScale);
             var minBarHeight = Math.Max(2, ScaleInt(2, LayoutScale));
             var progress = animationProgress;
+            var vibes = FluentTheme.VibesActive;
+
+            // Vibes: segments are colored by the legend's category order so dots and
+            // segments correspond exactly (same index/count fed to SeriesColor).
+            IReadOnlyList<ProviderSpendCategory> legendCategories = vibes ? TopSpendCategories(daily) : [];
 
             // Hovered slot highlight behind the bar, full plot height.
             if (hoveredIndex >= 0 && hoveredIndex < daily.Count)
@@ -1172,9 +1361,90 @@ public sealed class UsageGraphsForm : Form
 
                 var x = plot.Left + (index * slotWidth) + ((slotWidth - barWidth) / 2f);
                 var fullHeight = (int)Math.Round(plot.Height * (double)(day.EstimatedCostUsd / axisMax) * progress);
+                if (vibes)
+                {
+                    // Growth reveal with a subtle left-to-right cascade.
+                    var stagger = (double)index / daily.Count * 0.15;
+                    var grown = VibeTheme.EaseOutQuint(Math.Clamp((vibeRevealProgress * 1.15) - stagger, 0d, 1d));
+                    fullHeight = (int)Math.Round(plot.Height * (double)(day.EstimatedCostUsd / axisMax) * grown);
+                }
+
                 var totalHeight = Math.Clamp(fullHeight, minBarHeight, plot.Height);
                 var hovered = index == hoveredIndex;
+
                 var categories = DailySpendCategories(day).Where(category => category.EstimatedCostUsd > 0).ToArray();
+
+                if (vibes)
+                {
+                    var barRect = new RectangleF(x, plot.Bottom - totalHeight, barWidth, totalHeight);
+                    if (hovered)
+                    {
+                        // Soft glow behind the hovered bar, clipped to the baseline.
+                        var glow = RectangleF.Inflate(barRect, 3f * LayoutScale, 3f * LayoutScale);
+                        glow.Height = plot.Bottom - glow.Top;
+                        using var glowBrush = new SolidBrush(VibeTheme.WithOpacity(vibePalette.GradientMid, 0.25));
+                        using var glowPath = FluentTheme.RoundedRect(glow, topRadius + (3f * LayoutScale));
+                        graphics.FillPath(glowBrush, glowPath);
+                    }
+
+                    // Stacked per-category segments, colored by the legend's index/count
+                    // mapping so dots and segments correspond. The whole stack shares
+                    // totalHeight (already reveal-scaled), so it grows as one.
+                    var vibePainted = 0;
+                    for (var categoryIndex = 0; categoryIndex < categories.Length; categoryIndex++)
+                    {
+                        var height = categoryIndex == categories.Length - 1
+                            ? totalHeight - vibePainted
+                            : (int)Math.Round(totalHeight * (double)(categories[categoryIndex].EstimatedCostUsd / day.EstimatedCostUsd));
+                        height = Math.Clamp(height, 0, totalHeight - vibePainted);
+                        if (height <= 0)
+                        {
+                            continue;
+                        }
+
+                        var color = VibeSegmentColor(categories[categoryIndex].Label, categoryIndex, legendCategories);
+                        if (hovered)
+                        {
+                            color = FluentTheme.Lighten(color, 0.15f);
+                        }
+
+                        var segmentRect = new RectangleF(x, plot.Bottom - vibePainted - height, barWidth, height);
+                        // Subtle vertical shade inside each segment keeps the vibe polish
+                        // while the color steps mark the category boundaries. Inflate
+                        // vertically: LinearGradientBrush edge texels wrap when the path
+                        // touches the brush rectangle boundary.
+                        using var segmentBrush = new System.Drawing.Drawing2D.LinearGradientBrush(
+                            RectangleF.Inflate(segmentRect, 0f, 1f),
+                            color,
+                            FluentTheme.Darken(color, 0.12f),
+                            System.Drawing.Drawing2D.LinearGradientMode.Vertical);
+                        if (vibePainted + height >= totalHeight)
+                        {
+                            using var segmentPath = RoundedCornersPath(segmentRect, topRadius, topRadius, 0f, 0f);
+                            graphics.FillPath(segmentBrush, segmentPath);
+                        }
+                        else
+                        {
+                            graphics.FillRectangle(segmentBrush, segmentRect);
+                        }
+
+                        vibePainted += height;
+                    }
+
+                    if (categories.Length == 0)
+                    {
+                        // Cost without a category split: fall back to the plain palette bar.
+                        using var fallbackBrush = new System.Drawing.Drawing2D.LinearGradientBrush(
+                            RectangleF.Inflate(barRect, 0f, 1f),
+                            hovered ? FluentTheme.Lighten(vibePalette.GradientMid, 0.15f) : vibePalette.GradientMid,
+                            FluentTheme.Darken(vibePalette.GradientMid, 0.12f),
+                            System.Drawing.Drawing2D.LinearGradientMode.Vertical);
+                        using var fallbackPath = RoundedCornersPath(barRect, topRadius, topRadius, 0f, 0f);
+                        graphics.FillPath(fallbackBrush, fallbackPath);
+                    }
+
+                    continue;
+                }
 
                 if (categories.Length <= 1)
                 {
@@ -1237,6 +1507,25 @@ public sealed class UsageGraphsForm : Form
             }
         }
 
+        /// <summary>
+        /// Vibes-only: segment color for a category, using the exact index/count the
+        /// legend feeds to SeriesColor so dots and segments match. Labels beyond the
+        /// legend's top entries extend past the sweep end, where the parity lightness
+        /// alternation still separates adjacent segments.
+        /// </summary>
+        private Color VibeSegmentColor(string label, int categoryIndex, IReadOnlyList<ProviderSpendCategory> legendCategories)
+        {
+            for (var index = 0; index < legendCategories.Count; index++)
+            {
+                if (string.Equals(legendCategories[index].Label, label, StringComparison.OrdinalIgnoreCase))
+                {
+                    return VibeTheme.SeriesColor(vibePalette, index, legendCategories.Count);
+                }
+            }
+
+            return VibeTheme.SeriesColor(vibePalette, legendCategories.Count + categoryIndex, Math.Max(legendCategories.Count, 2));
+        }
+
         private void DrawDateLabels(Graphics graphics, Rectangle plot)
         {
             if (daily.Count == 0)
@@ -1275,6 +1564,164 @@ public sealed class UsageGraphsForm : Form
             var last = daily[^1].Day.ToString("MMM d");
             var lastSize = graphics.MeasureString(last, SharedSmallCaptionFont);
             graphics.DrawString(last, SharedSmallCaptionFont, labelBrush, plot.Right - lastSize.Width, labelTop);
+        }
+
+        /// <summary>
+        /// Vibes-only provider switch: called by the form before the new provider's data
+        /// lands. Collapses the current bars to the baseline (ease-out, ~200ms); data that
+        /// arrives mid-collapse is parked and applied when the collapse lands, at which
+        /// point the usual grow-reveal replays with the new palette. When there is nothing
+        /// to collapse (hidden, loading, empty), it only forces the next reveal to replay.
+        /// </summary>
+        public void BeginVibeProviderSwitch()
+        {
+            if (!FluentTheme.VibesActive)
+            {
+                return;
+            }
+
+            // Even identical-looking data must regrow under the new provider's colors.
+            vibeForceReveal = true;
+
+            if (vibeCollapsePending)
+            {
+                // A previous switch is still collapsing; let it land and apply the
+                // freshest pending data.
+                return;
+            }
+
+            if (!Visible
+                || loading
+                || daily.Count == 0
+                || daily.All(day => day.EstimatedCostUsd <= 0)
+                || !FluentAnimator.AnimationsEnabled)
+            {
+                return;
+            }
+
+            vibeCollapsePending = true;
+            vibeRevealAnimation?.Dispose();
+            vibeRevealAnimation = FluentAnimator.Animate(
+                vibeRevealProgress,
+                0d,
+                VibeCollapseDurationMs,
+                value =>
+                {
+                    vibeRevealProgress = value;
+                    if (!IsDisposed)
+                    {
+                        Invalidate();
+                    }
+                },
+                completed: () =>
+                {
+                    vibeCollapsePending = false;
+                    if (IsDisposed)
+                    {
+                        return;
+                    }
+
+                    if (vibeHasPendingData)
+                    {
+                        var pendingData = vibePendingData!;
+                        var pendingMessage = vibePendingMessage;
+                        vibeHasPendingData = false;
+                        vibePendingData = null;
+                        vibePendingMessage = null;
+                        SetData(pendingData, pendingMessage);
+                    }
+                    else
+                    {
+                        // No new data arrived yet; regrow the current bars so the
+                        // chart never sits collapsed.
+                        StartVibeReveal();
+                    }
+                });
+        }
+
+        /// <summary>
+        /// Vibes-only growth reveal: bars grow from the baseline over ~900ms with a small
+        /// per-bar stagger, then one sparkle burst celebrates the tallest bar. Never runs
+        /// while the chart is hidden; a reveal in flight is cancelled by the next one.
+        /// </summary>
+        private void StartVibeReveal()
+        {
+            vibeRevealAnimation?.Dispose();
+            vibeRevealAnimation = null;
+
+            if (!Visible
+                || daily.Count == 0
+                || daily.All(day => day.EstimatedCostUsd <= 0)
+                || !FluentAnimator.AnimationsEnabled)
+            {
+                vibeRevealProgress = 1d;
+                return;
+            }
+
+            vibeRevealProgress = 0d;
+            vibeRevealAnimation = FluentAnimator.Animate(
+                0d,
+                1d,
+                VibeTheme.RevealDurationMs,
+                value =>
+                {
+                    vibeRevealProgress = value;
+                    if (!IsDisposed)
+                    {
+                        Invalidate();
+                    }
+                },
+                completed: () =>
+                {
+                    if (!IsDisposed && FluentTheme.VibesActive)
+                    {
+                        FireVibeSparkle();
+                    }
+                });
+        }
+
+        /// <summary>One celebration burst at the top of the tallest bar (once per reveal).</summary>
+        private void FireVibeSparkle()
+        {
+            if (daily.Count == 0)
+            {
+                return;
+            }
+
+            var peakIndex = 0;
+            for (var index = 1; index < daily.Count; index++)
+            {
+                if (daily[index].EstimatedCostUsd > daily[peakIndex].EstimatedCostUsd)
+                {
+                    peakIndex = index;
+                }
+            }
+
+            if (daily[peakIndex].EstimatedCostUsd <= 0)
+            {
+                return;
+            }
+
+            var plot = PlotBounds;
+            var axisMax = NiceCeiling(daily.Max(day => day.EstimatedCostUsd));
+            var slotWidth = (float)plot.Width / daily.Count;
+            var barHeight = (float)(plot.Height * (double)(daily[peakIndex].EstimatedCostUsd / axisMax));
+            var origin = new PointF(plot.Left + ((peakIndex + 0.5f) * slotWidth), plot.Bottom - barHeight);
+            sparkles ??= new SparkleField(this);
+            sparkles.Burst(origin);
+        }
+
+        /// <summary>Cheap identity hash so the reveal replays only when the data actually changes.</summary>
+        private static int VibeDataKey(IReadOnlyList<ProviderDailyUsage> data)
+        {
+            var hash = 17;
+            foreach (var day in data)
+            {
+                hash = unchecked((hash * 31) + day.Day.GetHashCode());
+                hash = unchecked((hash * 31) + day.EstimatedCostUsd.GetHashCode());
+            }
+
+            return hash;
         }
 
         private Rectangle PlotBounds
@@ -1336,6 +1783,7 @@ public sealed class UsageGraphsForm : Form
         private string? lastToolTipText;
         private double animationProgress = 1d;
         private IDisposable? entranceAnimation;
+        private ProviderVibe vibePalette = VibeTheme.SignatureVibe;
 
         public ModelSpendChart()
         {
@@ -1359,6 +1807,22 @@ public sealed class UsageGraphsForm : Form
                 {
                     Invalidate();
                 }
+            }
+        }
+
+        /// <summary>Blended provider palette; the form retargets it on provider switches.</summary>
+        public ProviderVibe VibePalette
+        {
+            get => vibePalette;
+            set
+            {
+                if (vibePalette == value)
+                {
+                    return;
+                }
+
+                vibePalette = value;
+                Invalidate();
             }
         }
 
@@ -1533,6 +1997,7 @@ public sealed class UsageGraphsForm : Form
             using var nameBrush = new SolidBrush(tokens.TextPrimary);
             using var costBrush = new SolidBrush(tokens.TextSecondary);
             using var costFormat = new StringFormat(StringFormatFlags.NoWrap) { Alignment = StringAlignment.Far };
+            var vibes = FluentTheme.VibesActive;
 
             for (var index = 0; index < visible.Count; index++)
             {
@@ -1549,7 +2014,11 @@ public sealed class UsageGraphsForm : Form
                     graphics.FillPath(hoverBrush, hoverPath);
                 }
 
-                var color = SpendCategoryColor(model.Model, tokens);
+                // Vibes: rank position samples the provider sweep (top spender leads the
+                // gradient); default keeps the semantic per-model colors.
+                var color = vibes
+                    ? VibeTheme.SeriesColor(vibePalette, index, visible.Count)
+                    : SpendCategoryColor(model.Model, tokens);
                 var dot = ScaleInt(8, LayoutScale);
                 using (var dotBrush = new SolidBrush(color))
                 {

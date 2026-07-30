@@ -66,12 +66,23 @@ public static class FluentTheme
     private static (Color Light2, Color Dark1)? cachedAccentVariants;
 
     /// <summary>
+    /// True while the opt-in "vibes" appearance is enabled. Set from <see cref="UiSettings"/>
+    /// on load and save; when false the token sets below are exactly the stock Fluent ones.
+    /// </summary>
+    public static bool VibesActive { get; set; }
+
+    /// <summary>
     /// Builds the token set for the requested theme. When <paramref name="onBackdrop"/> is false
     /// every translucent token is alpha-composited over the theme Background so the result is
     /// fully opaque (fallback path for Windows 10 / pre-22H2 and for opaque window bodies).
     /// </summary>
     public static FluentTokens Get(bool isDark, bool onBackdrop)
     {
+        if (VibesActive)
+        {
+            return GetVibeTokens(onBackdrop);
+        }
+
         // WinUI uses the theme-adjusted accent for fills and text (SystemAccentColorLight2
         // in dark, SystemAccentColorDark1 in light), never the raw accent — raw dark-toned
         // accents (gold, olive, ...) are illegible on dark surfaces.
@@ -163,6 +174,80 @@ public static class FluentTheme
     }
 
     /// <summary>
+    /// Raw surface recipe for one vibe background style: canvas, surface/stroke/text tints
+    /// (ARGB uints, composited over the canvas on opaque paths) and the accent pair.
+    /// </summary>
+    private readonly record struct VibePalette(
+        Color Background,
+        uint CardFill,
+        uint CardStroke,
+        uint ControlFill,
+        uint ControlFillHover,
+        uint ControlFillPressed,
+        uint ControlStroke,
+        uint ControlStrokeBottom,
+        uint ControlStrongStroke,
+        uint TextPrimary,
+        uint TextSecondary,
+        uint TextTertiary,
+        uint TextDisabled,
+        uint MeterTrack,
+        Color AccentText);
+
+    /// <summary>
+    /// The "vibes" token set. Always dark; the Windows accent is deliberately ignored so the
+    /// palette stays coherent. The surface family is baked in as Graphite: hue-free charcoal
+    /// with a steel-blue accent.
+    /// </summary>
+    private static FluentTokens GetVibeTokens(bool onBackdrop)
+    {
+        var palette = new VibePalette(
+            Color.FromArgb(0xFF, 0x15, 0x15, 0x17),
+            0x10FFFFFF, 0x1CFFFFFF,
+            0x0FFFFFFF, 0x18FFFFFF, 0x0AFFFFFF,
+            0x1AFFFFFF, 0x24FFFFFF, 0x8BFFFFFF,
+            0xFFFAFAFA, 0xC5E8E8EA, 0x87C4C6CA, 0x5DB4B6BA,
+            0x16FFFFFF,
+            Color.FromArgb(0xFF, 0x9C, 0xC4, 0xFF));
+
+        var background = palette.Background;
+        var accent = VibeTheme.StyleAccent;
+        Color Resolve(Color color) => onBackdrop ? color : BlendOver(color, background);
+        Color R(uint argb) => Resolve(Argb(argb));
+
+        return new FluentTokens
+        {
+            IsDark = true,
+            OnBackdrop = onBackdrop,
+            Background = background,
+            CardFill = R(palette.CardFill),
+            CardStroke = R(palette.CardStroke),
+            ControlFill = R(palette.ControlFill),
+            ControlFillHover = R(palette.ControlFillHover),
+            ControlFillPressed = R(palette.ControlFillPressed),
+            ControlFillDisabled = R(palette.ControlFillPressed),
+            ControlStroke = R(palette.ControlStroke),
+            ControlStrokeBottom = R(palette.ControlStrokeBottom),
+            ControlStrongStroke = R(palette.ControlStrongStroke),
+            SubtleHover = R(palette.ControlFill),
+            SubtlePressed = R(palette.ControlFillPressed),
+            TextPrimary = R(palette.TextPrimary),
+            TextSecondary = R(palette.TextSecondary),
+            TextTertiary = R(palette.TextTertiary),
+            TextDisabled = R(palette.TextDisabled),
+            TextOnAccent = Color.White,
+            Accent = accent,
+            AccentHover = Resolve(Color.FromArgb(0xE6, accent)),
+            AccentPressed = Resolve(Color.FromArgb(0xCC, accent)),
+            AccentText = palette.AccentText,
+            MeterTrack = R(palette.MeterTrack),
+            Warning = VibeTheme.WarnStart,
+            Danger = VibeTheme.DangerStart,
+            Success = Argb(0xFF46E0A3)
+        };
+    }
+
+    /// <summary>
     /// Reads the user's accent color from HKCU\Software\Microsoft\Windows\DWM (AccentColor,
     /// DWORD in ABGR byte order). Cached after the first read; falls back to #FF0078D4.
     /// </summary>
@@ -192,6 +277,11 @@ public static class FluentTheme
     /// </summary>
     public static Color GetAccentFill(bool isDark)
     {
+        if (VibesActive)
+        {
+            return VibeTheme.StyleAccent;
+        }
+
         cachedAccentVariants ??= ReadAccentVariants();
         var variants = cachedAccentVariants.Value;
         return isDark ? variants.Light2 : variants.Dark1;
