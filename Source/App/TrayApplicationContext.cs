@@ -775,17 +775,11 @@ public sealed class TrayApplicationContext : ApplicationContext
         return TrimTooltip($"{codexText}, {claudeText}, {cursorText}");
     }
 
-    internal static string ShortWindow(int windowMinutes)
-    {
-        if (windowMinutes >= 1440 && windowMinutes % 1440 == 0)
-        {
-            return $"{windowMinutes / 1440}d";
-        }
-
-        return windowMinutes >= 60 && windowMinutes % 60 == 0
-            ? $"{windowMinutes / 60}h"
-            : $"{windowMinutes}m";
-    }
+    /// <summary>
+    /// Kept as a thin forwarder: the implementation moved to <see cref="UsageTooltip"/> in
+    /// CodexBar.Core so the WinUI shell builds the identical tray tooltip.
+    /// </summary>
+    internal static string ShortWindow(int windowMinutes) => UsageTooltip.ShortWindow(windowMinutes);
 
     private static string TrimTooltip(string value)
     {

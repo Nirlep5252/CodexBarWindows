@@ -8,103 +8,277 @@
     <!-- Transparent root so the system backdrop shows through; TintLayer paints the
          user-configured tint on top of the material. -->
     <Grid x:Name="RootGrid" Background="Transparent">
+
         <Border x:Name="TintLayer" />
 
-        <Grid x:Name="ContentRoot" Padding="16,14,16,14" RowSpacing="12">
+        <Grid x:Name="ContentRoot" Padding="16,12,16,12" RowSpacing="10">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
-                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
 
-            <!-- Header -->
-            <Grid Grid.Row="0" ColumnSpacing="10">
+            <!-- Header: identity on the left, actions on the right. Settings is deliberately
+                 NOT here - it lives in the tray menu, so the header stays about this window. -->
+            <Grid Grid.Row="0" ColumnSpacing="8">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
 
-                <StackPanel Grid.Column="0" Spacing="1">
+                <StackPanel Grid.Column="0" VerticalAlignment="Center">
                     <TextBlock
-                        Text="CodexBar"
-                        Style="{StaticResource SubtitleTextBlockStyle}" />
+                        x:Name="TitleText"
+                        MaxLines="1"
+                        Style="{StaticResource SubtitleTextBlockStyle}"
+                        TextTrimming="CharacterEllipsis" />
                     <TextBlock
-                        x:Name="SubtitleText"
+                        x:Name="PlanText"
+                        MaxLines="1"
+                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                         Style="{StaticResource CaptionTextBlockStyle}"
-                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        TextTrimming="CharacterEllipsis" />
                 </StackPanel>
 
-                <Button
+                <StackPanel
                     Grid.Column="1"
-                    x:Name="RefreshButton"
-                    VerticalAlignment="Top"
-                    Padding="8"
-                    Style="{StaticResource SubtleButtonStyle}"
-                    ToolTipService.ToolTip="Refresh">
-                    <FontIcon FontSize="15" Glyph="&#xE72C;" />
-                </Button>
+                    Orientation="Horizontal"
+                    Spacing="2"
+                    VerticalAlignment="Top">
+                    <Button
+                        x:Name="GraphsButton"
+                        Width="34"
+                        Height="32"
+                        Padding="0"
+                        AutomationProperties.Name="Usage graphs"
+                        Style="{StaticResource SubtleButtonStyle}"
+                        ToolTipService.ToolTip="Usage graphs">
+                        <FontIcon FontSize="15" Glyph="&#xE81C;" />
+                    </Button>
+                    <Button
+                        x:Name="RefreshButton"
+                        Width="34"
+                        Height="32"
+                        Padding="0"
+                        AutomationProperties.Name="Refresh"
+                        Style="{StaticResource SubtleButtonStyle}"
+                        ToolTipService.ToolTip="Refresh (F5)">
+                        <Grid>
+                            <FontIcon x:Name="RefreshGlyph" FontSize="15" Glyph="&#xE72C;" />
+                            <ProgressRing
+                                x:Name="RefreshSpinner"
+                                Width="16"
+                                Height="16"
+                                IsActive="False"
+                                Visibility="Collapsed" />
+                        </Grid>
+                    </Button>
+                    <Button
+                        x:Name="CloseButton"
+                        Width="34"
+                        Height="32"
+                        Padding="0"
+                        AutomationProperties.Name="Close"
+                        Style="{StaticResource SubtleButtonStyle}"
+                        ToolTipService.ToolTip="Close (Esc)">
+                        <FontIcon FontSize="14" Glyph="&#xE8BB;" />
+                    </Button>
+                </StackPanel>
             </Grid>
 
-            <!-- Providers -->
-            <Border
+            <!-- Provider tab strip. Scrolls horizontally rather than wrapping, because a user
+                 with several Codex accounts must not push the usage card off the screen. -->
+            <ScrollViewer
                 Grid.Row="1"
+                HorizontalScrollBarVisibility="Hidden"
+                HorizontalScrollMode="Auto"
+                VerticalScrollBarVisibility="Disabled"
+                VerticalScrollMode="Disabled">
+                <StackPanel x:Name="ProviderTabs" Orientation="Horizontal" Spacing="6" />
+            </ScrollViewer>
+
+            <!-- One grouped surface: the usage rows and, for Codex, the banked-reset row.
+                 Everything themed inside it uses {ThemeResource} so it re-resolves per element
+                 when the user forces a theme opposite to the app's. -->
+            <Border
+                Grid.Row="2"
                 Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                 BorderThickness="1"
                 CornerRadius="8">
-                <!-- Rows come from a template, never from brushes looked up in code: a brush
-                     resolved off Application.Current.Resources freezes to the APP theme and
-                     renders dark-on-light when the user forces the opposite theme. -->
-                <ItemsControl x:Name="ProviderList" Padding="4">
-                    <ItemsControl.ItemTemplate>
-                        <DataTemplate x:DataType="local:ProviderRow">
-                            <Grid Padding="10,8,10,8" ColumnSpacing="8">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
+                <StackPanel>
+                    <ItemsControl x:Name="UsageRows">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="local:UsageRowModel">
+                                <StackPanel>
+                                    <Border
+                                        Height="1"
+                                        Background="{ThemeResource CardStrokeColorDefaultBrush}"
+                                        Visibility="{x:Bind SeparatorVisibility}" />
+                                    <Grid Padding="14,11,14,13" RowSpacing="7">
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                        </Grid.RowDefinitions>
 
-                                <StackPanel Grid.Column="0" Spacing="1">
-                                    <TextBlock
-                                        Text="{x:Bind Name}"
-                                        Style="{StaticResource BodyStrongTextBlockStyle}" />
-                                    <TextBlock
-                                        Text="{x:Bind Description}"
-                                        Style="{StaticResource CaptionTextBlockStyle}"
-                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                        <Grid Grid.Row="0" ColumnSpacing="8">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock
+                                                MaxLines="1"
+                                                Style="{StaticResource BodyStrongTextBlockStyle}"
+                                                Text="{x:Bind Title}"
+                                                TextTrimming="CharacterEllipsis" />
+                                            <TextBlock
+                                                Grid.Column="1"
+                                                Foreground="{x:Bind HeatBrush}"
+                                                Style="{StaticResource BodyStrongTextBlockStyle}"
+                                                Text="{x:Bind PercentText}" />
+                                        </Grid>
+
+                                        <ProgressBar
+                                            Grid.Row="1"
+                                            Height="4"
+                                            Foreground="{x:Bind HeatBrush}"
+                                            IsIndeterminate="{x:Bind IsIndeterminate}"
+                                            Maximum="100"
+                                            Minimum="0"
+                                            Value="{x:Bind MeterValue}" />
+
+                                        <Grid Grid.Row="2" ColumnSpacing="8">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock
+                                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                Style="{StaticResource CaptionTextBlockStyle}"
+                                                Text="{x:Bind RemainingText}" />
+                                            <TextBlock
+                                                Grid.Column="1"
+                                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                Style="{StaticResource CaptionTextBlockStyle}"
+                                                Text="{x:Bind ResetText}" />
+                                        </Grid>
+                                    </Grid>
                                 </StackPanel>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
 
+                    <!-- Codex banked resets. Spending one is irreversible, so the action always
+                         takes a second deliberate click through an INLINE confirm - a dialog
+                         would take the foreground and dismiss the flyout underneath it. -->
+                    <StackPanel x:Name="ResetRow" Visibility="Collapsed">
+                        <Border
+                            x:Name="ResetSeparator"
+                            Height="1"
+                            Background="{ThemeResource CardStrokeColorDefaultBrush}" />
+                        <Grid Padding="14,10,14,12" ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+
+                            <Border
+                                x:Name="ResetBadge"
+                                Height="18"
+                                MinWidth="22"
+                                Padding="6,0,6,0"
+                                VerticalAlignment="Top"
+                                CornerRadius="9"
+                                Margin="0,2,0,0">
                                 <TextBlock
-                                    Grid.Column="1"
+                                    x:Name="ResetBadgeText"
+                                    HorizontalAlignment="Center"
                                     VerticalAlignment="Center"
-                                    Text="{x:Bind Status}"
+                                    FontSize="11"
+                                    FontWeight="SemiBold" />
+                            </Border>
+
+                            <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                <TextBlock
+                                    x:Name="ResetTitleText"
+                                    MaxLines="1"
+                                    Style="{StaticResource BodyStrongTextBlockStyle}"
+                                    TextTrimming="CharacterEllipsis" />
+                                <TextBlock
+                                    x:Name="ResetDetailText"
+                                    MaxLines="2"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                     Style="{StaticResource CaptionTextBlockStyle}"
-                                    Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
-                            </Grid>
-                        </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                </ItemsControl>
+                                    TextWrapping="Wrap" />
+                            </StackPanel>
+
+                            <StackPanel
+                                Grid.Column="2"
+                                Orientation="Horizontal"
+                                Spacing="6"
+                                VerticalAlignment="Center">
+                                <ProgressRing
+                                    x:Name="ResetBusyRing"
+                                    Width="18"
+                                    Height="18"
+                                    IsActive="False"
+                                    Visibility="Collapsed" />
+                                <!-- Neutral, not accent: this opens a confirm rather than
+                                     committing, and a loud primary button next to an
+                                     irreversible spend invites the click we do not want. -->
+                                <Button x:Name="RedeemButton" Content="Use reset" />
+                                <Button
+                                    x:Name="ConfirmRedeemButton"
+                                    Content="Use it"
+                                    Style="{StaticResource AccentButtonStyle}"
+                                    Visibility="Collapsed" />
+                                <Button
+                                    x:Name="CancelRedeemButton"
+                                    Content="Cancel"
+                                    Visibility="Collapsed" />
+                            </StackPanel>
+                        </Grid>
+                    </StackPanel>
+                </StackPanel>
             </Border>
 
-            <!-- Status line -->
-            <TextBlock
-                Grid.Row="2"
-                x:Name="StatusText"
-                TextWrapping="NoWrap"
-                TextTrimming="CharacterEllipsis"
-                Style="{StaticResource CaptionTextBlockStyle}"
-                Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+            <!-- Status line. Errors WRAP to three lines instead of being trimmed to one: the
+                 WinForms popup ellipsised them, which made the only diagnostic the app gives
+                 unreadable. The full text is also on the tooltip and on a right-click Copy. -->
+            <Grid Grid.Row="3" ColumnSpacing="6" Padding="2,0,2,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <Grid.ContextFlyout>
+                    <MenuFlyout>
+                        <MenuFlyoutItem
+                            x:Name="CopyStatusItem"
+                            MinWidth="140"
+                            Text="Copy"
+                            Click="OnCopyStatus" />
+                    </MenuFlyout>
+                </Grid.ContextFlyout>
 
-            <!-- Footer actions -->
-            <StackPanel
-                Grid.Row="3"
-                Orientation="Horizontal"
-                HorizontalAlignment="Right"
-                Spacing="8">
-                <Button x:Name="GraphsButton" Content="Usage graphs" />
-                <Button x:Name="SettingsButton" Content="Settings" />
-            </StackPanel>
+                <FontIcon
+                    x:Name="StatusIcon"
+                    Margin="0,1,0,0"
+                    VerticalAlignment="Top"
+                    FontSize="12"
+                    Glyph="&#xE7BA;"
+                    Visibility="Collapsed" />
+                <TextBlock
+                    x:Name="StatusText"
+                    Grid.Column="1"
+                    MaxLines="3"
+                    Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                    Style="{StaticResource CaptionTextBlockStyle}"
+                    TextTrimming="CharacterEllipsis"
+                    TextWrapping="Wrap" />
+            </Grid>
         </Grid>
     </Grid>
 </Window>

@@ -20,6 +20,7 @@ public partial class App : Application
     private readonly SingleInstanceGuard? singleInstance;
 
     private DispatcherQueue? queue;
+    private UsageRefreshService? usage;
     private TaskbarIcon? trayIcon;
     private FlyoutWindow? flyout;
     private ToolWindow? settingsWindow;
@@ -41,6 +42,17 @@ public partial class App : Application
 
         queue = DispatcherQueue.GetForCurrentThread();
         AppTheme.Initialize(queue);
+
+        // Everything the service touches is mutated on the UI thread, so it marshals through
+        // the dispatcher rather than owning a lock.
+        usage = new UsageRefreshService(action => queue.TryEnqueue(() => action()));
+        usage.TooltipChanged += text =>
+        {
+            if (trayIcon is not null)
+            {
+                trayIcon.ToolTipText = text;
+            }
+        };
 
         if (singleInstance is not null)
         {
@@ -103,8 +115,7 @@ public partial class App : Application
             return flyout;
         }
 
-        flyout = new FlyoutWindow();
-        flyout.SettingsRequested += (_, _) => ShowSettings();
+        flyout = new FlyoutWindow(usage!);
         flyout.GraphsRequested += (_, _) => ShowGraphs();
         return flyout;
     }
@@ -135,7 +146,19 @@ public partial class App : Application
             "Charts are built in a later phase. LiveCharts needs a pre-warm pass at startup, which lands with the charts themselves.",
             widthDip: 900,
             heightDip: 600);
+
+        // The graphs window shows usage too, so it counts for the visibility gate; and it is
+        // the only surface that plots the 30-day history, so it is the only reason to pay for
+        // the session-log scan.
+        if (usage is not null)
+        {
+            usage.IncludeHistory = true;
+            usage.SetWindowOpen(GraphsWindowId, true);
+            usage.Refresh();
+        }
     }
+
+    private const string GraphsWindowId = "graphs";
 
     private ToolWindow ShowToolWindow(
         ToolWindow? existing,
@@ -153,7 +176,17 @@ public partial class App : Application
         }
 
         var window = new ToolWindow(title, heading, body, widthDip, heightDip);
-        window.Closed += (_, _) => assign(null);
+        window.Closed += (_, _) =>
+        {
+            // Identity is checked BEFORE assign clears the field it would be compared against.
+            var wasGraphs = ReferenceEquals(window, graphsWindow);
+            assign(null);
+            if (usage is not null && wasGraphs)
+            {
+                usage.IncludeHistory = false;
+                usage.SetWindowOpen(GraphsWindowId, false);
+            }
+        };
         // A sibling window losing focus is invisible to the flyout, so it re-arms the check.
         window.ActivationChanged += (_, _) => flyout?.ReArmDismissCheck();
         window.ShowAndFocus();
@@ -220,6 +253,9 @@ public partial class App : Application
 
         trayIcon?.Dispose();
         trayIcon = null;
+
+        usage?.Dispose();
+        usage = null;
 
         AppTheme.Shutdown();
         Exit();

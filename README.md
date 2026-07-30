@@ -138,6 +138,14 @@ Set `CODEXBAR_WINUI_DIAG=1` to log the flyout's show/dismiss lifecycle to
 `CODEXBAR_WINUI_AUTOEXIT=<seconds>` shuts the app down again, which is how the shell is verified
 without a human clicking the tray icon.
 
+The WinUI flyout reads real usage through `UsageRefreshService` in `CodexBar.Core`, which is the
+UI-free port of the WinForms tray context's refresh orchestration: per-provider readers, the
+`KeepLastGood` stale-data retention, the banked-reset redemption flow, and the visibility-gated
+poll timer. **Nothing refreshes while no window is showing usage** — opening the flyout or the
+graphs window starts the one-minute timer, closing the last one stops it. The WinForms app still
+runs its own copy of that logic in `Source/App/TrayApplicationContext.cs`; the two converge at
+cutover.
+
 ## Versioning
 
 The app version is defined in [Directory.Build.props](Directory.Build.props):
