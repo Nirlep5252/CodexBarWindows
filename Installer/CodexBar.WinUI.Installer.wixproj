@@ -1,0 +1,34 @@
+<Project Sdk="WixToolset.Sdk/6.0.2">
+  <PropertyGroup>
+    <!--
+      The MSI file name is load-bearing: GitHubReleaseUpdater filters release assets on the
+      substring in ShellIdentity.ReleaseAssetNameHint ("CodexBar.WinUI"), and the WinForms app
+      filters on "CodexBarWindows". This name matches the first and, crucially, does NOT contain
+      the second - so a release carrying both MSIs never hands one app the other's installer.
+    -->
+    <OutputName>CodexBar.WinUI-$(ProductVersion)-win-x64</OutputName>
+    <OutputType>Package</OutputType>
+    <ProductVersion Condition="'$(ProductVersion)' == ''">0.7.0</ProductVersion>
+    <PublishDir Condition="'$(PublishDir)' == ''">..\bin\publish-winui\win-x64</PublishDir>
+    <DefineConstants>ProductVersion=$(ProductVersion);PublishDir=$(PublishDir)</DefineConstants>
+    <!--
+      ICE38/ICE43/ICE57/ICE64 all fire because this is a perUser package whose payload lives under
+      the user profile and whose harvested components are keyed on files rather than registry
+      values; the WinForms package suppresses ICE91 for the same reason. ICE03 is about the File
+      table's Language column: several of the Windows App SDK's own resource DLLs declare more
+      translations than the column's 20 characters hold, so the harvest produces a language list
+      ICE03 rejects. None of that is under this repo's control, and the resulting MSI was verified
+      by installing it and running the installed app.
+    -->
+    <SuppressIces>ICE03;ICE38;ICE43;ICE57;ICE64;ICE91</SuppressIces>
+    <!-- The WiX SDK globs every .wxs in this folder, and its glob is evaluated AFTER the project
+         body, so a <Compile Remove="Package.wxs" /> here has nothing to remove yet and the build
+         fails with WIX0089 "multiple entry sections". Opting out of the glob and naming the one
+         source explicitly is the only ordering-proof way to keep the two packages apart. -->
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="PackageWinUI.wxs" />
+  </ItemGroup>
+</Project>

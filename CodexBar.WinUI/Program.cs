@@ -8,12 +8,10 @@ namespace CodexBar.WinUI;
 public static class Program
 {
     /// <summary>
-    /// Scope suffix for <see cref="SingleInstanceGuard"/>. While the WinUI 3 rewrite runs
-    /// side by side with the shipping WinForms app they must NOT share a mutex name, or
-    /// launching one would silently exit because the other already owns it. At cutover this
-    /// becomes <c>null</c> so the WinUI app inherits the original single-instance identity.
+    /// Scope suffix for <see cref="SingleInstanceGuard"/>. See <see cref="ShellIdentity"/>, which
+    /// holds every side-by-side name and the cutover instructions for all of them.
     /// </summary>
-    internal const string SingleInstanceScope = "WinUI";
+    internal const string SingleInstanceScope = ShellIdentity.SingleInstanceMutexScope;
 
     private static SingleInstanceGuard? singleInstance;
 

@@ -47,6 +47,11 @@ public sealed partial class SettingsWindow : Window
     private UiSettings settings;
     private int? pendingTintPercent;
     /// <summary>
+    /// Set in <see cref="OnClosed"/>. An update check outcome can arrive after the window is
+    /// gone, and touching a closed window's controls throws.
+    /// </summary>
+    private bool isClosed;
+    /// <summary>
     /// Suppresses the write-back handlers. Set while the controls are being populated from the
     /// persisted settings, and again around the one place this window drives a control itself
     /// (snapping the last tool back on), so neither can be mistaken for a user edit.
@@ -87,6 +92,14 @@ public sealed partial class SettingsWindow : Window
 
         RootGrid.ActualThemeChanged += (_, _) => AppTheme.ApplyTint(RootGrid, TintLayer);
         AppTheme.Changed += OnThemeChanged;
+        if (App.Shell is { } shell)
+        {
+            // A check can be started from the tray menu or by the six-hourly timer, so the
+            // button follows the App's state rather than only its own clicks.
+            shell.UpdateCheckStateChanged += OnUpdateCheckStateChanged;
+            CheckUpdatesButton.IsEnabled = !shell.IsCheckingForUpdates;
+        }
+
         Activated += (_, _) => ActivationChanged?.Invoke(this, EventArgs.Empty);
         Closed += (_, _) => OnClosed();
 
@@ -112,11 +125,18 @@ public sealed partial class SettingsWindow : Window
 
     private void OnClosed()
     {
+        isClosed = true;
+
         // Flush before the window goes: a tint drag that ended inside the debounce window
         // would otherwise be silently dropped.
         CommitPendingTint();
         tintCommitTimer.Stop();
         AppTheme.Changed -= OnThemeChanged;
+
+        if (App.Shell is { } shell)
+        {
+            shell.UpdateCheckStateChanged -= OnUpdateCheckStateChanged;
+        }
     }
 
     private void OnThemeChanged(object? sender, EventArgs e)
@@ -133,7 +153,9 @@ public sealed partial class SettingsWindow : Window
     {
         VersionCard.Description = AppInfo.VersionText;
 
-        StartupToggle.IsOn = StartupSettings.IsEnabled;
+        // ShellIdentity, not StartupSettings.IsEnabled: the WinForms app owns the unsuffixed
+        // Run value, and this shell must not read or overwrite it while both are installed.
+        StartupToggle.IsOn = StartupSettings.IsEnabledFor(ShellIdentity.StartupRegistryValueName);
         CodexEnabledToggle.IsOn = settings.CodexEnabled;
         ClaudeEnabledToggle.IsOn = settings.ClaudeEnabled;
         CursorEnabledToggle.IsOn = settings.CursorEnabled;
@@ -156,9 +178,15 @@ public sealed partial class SettingsWindow : Window
         {
             if (!suppressWrites)
             {
-                StartupSettings.SetEnabled(StartupToggle.IsOn);
+                StartupSettings.SetEnabledFor(ShellIdentity.StartupRegistryValueName, StartupToggle.IsOn);
+                DiagnosticLog.Write(
+                    "start with windows {0} value={1}",
+                    StartupToggle.IsOn ? "on" : "off",
+                    ShellIdentity.StartupRegistryValueName);
             }
         };
+
+        CheckUpdatesButton.Click += (_, _) => CheckForUpdates();
 
         CodexEnabledToggle.Toggled += (_, _) => OnProviderEnabledChanged();
         ClaudeEnabledToggle.Toggled += (_, _) => OnProviderEnabledChanged();
@@ -227,6 +255,39 @@ public sealed partial class SettingsWindow : Window
         };
         settings.Save();
     }
+
+    /// <summary>
+    /// Runs an update check and reports the outcome HERE rather than in the flyout. The tray
+    /// menu's copy of this command has no window of its own to answer in, so it borrows the
+    /// flyout; this one is already looking at the version it is asking about.
+    /// </summary>
+    private void CheckForUpdates()
+    {
+        UpdateInfoBar.Severity = InfoBarSeverity.Informational;
+        UpdateInfoBar.Message = "Checking for updates...";
+        UpdateInfoBar.IsOpen = true;
+
+        App.Shell?.CheckForUpdates(result =>
+        {
+            // The window can be closed while the HTTP call is in flight; the callback still runs
+            // because the App owns the check, so the controls have to be treated as gone.
+            if (isClosed)
+            {
+                return;
+            }
+
+            UpdateInfoBar.Severity = result.Status switch
+            {
+                UpdateCheckStatus.UpToDate => InfoBarSeverity.Success,
+                UpdateCheckStatus.Installing => InfoBarSeverity.Success,
+                _ => InfoBarSeverity.Warning
+            };
+            UpdateInfoBar.Message = result.Message;
+            UpdateInfoBar.IsOpen = true;
+        });
+    }
+
+    private void OnUpdateCheckStateChanged(bool isChecking) => CheckUpdatesButton.IsEnabled = !isChecking;
 
     // --------------------------------------------------------------- appearance
 

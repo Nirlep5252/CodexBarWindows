@@ -71,7 +71,15 @@
                             <tk:SettingsCard.HeaderIcon>
                                 <FontIcon Glyph="&#xE946;" />
                             </tk:SettingsCard.HeaderIcon>
+                            <Button x:Name="CheckUpdatesButton" Content="Check for updates" />
                         </tk:SettingsCard>
+
+                        <InfoBar
+                            x:Name="UpdateInfoBar"
+                            Margin="0,4,0,0"
+                            IsClosable="True"
+                            IsOpen="False"
+                            Severity="Informational" />
 
                         <TextBlock
                             Margin="2,20,0,6"

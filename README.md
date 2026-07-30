@@ -102,12 +102,27 @@ Publish manually:
 dotnet publish .\CodexBarWindows.csproj -c Release -r win-x64 --self-contained:true
 ```
 
+### WinUI 3 rewrite (in progress)
+
+A WinUI 3 shell is being built in `CodexBar.WinUI/`, side by side with this app — both build, both
+can be installed, and both can run at once. It is not the default and it replaces nothing yet.
+
+```powershell
+.\Scripts\run-winui.ps1        # build and run it
+.\Scripts\install-winui.ps1    # publish, build its MSI, install to %LOCALAPPDATA%\Programs\CodexBar.WinUI
+.\Scripts\uninstall-winui.ps1
+```
+
+See [docs/winui3-rewrite.md](docs/winui3-rewrite.md) for what is built, what is verified, and the
+exact steps to cut over.
+
 ## Project Layout
 
 ```text
 Assets/                    App icon and tray logo assets
-Installer/                 WiX MSI package definition
+Installer/                 WiX MSI package definitions (one per shell)
 Scripts/                   Local run, install, uninstall, and MSI build scripts
+docs/winui3-rewrite.md     The WinUI 3 rewrite: status, verification, cutover steps
 CodexBar.Core/            UI-free shared library (settings, providers, updates)
 CodexBar.Core/App/        App settings, version info, single-instance guard
 CodexBar.Core/Claude/     Claude Code OAuth usage reading

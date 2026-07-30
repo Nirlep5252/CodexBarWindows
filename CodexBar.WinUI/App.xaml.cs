@@ -17,6 +17,22 @@ namespace CodexBar.WinUI;
 /// </summary>
 public partial class App : Application
 {
+    /// <summary>
+    /// Delay before the first automatic update check. The app is competing with the rest of the
+    /// user's sign-in for disk and network at this point, and nothing here is urgent.
+    /// </summary>
+    private static readonly TimeSpan FirstUpdateCheckDelay = TimeSpan.FromSeconds(10);
+
+    /// <summary>Interval between automatic update checks. Matches the WinForms shell.</summary>
+    private static readonly TimeSpan AutomaticUpdateCheckInterval = TimeSpan.FromHours(6);
+
+    /// <summary>
+    /// How long the "installing" notice stays on screen before the process exits. The updater
+    /// waits for THIS process to exit before running msiexec, so without a pause the user would
+    /// see the flyout appear and vanish in the same frame with no idea why the app restarted.
+    /// </summary>
+    private static readonly TimeSpan InstallNoticeDwell = TimeSpan.FromSeconds(2.5);
+
     private readonly SingleInstanceGuard? singleInstance;
 
     private DispatcherQueue? queue;
@@ -26,6 +42,7 @@ public partial class App : Application
     private SettingsWindow? settingsWindow;
     private GraphsWindow? graphsWindow;
     private MenuFlyoutItem? checkForUpdatesItem;
+    private DispatcherQueueTimer? updateTimer;
     private int updateCheckInProgress;
 
     public App(SingleInstanceGuard? singleInstance = null)
@@ -33,6 +50,13 @@ public partial class App : Application
         this.singleInstance = singleInstance;
         InitializeComponent();
     }
+
+    /// <summary>
+    /// The running shell, for the windows that need to reach app-level commands (currently only
+    /// the update check, which is owned here so the tray menu item, the settings button and the
+    /// six-hourly timer all share one in-flight guard).
+    /// </summary>
+    public static App? Shell => Current as App;
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
@@ -46,13 +70,9 @@ public partial class App : Application
         // Everything the service touches is mutated on the UI thread, so it marshals through
         // the dispatcher rather than owning a lock.
         usage = new UsageRefreshService(action => queue.TryEnqueue(() => action()));
-        usage.TooltipChanged += text =>
-        {
-            if (trayIcon is not null)
-            {
-                trayIcon.ToolTipText = text;
-            }
-        };
+        // The tray hover text. UsageTooltip.Build is shared with the WinForms shell, so both
+        // produce byte-identical strings (and both get its 63-character shell clamp).
+        usage.TooltipChanged += ApplyTrayTooltip;
 
         if (singleInstance is not null)
         {
@@ -67,7 +87,19 @@ public partial class App : Application
         // open does not sit blank for half a second. See ChartPrewarm.
         ChartPrewarm.Start(queue);
 
+        StartAutomaticUpdateChecks();
         MaybeAutoShow();
+    }
+
+    private void ApplyTrayTooltip(string text)
+    {
+        if (trayIcon is null)
+        {
+            return;
+        }
+
+        trayIcon.ToolTipText = text;
+        DiagnosticLog.Write("tray tooltip: {0}", text);
     }
 
     private void CreateTrayIcon()
@@ -79,7 +111,14 @@ public partial class App : Application
         settingsItem.Click += (_, _) => ShowSettings();
 
         checkForUpdatesItem = CreateMenuItem("Check for updates");
-        checkForUpdatesItem.Click += (_, _) => BeginUpdateCheck();
+        // Reported through the flyout: the tray menu is already gone by the time the HTTP call
+        // comes back, so the outcome needs a surface that outlives it.
+        checkForUpdatesItem.Click += (_, _) => CheckForUpdates(result =>
+        {
+            var window = EnsureFlyout();
+            window.SetStatus(result.Message);
+            window.ShowFlyout();
+        });
 
         var exitItem = CreateMenuItem("Exit");
         exitItem.Click += (_, _) => ExitApp();
@@ -93,6 +132,10 @@ public partial class App : Application
 
         trayIcon = new TaskbarIcon
         {
+            // Short and static on purpose. The shell BAKES the registration-time text into the
+            // notification-area button's accessible name and then appends the live tooltip to
+            // it, so a long placeholder here is read out in front of the usage figures forever
+            // (verified through UI Automation: the button's Name is "<this> <ToolTipText>").
             ToolTipText = AppInfo.AppName,
             ContextFlyout = menu,
             ContextMenuMode = ContextMenuMode.SecondWindow,
@@ -165,21 +208,42 @@ public partial class App : Application
         window.ShowAndFocus();
     }
 
-    private void BeginUpdateCheck()
+    // ------------------------------------------------------------------- updates
+
+    /// <summary>True while an update check is in flight, so callers can disable their button.</summary>
+    public bool IsCheckingForUpdates => Volatile.Read(ref updateCheckInProgress) == 1;
+
+    /// <summary>Raised on the UI thread whenever <see cref="IsCheckingForUpdates"/> flips.</summary>
+    public event Action<bool>? UpdateCheckStateChanged;
+
+    /// <summary>
+    /// Runs one update check against the GitHub releases feed and installs a newer MSI if there
+    /// is one. Mirrors the WinForms shell, including the rule that only a build running from the
+    /// installed location ever updates itself - a dev build reports that and does nothing.
+    /// </summary>
+    /// <param name="report">
+    /// Called on the UI thread with the outcome, or <c>null</c> for a silent (automatic) check.
+    /// An "installing" outcome is ALWAYS surfaced regardless, because it is about to restart the
+    /// app and an unexplained restart is the one thing worse than a notification.
+    /// </param>
+    public void CheckForUpdates(Action<UpdateCheckResult>? report)
     {
         if (Interlocked.Exchange(ref updateCheckInProgress, 1) == 1)
         {
+            report?.Invoke(UpdateCheckResult.Skipped("An update check is already running."));
             return;
         }
 
-        SetUpdateMenuState(isChecking: true);
+        SetUpdateCheckState(isChecking: true);
 
         _ = Task.Run(async () =>
         {
             UpdateCheckResult result;
             try
             {
-                result = await new GitHubReleaseUpdater().CheckAndInstallLatestAsync(CancellationToken.None);
+                // ShellIdentity, not the defaults: while the two shells are installed side by
+                // side this must look at its OWN install folder and download its OWN MSI.
+                result = await ShellIdentity.CreateUpdater().CheckAndInstallLatestAsync(CancellationToken.None);
             }
             catch (Exception ex)
             {
@@ -188,35 +252,94 @@ public partial class App : Application
 
             queue?.TryEnqueue(() =>
             {
-                updateCheckInProgress = 0;
-                SetUpdateMenuState(isChecking: false);
-
-                var window = EnsureFlyout();
-                window.SetStatus(result.Message);
-                window.ShowFlyout();
+                SetUpdateCheckState(isChecking: false);
+                DiagnosticLog.Write("update check: {0} - {1}", result.Status, result.Message);
 
                 if (result.Status == UpdateCheckStatus.Installing)
                 {
-                    ExitApp();
+                    AnnounceInstallAndExit(result);
+                    return;
                 }
+
+                report?.Invoke(result);
             });
         });
     }
 
-    private void SetUpdateMenuState(bool isChecking)
+    /// <summary>
+    /// Shows the "installing" notice, then exits so msiexec can replace the files. The updater
+    /// has already queued a script that waits for this process, installs, and relaunches.
+    /// </summary>
+    private void AnnounceInstallAndExit(UpdateCheckResult result)
     {
-        if (checkForUpdatesItem is null)
+        var window = EnsureFlyout();
+        window.SetStatus($"{result.Message} The app will restart shortly.");
+        window.ShowFlyout();
+
+        if (queue is null)
+        {
+            ExitApp();
+            return;
+        }
+
+        var exitTimer = queue.CreateTimer();
+        exitTimer.Interval = InstallNoticeDwell;
+        exitTimer.IsRepeating = false;
+        exitTimer.Tick += (_, _) => ExitApp();
+        exitTimer.Start();
+    }
+
+    /// <summary>
+    /// Arms the automatic checks: one shortly after startup, then one every six hours. This is
+    /// the ONLY thing this app does on a background timer - the usage poll is gated on a window
+    /// being open (see <see cref="UsageRefreshService"/>), but an app that cannot reach its own
+    /// updates unless someone opens a window would never update at all.
+    /// </summary>
+    private void StartAutomaticUpdateChecks()
+    {
+        if (queue is null)
         {
             return;
         }
 
-        checkForUpdatesItem.IsEnabled = !isChecking;
-        checkForUpdatesItem.Text = isChecking ? "Checking for updates..." : "Check for updates";
+        // ONE timer, held in a field, that re-arms itself at the long interval after the first
+        // tick. A second local-variable timer for the startup check was tried first and its
+        // 10-second tick NEVER ARRIVED: an unrooted DispatcherQueueTimer is collected out from
+        // under its own Tick handler. The short-lived timers in MaybeAutoShow get away with it
+        // only because 1.5 seconds is too soon for a collection to happen.
+        updateTimer = queue.CreateTimer();
+        updateTimer.Interval = FirstUpdateCheckDelay;
+        updateTimer.IsRepeating = false;
+        updateTimer.Tick += (timer, _) =>
+        {
+            CheckForUpdates(report: null);
+
+            timer.Interval = AutomaticUpdateCheckInterval;
+            timer.IsRepeating = true;
+            timer.Start();
+        };
+        updateTimer.Start();
+    }
+
+    private void SetUpdateCheckState(bool isChecking)
+    {
+        updateCheckInProgress = isChecking ? 1 : 0;
+
+        if (checkForUpdatesItem is not null)
+        {
+            checkForUpdatesItem.IsEnabled = !isChecking;
+            checkForUpdatesItem.Text = isChecking ? "Checking for updates..." : "Check for updates";
+        }
+
+        UpdateCheckStateChanged?.Invoke(isChecking);
     }
 
     private void ExitApp()
     {
         DiagnosticLog.Write("exit requested");
+
+        updateTimer?.Stop();
+        updateTimer = null;
 
         ChartPrewarm.Stop();
         settingsWindow?.Close();

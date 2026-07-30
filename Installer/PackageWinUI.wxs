@@ -1,0 +1,90 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <!--
+    MSI for the WinUI 3 shell. This is a SECOND package alongside Package.wxs (the WinForms app),
+    not a replacement: while the rewrite is in preview both can be installed at once, so every
+    name here is deliberately distinct from the WinForms package's -
+
+      * a different UpgradeCode, or one package's MajorUpgrade would uninstall the other;
+      * a different INSTALLFOLDER, or each package's uninstall would delete the other's files;
+      * a different Run value name, or whichever was installed last would own autostart alone.
+
+    The three names the APP also has to agree with (install folder, Run value, MSI file name) are
+    stated in CodexBar.WinUI/ShellIdentity.cs. If they drift, the symptom is silent: the
+    self-updater decides it is not an installed build and simply never updates again.
+
+    Unlike the WinForms package this harvests the whole publish folder with <Files>, because a
+    self-contained WinUI 3 publish is ~540 files (the .NET runtime, the Windows App SDK's native
+    DLLs and ~90 locale folders) rather than the WinForms app's single-file exe.
+  -->
+  <Package
+    Name="CodexBar (WinUI 3)"
+    Manufacturer="Nirlep5252"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="{96483CED-BE0E-4F81-BD1B-2CC0C08CAACD}"
+    Scope="perUser">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of CodexBar (WinUI 3) is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="CodexBarWinUiIcon" SourceFile="$(var.PublishDir)\Assets\CodexBarWindows.ico" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsDirectory" Name="Programs">
+        <!-- Must equal ShellIdentity.InstallFolderName. -->
+        <Directory Id="INSTALLFOLDER" Name="CodexBar.WinUI" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="CodexBar (WinUI 3)" />
+    </StandardDirectory>
+
+    <!-- Harvests the publish folder, subdirectories included. WiX generates one component per
+         file with its own GUID, so adding or removing a runtime file needs no edit here. -->
+    <ComponentGroup Id="ApplicationFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(var.PublishDir)\**" />
+    </ComponentGroup>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <!-- Autostart, matching the WinForms package. The value NAME is what
+           StartupSettings.IsEnabledFor(ShellIdentity.StartupRegistryValueName) reads, so the
+           settings toggle shows "On" straight after an install. -->
+      <Component Id="StartupRegistration" Guid="{2389DDCA-4E88-4175-A3BA-7A47CD05E036}">
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Microsoft\Windows\CurrentVersion\Run"
+          Name="CodexBar.WinUI"
+          Value="&quot;[INSTALLFOLDER]CodexBar.WinUI.exe&quot;"
+          Type="string"
+          KeyPath="yes" />
+        <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+        <RemoveFolder Id="RemoveProgramsDirectory" Directory="ProgramsDirectory" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="ApplicationProgramsFolder">
+      <Component Id="StartMenuShortcut" Guid="{A9D35609-B8E6-4522-A681-0EAE240571FD}">
+        <Shortcut
+          Id="ApplicationStartMenuShortcut"
+          Name="CodexBar (WinUI 3)"
+          Description="Show Codex, Claude and Cursor usage from the Windows tray"
+          Target="[INSTALLFOLDER]CodexBar.WinUI.exe"
+          Icon="CodexBarWinUiIcon"
+          IconIndex="0"
+          WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveApplicationProgramsFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\CodexBar.WinUI"
+          Name="StartMenuShortcut"
+          Value="1"
+          Type="integer"
+          KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="MainFeature" Title="CodexBar (WinUI 3)" Level="1">
+      <ComponentGroupRef Id="ApplicationFiles" />
+      <ComponentRef Id="StartupRegistration" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>

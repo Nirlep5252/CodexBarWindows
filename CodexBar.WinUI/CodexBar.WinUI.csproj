@@ -62,4 +62,32 @@
     </Content>
   </ItemGroup>
 
+  <!--
+    WITHOUT THIS TARGET THE PUBLISHED APP CRASHES. `dotnet publish` on this unpackaged WinUI 3
+    project silently drops exactly two of the build outputs: this project's own compiled resource
+    index (CodexBar.WinUI.pri) and App.xbf. Every OTHER .pri is published (Microsoft.UI.pri,
+    Microsoft.UI.Xaml.Controls.pri, Microsoft.WindowsAppRuntime.pri), which is what makes the
+    omission so easy to miss - the publish output looks complete and the app even STARTS.
+
+    The failure it produces is not a missing-file error. The process launches, runs everything
+    that does not touch a XAML tree of ours, and then fail-fasts with 0xC0000409
+    (STATUS_STACK_BUFFER_OVERRUN) the moment the first x:Class window is constructed. It was
+    diagnosed by diffing the publish folder against the build folder - 538 files against 543 -
+    and confirmed by copying just these two files in by hand, after which the same publish ran
+    correctly.
+  -->
+  <Target Name="PublishWinUiResourceIndex" AfterTargets="ComputeResolvedFilesToPublishList">
+    <ItemGroup>
+      <_WinUiPublishExtras Include="$(TargetDir)$(TargetName).pri" />
+      <_WinUiPublishExtras Include="$(TargetDir)*.xbf" />
+      <!-- Idempotent: if a future Windows App SDK starts publishing these itself, the entries it
+           added are dropped here and re-added once, rather than duplicated. -->
+      <ResolvedFileToPublish Remove="@(_WinUiPublishExtras)" />
+      <ResolvedFileToPublish Include="@(_WinUiPublishExtras)">
+        <RelativePath>%(Filename)%(Extension)</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+  </Target>
+
 </Project>

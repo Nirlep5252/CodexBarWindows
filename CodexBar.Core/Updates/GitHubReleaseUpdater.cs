@@ -6,12 +6,29 @@ using System.Text.Json.Serialization;
 
 namespace CodexBarWindows;
 
-public sealed class GitHubReleaseUpdater
+/// <param name="installFolderName">
+/// Folder under <c>%LOCALAPPDATA%\Programs</c> that this shell's MSI installs into. Only a build
+/// running from there updates itself, so a dev build never overwrites the installed app. Defaults
+/// to <see cref="AppInfo.AppName"/>; the WinUI shell passes its own while the two are installed
+/// side by side (see <c>CodexBar.WinUI/ShellIdentity.cs</c>).
+/// </param>
+/// <param name="assetNameHint">
+/// Substring every candidate release asset must contain. This is a HARD filter, not a preference:
+/// once a release carries an MSI for each shell, a mere ordering hint would happily install the
+/// other app over this one when the preferred asset were missing.
+/// </param>
+public sealed class GitHubReleaseUpdater(string? installFolderName = null, string? assetNameHint = null)
 {
     private const string Owner = "Nirlep5252";
     private const string Repository = "CodexBarWindows";
     private const string RepositoryApiUrl = "https://api.github.com/repos/" + Owner + "/" + Repository;
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
+
+    private readonly string installFolderName =
+        string.IsNullOrWhiteSpace(installFolderName) ? AppInfo.AppName : installFolderName;
+
+    private readonly string assetNameHint =
+        string.IsNullOrWhiteSpace(assetNameHint) ? AppInfo.AppName : assetNameHint;
 
     public bool IsInstalledBuild
     {
@@ -20,7 +37,7 @@ public sealed class GitHubReleaseUpdater
             var installRoot = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "Programs",
-                "CodexBarWindows");
+                installFolderName);
 
             var baseDirectory = Path.GetFullPath(AppContext.BaseDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
             var expectedDirectory = Path.GetFullPath(installRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
@@ -58,13 +75,14 @@ public sealed class GitHubReleaseUpdater
 
         var msiAsset = release.Assets
             .Where(asset => asset.Name.EndsWith(".msi", StringComparison.OrdinalIgnoreCase))
+            .Where(asset => asset.Name.Contains(assetNameHint, StringComparison.OrdinalIgnoreCase))
             .OrderByDescending(asset => asset.Name.Contains("win-x64", StringComparison.OrdinalIgnoreCase))
-            .ThenByDescending(asset => asset.Name.Contains("CodexBarWindows", StringComparison.OrdinalIgnoreCase))
             .FirstOrDefault();
 
         if (msiAsset is null)
         {
-            return UpdateCheckResult.Skipped($"Release {release.TagName} does not include an MSI asset.");
+            return UpdateCheckResult.Skipped(
+                $"Release {release.TagName} does not include an MSI asset named for {assetNameHint}.");
         }
 
         var msiPath = await DownloadAssetAsync(httpClient, msiAsset, releaseVersion, cancellationToken).ConfigureAwait(false);
