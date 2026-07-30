@@ -959,7 +959,6 @@ public sealed class UsageGraphsForm : Form
         private double vibeRevealProgress = 1d;
         private IDisposable? vibeRevealAnimation;
         private int vibeRevealedDataKey;
-        private SparkleField? sparkles;
         private ProviderVibe vibePalette = VibeTheme.SignatureVibe;
         private bool vibeForceReveal;
         private bool vibeCollapsePending;
@@ -1108,7 +1107,6 @@ public sealed class UsageGraphsForm : Form
             {
                 entranceAnimation?.Dispose();
                 vibeRevealAnimation?.Dispose();
-                sparkles?.Dispose();
                 toolTip.Dispose();
             }
 
@@ -1232,11 +1230,6 @@ public sealed class UsageGraphsForm : Form
             DrawGridAndAxis(graphics, plot, axisMax);
             DrawBars(graphics, plot, axisMax);
             DrawDateLabels(graphics, plot);
-
-            if (FluentTheme.VibesActive)
-            {
-                sparkles?.Render(graphics);
-            }
         }
 
         private void DrawLegend(Graphics graphics, int pad)
@@ -1641,8 +1634,8 @@ public sealed class UsageGraphsForm : Form
 
         /// <summary>
         /// Vibes-only growth reveal: bars grow from the baseline over ~900ms with a small
-        /// per-bar stagger, then one sparkle burst celebrates the tallest bar. Never runs
-        /// while the chart is hidden; a reveal in flight is cancelled by the next one.
+        /// per-bar stagger. Never runs while the chart is hidden; a reveal in flight is
+        /// cancelled by the next one.
         /// </summary>
         private void StartVibeReveal()
         {
@@ -1670,45 +1663,7 @@ public sealed class UsageGraphsForm : Form
                     {
                         Invalidate();
                     }
-                },
-                completed: () =>
-                {
-                    if (!IsDisposed && FluentTheme.VibesActive)
-                    {
-                        FireVibeSparkle();
-                    }
                 });
-        }
-
-        /// <summary>One celebration burst at the top of the tallest bar (once per reveal).</summary>
-        private void FireVibeSparkle()
-        {
-            if (daily.Count == 0)
-            {
-                return;
-            }
-
-            var peakIndex = 0;
-            for (var index = 1; index < daily.Count; index++)
-            {
-                if (daily[index].EstimatedCostUsd > daily[peakIndex].EstimatedCostUsd)
-                {
-                    peakIndex = index;
-                }
-            }
-
-            if (daily[peakIndex].EstimatedCostUsd <= 0)
-            {
-                return;
-            }
-
-            var plot = PlotBounds;
-            var axisMax = NiceCeiling(daily.Max(day => day.EstimatedCostUsd));
-            var slotWidth = (float)plot.Width / daily.Count;
-            var barHeight = (float)(plot.Height * (double)(daily[peakIndex].EstimatedCostUsd / axisMax));
-            var origin = new PointF(plot.Left + ((peakIndex + 0.5f) * slotWidth), plot.Bottom - barHeight);
-            sparkles ??= new SparkleField(this);
-            sparkles.Burst(origin);
         }
 
         /// <summary>Cheap identity hash so the reveal replays only when the data actually changes.</summary>
