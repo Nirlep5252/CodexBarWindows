@@ -24,7 +24,7 @@ public partial class App : Application
     private TaskbarIcon? trayIcon;
     private FlyoutWindow? flyout;
     private SettingsWindow? settingsWindow;
-    private ToolWindow? graphsWindow;
+    private GraphsWindow? graphsWindow;
     private MenuFlyoutItem? checkForUpdatesItem;
     private int updateCheckInProgress;
 
@@ -62,6 +62,10 @@ public partial class App : Application
 
         CreateTrayIcon();
         DiagnosticLog.Write("shell ready (windowless)");
+
+        // Pays LiveCharts' one-off Skia initialisation off-screen, so the first "Usage graphs"
+        // open does not sit blank for half a second. See ChartPrewarm.
+        ChartPrewarm.Start(queue);
 
         MaybeAutoShow();
     }
@@ -140,61 +144,25 @@ public partial class App : Application
         window.ShowAndFocus();
     }
 
+    /// <summary>
+    /// Opens the Usage graphs window. The window itself owns the history gate (it is the only
+    /// surface that plots the 30-day scan) and the poll-timer registration, so this only has to
+    /// create it once and hand it focus afterwards.
+    /// </summary>
     private void ShowGraphs()
     {
-        graphsWindow = ShowToolWindow(
-            graphsWindow,
-            window => graphsWindow = window,
-            "Usage graphs",
-            "Usage graphs",
-            "Charts are built in a later phase. LiveCharts needs a pre-warm pass at startup, which lands with the charts themselves.",
-            widthDip: 900,
-            heightDip: 600);
-
-        // The graphs window shows usage too, so it counts for the visibility gate; and it is
-        // the only surface that plots the 30-day history, so it is the only reason to pay for
-        // the session-log scan.
-        if (usage is not null)
+        if (graphsWindow is not null)
         {
-            usage.IncludeHistory = true;
-            usage.SetWindowOpen(GraphsWindowId, true);
-            usage.Refresh();
-        }
-    }
-
-    private const string GraphsWindowId = "graphs";
-
-    private ToolWindow ShowToolWindow(
-        ToolWindow? existing,
-        Action<ToolWindow?> assign,
-        string title,
-        string heading,
-        string body,
-        int widthDip,
-        int heightDip)
-    {
-        if (existing is not null)
-        {
-            existing.ShowAndFocus();
-            return existing;
+            graphsWindow.ShowAndFocus();
+            return;
         }
 
-        var window = new ToolWindow(title, heading, body, widthDip, heightDip);
-        window.Closed += (_, _) =>
-        {
-            // Identity is checked BEFORE assign clears the field it would be compared against.
-            var wasGraphs = ReferenceEquals(window, graphsWindow);
-            assign(null);
-            if (usage is not null && wasGraphs)
-            {
-                usage.IncludeHistory = false;
-                usage.SetWindowOpen(GraphsWindowId, false);
-            }
-        };
+        var window = new GraphsWindow(usage!);
+        graphsWindow = window;
+        window.Closed += (_, _) => graphsWindow = null;
         // A sibling window losing focus is invisible to the flyout, so it re-arms the check.
         window.ActivationChanged += (_, _) => flyout?.ReArmDismissCheck();
         window.ShowAndFocus();
-        return window;
     }
 
     private void BeginUpdateCheck()
@@ -250,6 +218,7 @@ public partial class App : Application
     {
         DiagnosticLog.Write("exit requested");
 
+        ChartPrewarm.Stop();
         settingsWindow?.Close();
         graphsWindow?.Close();
         flyout?.ShutDown();
@@ -294,6 +263,18 @@ public partial class App : Application
             settingsTimer.IsRepeating = false;
             settingsTimer.Tick += (_, _) => ShowSettings();
             settingsTimer.Start();
+        }
+
+        if (double.TryParse(
+                Environment.GetEnvironmentVariable("CODEXBAR_WINUI_AUTOGRAPHS"),
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var graphsDelay) && graphsDelay > 0)
+        {
+            var graphsTimer = queue.CreateTimer();
+            graphsTimer.Interval = TimeSpan.FromSeconds(graphsDelay);
+            graphsTimer.IsRepeating = false;
+            graphsTimer.Tick += (_, _) => ShowGraphs();
+            graphsTimer.Start();
         }
 
         if (int.TryParse(Environment.GetEnvironmentVariable("CODEXBAR_WINUI_AUTOEXIT"), out var seconds) && seconds > 0)

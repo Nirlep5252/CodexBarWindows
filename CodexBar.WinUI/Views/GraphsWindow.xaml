@@ -1,0 +1,261 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<Window
+    x:Class="CodexBar.WinUI.GraphsWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:lvc="using:LiveChartsCore.SkiaSharpView.WinUI">
+
+    <!--
+      The WinForms UsageGraphsForm hand-painted both charts with GDI+ (bars, gridlines, axis
+      labels, legend, hover highlight, tooltips and entrance animations - roughly 1200 of its
+      2072 lines). Here the two charts are LiveCharts2 CartesianCharts and the code-behind only
+      shapes data into series. Everything else on this window is a stock control.
+    -->
+    <Grid x:Name="RootGrid" Background="Transparent">
+        <Border x:Name="TintLayer" />
+
+        <Grid Margin="24,20,24,24">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <!-- Minimums low enough that the two charts still fit under an open error bar
+                     at the default window height; the window is resizable for more. -->
+                <RowDefinition Height="3*" MinHeight="200" />
+                <RowDefinition Height="2*" MinHeight="150" />
+            </Grid.RowDefinitions>
+
+            <!-- ============================================================ header -->
+            <Grid Grid.Row="0" Margin="0,0,0,14">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                    <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="Usage graphs" />
+                    <StackPanel
+                        Margin="0,2,0,0"
+                        Orientation="Horizontal"
+                        Spacing="6">
+                        <!-- Stale data is stated, never implied: the glyph and the warning colour
+                             appear together with "Showing data from ...". -->
+                        <FontIcon
+                            x:Name="StaleIcon"
+                            FontSize="12"
+                            Glyph="&#xE7BA;"
+                            Visibility="Collapsed"
+                            VerticalAlignment="Center" />
+                        <TextBlock
+                            x:Name="SubtitleText"
+                            Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                            Style="{StaticResource CaptionTextBlockStyle}"
+                            Text="Local session estimates"
+                            TextWrapping="Wrap"
+                            VerticalAlignment="Center" />
+                        <ProgressRing
+                            x:Name="BusyRing"
+                            Width="14"
+                            Height="14"
+                            IsActive="False"
+                            Visibility="Collapsed"
+                            VerticalAlignment="Center" />
+                    </StackPanel>
+                </StackPanel>
+
+                <ComboBox
+                    x:Name="ProviderCombo"
+                    Grid.Column="1"
+                    MinWidth="200"
+                    AutomationProperties.Name="Provider"
+                    SelectionChanged="OnProviderSelectionChanged"
+                    VerticalAlignment="Center" />
+            </Grid>
+
+            <!-- ===================================================== error / notice -->
+            <!--
+              Errors keep their FULL text here, exactly as in the flyout: wrapped (never
+              ellipsised), repeated in the tooltip, and copyable - the message is frequently the
+              only explanation the app can give for missing numbers.
+            -->
+            <InfoBar
+                x:Name="ErrorBar"
+                Grid.Row="1"
+                Margin="0,0,0,12"
+                IsClosable="False"
+                IsOpen="False"
+                IsTabStop="True">
+                <InfoBar.ActionButton>
+                    <Button
+                        x:Name="CopyErrorButton"
+                        Click="OnCopyError"
+                        Content="Copy" />
+                </InfoBar.ActionButton>
+            </InfoBar>
+
+            <!-- ===================================================== summary cards -->
+            <Grid Grid.Row="2" Margin="0,0,0,12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="12" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Border
+                    Grid.Column="0"
+                    Padding="16,12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    CornerRadius="{ThemeResource ControlCornerRadius}">
+                    <StackPanel>
+                        <TextBlock
+                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                            Style="{StaticResource CaptionTextBlockStyle}"
+                            Text="Today" />
+                        <TextBlock
+                            x:Name="TodayValueText"
+                            Style="{StaticResource SubtitleTextBlockStyle}"
+                            Text="--" />
+                        <TextBlock
+                            x:Name="TodayDetailText"
+                            Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                            Style="{StaticResource CaptionTextBlockStyle}"
+                            Text="" />
+                    </StackPanel>
+                </Border>
+
+                <Border
+                    Grid.Column="2"
+                    Padding="16,12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    CornerRadius="{ThemeResource ControlCornerRadius}">
+                    <StackPanel>
+                        <TextBlock
+                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                            Style="{StaticResource CaptionTextBlockStyle}"
+                            Text="Last 30 days" />
+                        <TextBlock
+                            x:Name="MonthValueText"
+                            Style="{StaticResource SubtitleTextBlockStyle}"
+                            Text="--" />
+                        <TextBlock
+                            x:Name="MonthDetailText"
+                            Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                            Style="{StaticResource CaptionTextBlockStyle}"
+                            Text="" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <!-- ======================================================= daily chart -->
+            <Border
+                Grid.Row="3"
+                Margin="0,0,0,12"
+                Padding="16,12,16,12"
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1"
+                CornerRadius="{ThemeResource ControlCornerRadius}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <TextBlock
+                        Grid.Row="0"
+                        Style="{StaticResource BodyStrongTextBlockStyle}"
+                        Text="Estimated spend by day" />
+
+                    <Grid Grid.Row="1" Margin="0,6,0,0">
+                        <!-- Transparent: the chart control's own background defaults to an
+                             opaque black, which would punch a hole in the card. -->
+                        <lvc:CartesianChart x:Name="DailyChart" Background="Transparent" />
+                        <StackPanel
+                            x:Name="DailyOverlay"
+                            HorizontalAlignment="Center"
+                            Orientation="Horizontal"
+                            Spacing="10"
+                            VerticalAlignment="Center"
+                            Visibility="Collapsed">
+                            <ProgressRing
+                                x:Name="DailyOverlayRing"
+                                Width="18"
+                                Height="18"
+                                IsActive="False"
+                                Visibility="Collapsed" />
+                            <TextBlock
+                                x:Name="DailyOverlayText"
+                                Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                Style="{StaticResource BodyTextBlockStyle}"
+                                VerticalAlignment="Center" />
+                        </StackPanel>
+                    </Grid>
+                </Grid>
+            </Border>
+
+            <!-- ======================================================= model chart -->
+            <Border
+                Grid.Row="4"
+                Padding="16,12,16,12"
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1"
+                CornerRadius="{ThemeResource ControlCornerRadius}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+
+                    <Grid Grid.Row="0">
+                        <TextBlock
+                            Style="{StaticResource BodyStrongTextBlockStyle}"
+                            Text="Estimated spend by model" />
+                        <TextBlock
+                            Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                            HorizontalAlignment="Right"
+                            Style="{StaticResource CaptionTextBlockStyle}"
+                            Text="Last 30 days"
+                            VerticalAlignment="Center" />
+                    </Grid>
+
+                    <Grid Grid.Row="1" Margin="0,6,0,0">
+                        <lvc:CartesianChart x:Name="ModelChart" Background="Transparent" />
+                        <StackPanel
+                            x:Name="ModelOverlay"
+                            HorizontalAlignment="Center"
+                            Orientation="Horizontal"
+                            Spacing="10"
+                            VerticalAlignment="Center"
+                            Visibility="Collapsed">
+                            <ProgressRing
+                                x:Name="ModelOverlayRing"
+                                Width="18"
+                                Height="18"
+                                IsActive="False"
+                                Visibility="Collapsed" />
+                            <TextBlock
+                                x:Name="ModelOverlayText"
+                                Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                Style="{StaticResource BodyTextBlockStyle}"
+                                VerticalAlignment="Center" />
+                        </StackPanel>
+                    </Grid>
+
+                    <TextBlock
+                        x:Name="ModelOverflowText"
+                        Grid.Row="2"
+                        Margin="0,4,0,0"
+                        Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                        Style="{StaticResource CaptionTextBlockStyle}"
+                        Visibility="Collapsed" />
+                </Grid>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>

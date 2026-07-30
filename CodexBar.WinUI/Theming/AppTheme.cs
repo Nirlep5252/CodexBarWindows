@@ -119,6 +119,11 @@ internal static class AppTheme
         window.SystemBackdrop = CreateBackdrop();
         ApplyTint(root, tintLayer);
 
+        // The system caption bar does not follow the XAML theme on its own.
+        NativeWindow.SetTitleBarTheme(
+            WinRT.Interop.WindowNative.GetWindowHandle(window),
+            root.ActualTheme == ElementTheme.Dark);
+
         DiagnosticLog.Write(
             "theme applied window={0} requested={1} actual={2} material={3} backdrop={4} tint={5}%",
             window.GetType().Name,

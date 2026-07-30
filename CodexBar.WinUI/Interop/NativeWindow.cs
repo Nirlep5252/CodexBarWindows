@@ -9,6 +9,7 @@ namespace CodexBar.WinUI;
 /// </summary>
 internal static class NativeWindow
 {
+    private const int DwmwaUseImmersiveDarkMode = 20;
     private const int DwmwaWindowCornerPreference = 33;
     private const int DwmwcpRoundSmall = 3;   // 2 = DWMWCP_ROUND, the larger radius.
 
@@ -16,6 +17,18 @@ internal static class NativeWindow
     {
         var preference = DwmwcpRoundSmall;
         _ = DwmSetWindowAttribute(hwnd, DwmwaWindowCornerPreference, ref preference, sizeof(int));
+    }
+
+    /// <summary>
+    /// Paints the system title bar light or dark. WinUI 3 does NOT do this for an unpackaged
+    /// window: a dark-themed settings or graphs window shipped with a white caption bar until
+    /// this was called (verified by sampling the captured pixels - #F3F3F3 over #202020 content).
+    /// A window with no title bar (the flyout) is unaffected.
+    /// </summary>
+    public static void SetTitleBarTheme(IntPtr hwnd, bool isDark)
+    {
+        var value = isDark ? 1 : 0;
+        _ = DwmSetWindowAttribute(hwnd, DwmwaUseImmersiveDarkMode, ref value, sizeof(int));
     }
 
     public static double ScaleFor(IntPtr hwnd)

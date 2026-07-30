@@ -44,6 +44,9 @@
     <!-- SettingsCard / SettingsExpander: the idiomatic Windows 11 settings surface. Verified
          to restore, compile AND run unpackaged against WindowsAppSDK 1.8 before it was adopted. -->
     <PackageReference Include="CommunityToolkit.WinUI.Controls.SettingsControls" Version="8.2.251219" />
+    <!-- Charts for the Usage graphs window. Verified to render UNPACKAGED; it costs ~0.5s of
+         Skia init on the first render in a process, which App pays off-screen at startup. -->
+    <PackageReference Include="LiveChartsCore.SkiaSharpView.WinUI" Version="2.0.5" />
     <Manifest Include="$(ApplicationManifest)" />
   </ItemGroup>
 
