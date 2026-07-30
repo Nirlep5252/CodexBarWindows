@@ -342,6 +342,15 @@ public sealed class UsagePopupForm : Form
             _ = Handle;
         }
 
+        // The backdrop must be applied BEFORE tokens are resolved: RefreshTheme picks
+        // opaque or translucent fills based on backdropActive, and on the first open the
+        // flag is still false — cards would paint opaque over a translucent body and the
+        // window would look different from every later open.
+        if (uiSettings.EffectiveMaterial != BackdropMaterial.Solid)
+        {
+            ApplyBackdropMaterial();
+        }
+
         RefreshTheme();
         ApplyScaledLayout();
         var target = CalculateLocation(anchor);
@@ -392,7 +401,8 @@ public sealed class UsagePopupForm : Form
 
         if (uiSettings.EffectiveMaterial != BackdropMaterial.Solid)
         {
-            ApplyBackdropMaterial();
+            // Backdrop was applied before Show; the nudge (which needs a visible window)
+            // forces DWM to actually composite it.
             NudgeSizeForBackdrop();
         }
     }
