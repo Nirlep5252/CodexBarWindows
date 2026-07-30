@@ -66,10 +66,22 @@ public static class FluentTheme
     private static (Color Light2, Color Dark1)? cachedAccentVariants;
 
     /// <summary>
-    /// True while the opt-in "vibes" appearance is enabled. Set from <see cref="UiSettings"/>
-    /// on load and save; when false the token sets below are exactly the stock Fluent ones.
+    /// True while the opt-in "vibes" appearance is enabled; when false the token sets below are
+    /// exactly the stock Fluent ones.
     /// </summary>
-    public static bool VibesActive { get; set; }
+    /// <remarks>
+    /// This layer OBSERVES <see cref="UiSettings"/> rather than being written by it. The previous
+    /// direction made the settings type — which the UI-free logic layer wants to share — depend on
+    /// the UI theme, which blocks reusing it outside WinForms. Seeding happens in the static
+    /// constructor, so the value is correct from the first read regardless of startup order.
+    /// </remarks>
+    public static bool VibesActive { get; private set; }
+
+    static FluentTheme()
+    {
+        VibesActive = UiSettings.Load().VibesEnabled;
+        UiSettings.Changed += (_, _) => VibesActive = UiSettings.Load().VibesEnabled;
+    }
 
     /// <summary>
     /// Builds the token set for the requested theme. When <paramref name="onBackdrop"/> is false

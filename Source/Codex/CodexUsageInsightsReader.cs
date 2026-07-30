@@ -11,14 +11,27 @@ public sealed class CodexUsageInsightsReader
     private const int MaxFilesToScan = 1200;
     private readonly string codexHome;
 
+    /// <summary>
+    /// The on-disk cache is a single shared file keyed by absolute path, so only the reader
+    /// scanning the real Codex home may write it. A reader pointed at a custom home (tests,
+    /// fixtures) scans a different corpus and would otherwise clobber the user's cache.
+    /// </summary>
+    private readonly bool persistCache;
+
     public CodexUsageInsightsReader()
-        : this(ResolveCodexHome())
+        : this(ResolveCodexHome(), persistCache: true)
     {
     }
 
     public CodexUsageInsightsReader(string codexHome)
+        : this(codexHome, persistCache: false)
+    {
+    }
+
+    private CodexUsageInsightsReader(string codexHome, bool persistCache)
     {
         this.codexHome = codexHome;
+        this.persistCache = persistCache;
     }
 
     public ProviderUsageInsightsLookupResult ReadLatest()
@@ -51,23 +64,23 @@ public sealed class CodexUsageInsightsReader
             var models = new Dictionary<string, MutableUsage>(StringComparer.OrdinalIgnoreCase);
             var fastTurnIds = ReadFastTurnIdsFromCodexLogs(codexHome);
 
-            foreach (var file in codexFiles)
+            // Per-file scanning is independent and CPU-bound (JSON parse dominates), so it runs
+            // in parallel; FileRowsCache is a ConcurrentDictionary. Aggregation stays sequential
+            // below because MutableUsage accumulators are not thread-safe. DOP is capped so a
+            // refresh does not monopolise the machine — this only ever runs while a window is
+            // open, so idle CPU is unaffected.
+            EnsurePersistedCacheLoaded();
+            var scanned = ScanFilesInParallel(codexFiles, piFiles, firstScanDay);
+
+            foreach (var row in scanned)
             {
-                foreach (var row in GetOrScanFileRows(file, firstScanDay, isPiFile: false))
-                {
-                    ApplyRow(row, firstScanDay, daily, models, fastTurnIds);
-                }
+                ApplyRow(row, firstReportDay, daily, models, fastTurnIds);
             }
 
-            foreach (var file in piFiles)
-            {
-                foreach (var row in GetOrScanFileRows(file, firstScanDay, isPiFile: true))
-                {
-                    ApplyRow(row, firstScanDay, daily, models, fastTurnIds);
-                }
-            }
-
-            PruneFileRowsCache();
+            var piPaths = piFiles.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var scannedPaths = codexFiles.Concat(piFiles).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            PruneFileRowsCache(scannedPaths);
+            SavePersistedCache(firstReportDay, piPaths);
 
             var dailyRows = Enumerable.Range(0, DaysToReport)
                 .Select(offset => firstReportDay.AddDays(offset))
@@ -386,21 +399,97 @@ public sealed class CodexUsageInsightsReader
     private sealed record CachedFileRows(
         long Length,
         long LastWriteUtcTicks,
+        long CreationUtcTicks,
         DateOnly FirstScanDay,
         IReadOnlyList<CodexScanRow> Rows);
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, CachedFileRows> FileRowsCache =
         new(StringComparer.OrdinalIgnoreCase);
 
+    private const string CacheProviderName = "codex";
+    private static int persistedCacheLoaded;
+
+    /// <summary>Set whenever a file is actually (re)scanned, so an unchanged refresh skips the write.</summary>
+    private static int cacheDirty;
+
+    /// <summary>Seeds the in-memory cache from disk once per process, on the first history read.</summary>
+    private void EnsurePersistedCacheLoaded()
+    {
+        if (!persistCache || Interlocked.Exchange(ref persistedCacheLoaded, 1) == 1)
+        {
+            return;
+        }
+
+        var entries = UsageScanCache.TryLoad<CodexScanRow>(CacheProviderName);
+        if (entries is null)
+        {
+            return;
+        }
+
+        foreach (var (path, entry) in entries)
+        {
+            FileRowsCache.TryAdd(
+                path,
+                new CachedFileRows(entry.Length, entry.LastWriteUtcTicks, entry.CreationUtcTicks, entry.FirstScanDay, entry.Rows));
+        }
+    }
+
+    /// <summary>
+    /// Writes the current cache to disk, keeping only files that still exist and still carry rows
+    /// inside the reported window.
+    /// </summary>
+    /// <remarks>
+    /// pi files are deliberately NOT persisted. A pi row's <c>BaseFast</c> is decided by
+    /// <see cref="IsFastMode"/>, which falls through to a pricing-dependent cost heuristic, and pi
+    /// rows carry no turn id — so unlike Codex rows, replay cannot re-derive it. Persisting one
+    /// would freeze a classification made under whatever pricing table happened to be loaded at
+    /// scan time. pi corpora are small, so rescanning them each launch costs almost nothing.
+    /// </remarks>
+    private void SavePersistedCache(DateOnly firstReportDay, IReadOnlySet<string> piPaths)
+    {
+        // Only the default-rooted reader owns the shared cache file. A reader pointed at a custom
+        // root (tests, fixtures) scans a different corpus entirely and must not overwrite it.
+        if (!persistCache || Interlocked.Exchange(ref cacheDirty, 0) == 0)
+        {
+            return;
+        }
+
+        var entries = new Dictionary<string, UsageScanCacheEntry<CodexScanRow>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (path, cached) in FileRowsCache)
+        {
+            if (piPaths.Contains(path) || !File.Exists(path))
+            {
+                continue;
+            }
+
+            // Rows are trimmed to the report window, but entries with no rows are KEPT: an empty
+            // result is an expensive thing to re-derive (see PruneFileRowsCache).
+            var rows = cached.Rows.Where(row => row.Day >= firstReportDay).ToArray();
+            entries[path] = new UsageScanCacheEntry<CodexScanRow>(
+                cached.Length,
+                cached.LastWriteUtcTicks,
+                cached.CreationUtcTicks,
+                // Clamp so a reloaded entry never claims coverage for days whose rows were just
+                // trimmed away. Safe today because aggregation filters to firstReportDay, but the
+                // entry should be self-consistent rather than depend on that invariant holding.
+                cached.FirstScanDay > firstReportDay ? cached.FirstScanDay : firstReportDay,
+                rows);
+        }
+
+        UsageScanCache.TrySave(CacheProviderName, entries);
+    }
+
     private static IReadOnlyList<CodexScanRow> GetOrScanFileRows(string file, DateOnly firstScanDay, bool isPiFile)
     {
         long length;
         long lastWriteUtcTicks;
+        long creationUtcTicks;
         try
         {
             var info = new FileInfo(file);
             length = info.Length;
             lastWriteUtcTicks = info.LastWriteTimeUtc.Ticks;
+            creationUtcTicks = info.CreationTimeUtc.Ticks;
         }
         catch
         {
@@ -409,29 +498,38 @@ public sealed class CodexUsageInsightsReader
 
         // A cached scan taken with an earlier lookback window is still valid: rows older than the
         // current window were already excluded then, and days only move forward.
+        // Note Length carries this check for Codex rollouts: Codex holds the rollout handle open,
+        // so NTFS leaves LastWriteTimeUtc frozen while the file grows. Never treat an unchanged
+        // write time as "unchanged file" here.
         if (FileRowsCache.TryGetValue(file, out var cached) &&
             cached.Length == length &&
             cached.LastWriteUtcTicks == lastWriteUtcTicks &&
+            cached.CreationUtcTicks == creationUtcTicks &&
             cached.FirstScanDay <= firstScanDay)
         {
             return cached.Rows;
         }
 
         var rows = isPiFile ? ScanPiFile(file, firstScanDay) : ScanCodexFile(file, firstScanDay);
-        FileRowsCache[file] = new CachedFileRows(length, lastWriteUtcTicks, firstScanDay, rows);
+        FileRowsCache[file] = new CachedFileRows(length, lastWriteUtcTicks, creationUtcTicks, firstScanDay, rows);
+        Interlocked.Exchange(ref cacheDirty, 1);
         return rows;
     }
 
-    private static void PruneFileRowsCache()
+    private static void PruneFileRowsCache(IReadOnlySet<string> scannedPaths)
     {
-        if (FileRowsCache.Count <= 2048)
-        {
-            return;
-        }
-
+        // Evicting only deleted paths did not bound anything: session logs stay on disk long
+        // after they age out of the scan window, so their entries were retained for the life of
+        // the process. Retaining exactly the files enumerated this pass is both exact and free —
+        // enumeration already applies the mtime window — and needs no extra stat calls.
+        //
+        // Crucially this keeps entries that produced NO rows. Those are the most valuable ones:
+        // a rollout classified SuppressWholeFile returns an empty list only after up to three
+        // full passes over the largest files in the corpus, so dropping it would re-parse the
+        // most expensive file in the set on every refresh.
         foreach (var path in FileRowsCache.Keys)
         {
-            if (!File.Exists(path))
+            if (!scannedPaths.Contains(path))
             {
                 FileRowsCache.TryRemove(path, out _);
             }
@@ -440,12 +538,16 @@ public sealed class CodexUsageInsightsReader
 
     private static void ApplyRow(
         CodexScanRow row,
-        DateOnly firstScanDay,
+        DateOnly firstReportDay,
         IDictionary<DateOnly, MutableUsage> daily,
         IDictionary<string, MutableUsage> models,
         IReadOnlySet<string> fastTurnIds)
     {
-        if (row.Day < firstScanDay)
+        // Aggregate over the REPORTED window, not the scan window. Files are selected with a
+        // wider lookback (ScanLookbackDays) so a file whose mtime is just outside the window can
+        // still contribute in-window rows — but rows older than the chart's first day must not
+        // reach the model breakdown, or it silently totals more than the chart it sits beside.
+        if (row.Day < firstReportDay)
         {
             return;
         }
@@ -454,6 +556,44 @@ public sealed class CodexUsageInsightsReader
         var categoryLabel = ModelBreakdownLabel(row.Model, isFastMode);
         Add(daily, row.Day, row.Model, row.Tokens, isFastMode, row.ExactCostUsd, categoryLabel);
         Add(models, ModelBreakdownKey(row.Model, isFastMode), row.Model, row.Tokens, isFastMode, row.ExactCostUsd, categoryLabel);
+    }
+
+    /// <summary>Bounded so a refresh leaves cores free for the rest of the machine.</summary>
+    private static int ScanParallelism => Math.Clamp(Environment.ProcessorCount - 2, 1, 8);
+
+    /// <summary>
+    /// Scans every file in parallel and returns the rows in a deterministic order: Codex files
+    /// first, then pi, each in the caller's order. Order matters because it feeds the accounting
+    /// replay, so results are placed by index rather than appended as they complete.
+    /// </summary>
+    private IReadOnlyList<CodexScanRow> ScanFilesInParallel(
+        IReadOnlyList<string> codexFiles,
+        IReadOnlyList<string> piFiles,
+        DateOnly firstScanDay)
+    {
+        var perFile = new IReadOnlyList<CodexScanRow>[codexFiles.Count + piFiles.Count];
+        var options = new ParallelOptions { MaxDegreeOfParallelism = ScanParallelism };
+
+        Parallel.For(0, perFile.Length, options, index =>
+        {
+            var isPiFile = index >= codexFiles.Count;
+            var path = isPiFile ? piFiles[index - codexFiles.Count] : codexFiles[index];
+            perFile[index] = GetOrScanFileRows(path, firstScanDay, isPiFile);
+        });
+
+        var total = 0;
+        foreach (var rows in perFile)
+        {
+            total += rows.Count;
+        }
+
+        var combined = new List<CodexScanRow>(total);
+        foreach (var rows in perFile)
+        {
+            combined.AddRange(rows);
+        }
+
+        return combined;
     }
 
     private static IEnumerable<string> ReadSharedLines(string path)

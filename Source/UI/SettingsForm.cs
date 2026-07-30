@@ -21,6 +21,7 @@ public sealed class SettingsForm : Form
     private const string StartupGlyph = "\uE7E8";     // Power button
     private const string MaterialGlyph = "\uE771";    // Personalize
     private const string VibesGlyph = "\uE945";       // Lightning bolt
+    private const string ToolsGlyph = "\uE90F";       // Developer tools
 
     private readonly Font subtitleFont;
     private readonly Font bodyFont;
@@ -31,6 +32,11 @@ public sealed class SettingsForm : Form
 
     private FluentTokens tokens;
     private UiSettings uiSettings;
+
+    // Coalesces tint-slider drag ticks into one save. Runs only mid-drag and is stopped on
+    // every commit, so it adds no idle work.
+    private readonly System.Windows.Forms.Timer opacityCommitTimer = new() { Interval = 150 };
+    private int? pendingTintPercent;
 
     private Panel generalPage = null!;
     private Panel appearancePage = null!;
@@ -53,6 +59,14 @@ public sealed class SettingsForm : Form
     private Label opacityValueLabel = null!;
     private SettingsCard vibesCard = null!;
     private FluentToggle vibesToggle = null!;
+
+    private SettingsCard codexEnabledCard = null!;
+    private FluentToggle codexEnabledToggle = null!;
+    private SettingsCard claudeEnabledCard = null!;
+    private FluentToggle claudeEnabledToggle = null!;
+    private SettingsCard cursorEnabledCard = null!;
+    private FluentToggle cursorEnabledToggle = null!;
+    private bool suppressProviderToggleEvents;
 
     private Label accountsTitleLabel = null!;
     private Label accountsCaptionLabel = null!;
@@ -153,13 +167,27 @@ public sealed class SettingsForm : Form
 
     protected override void Dispose(bool disposing)
     {
+        // Flush before base.Dispose: a disposed form cannot save, and the pending tint from a
+        // drag that ended inside the debounce window would otherwise be dropped.
+        if (disposing)
+        {
+            CommitPendingTint();
+        }
+
         base.Dispose(disposing);
         if (disposing)
         {
+            opacityCommitTimer.Dispose();
             subtitleFont.Dispose();
             bodyFont.Dispose();
             captionFont.Dispose();
         }
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        CommitPendingTint();
+        base.OnFormClosing(e);
     }
 
     private Panel CreatePage()
@@ -212,7 +240,76 @@ public sealed class SettingsForm : Form
             Title = "Version"
         };
 
-        generalPage.Controls.AddRange([generalTitleLabel, startupCard, versionCard]);
+        codexEnabledToggle = new FluentToggle(tokens) { Checked = uiSettings.CodexEnabled, Size = new Size(40, 20) };
+        codexEnabledToggle.CheckedChanged += (_, _) => OnProviderEnabledChanged();
+        codexEnabledCard = new SettingsCard(tokens)
+        {
+            Description = "Show Codex usage and poll the Codex CLI",
+            Glyph = ToolsGlyph,
+            Location = new Point(24, 214),
+            Size = new Size(532, 64),
+            Title = "Codex"
+        };
+        codexEnabledCard.ActionControl = codexEnabledToggle;
+
+        claudeEnabledToggle = new FluentToggle(tokens) { Checked = uiSettings.ClaudeEnabled, Size = new Size(40, 20) };
+        claudeEnabledToggle.CheckedChanged += (_, _) => OnProviderEnabledChanged();
+        claudeEnabledCard = new SettingsCard(tokens)
+        {
+            Description = "Show Claude usage and read Claude Code session data",
+            Glyph = ToolsGlyph,
+            Location = new Point(24, 286),
+            Size = new Size(532, 64),
+            Title = "Claude"
+        };
+        claudeEnabledCard.ActionControl = claudeEnabledToggle;
+
+        cursorEnabledToggle = new FluentToggle(tokens) { Checked = uiSettings.CursorEnabled, Size = new Size(40, 20) };
+        cursorEnabledToggle.CheckedChanged += (_, _) => OnProviderEnabledChanged();
+        cursorEnabledCard = new SettingsCard(tokens)
+        {
+            Description = "Show Cursor usage",
+            Glyph = ToolsGlyph,
+            Location = new Point(24, 358),
+            Size = new Size(532, 64),
+            Title = "Cursor"
+        };
+        cursorEnabledCard.ActionControl = cursorEnabledToggle;
+
+        generalPage.Controls.AddRange([
+            generalTitleLabel,
+            startupCard,
+            versionCard,
+            codexEnabledCard,
+            claudeEnabledCard,
+            cursorEnabledCard]);
+    }
+
+    /// <summary>
+    /// Persists the per-tool toggles. Disabling every tool would leave the flyout with nothing
+    /// to show, so the last enabled one is held on and its toggle snapped back.
+    /// </summary>
+    private void OnProviderEnabledChanged()
+    {
+        if (suppressProviderToggleEvents)
+        {
+            return;
+        }
+
+        if (!codexEnabledToggle.Checked && !claudeEnabledToggle.Checked && !cursorEnabledToggle.Checked)
+        {
+            suppressProviderToggleEvents = true;
+            codexEnabledToggle.Checked = true;
+            suppressProviderToggleEvents = false;
+        }
+
+        uiSettings = uiSettings with
+        {
+            CodexEnabled = codexEnabledToggle.Checked,
+            ClaudeEnabled = claudeEnabledToggle.Checked,
+            CursorEnabled = cursorEnabledToggle.Checked
+        };
+        uiSettings.Save();
     }
 
     private void BuildAppearancePage()
@@ -315,6 +412,7 @@ public sealed class SettingsForm : Form
         themeCombo.SelectedIndexChanged += (_, _) => OnThemeSelectionChanged();
         materialCombo.SelectedIndexChanged += (_, _) => OnMaterialSelectionChanged();
         opacitySlider.ValueChanged += (_, _) => OnOpacityChanged();
+        opacityCommitTimer.Tick += (_, _) => CommitPendingTint();
         vibesToggle.CheckedChanged += (_, _) => OnVibesToggled();
 
         appearancePage.Controls.AddRange([appearanceTitleLabel, themeCard, materialExpander, vibesCard]);
@@ -467,15 +565,43 @@ public sealed class SettingsForm : Form
         opacitySlider.Enabled = material != BackdropMaterial.Solid;
     }
 
+    /// <summary>
+    /// The slider raises this on every drag tick. Saving each tick wrote the registry and
+    /// broadcast <see cref="UiSettings.Changed"/> dozens of times per drag — every listener
+    /// repainted and the tray icon was rebuilt from its PNG each time, which made the drag
+    /// feel like it was not applying at all. The value is coalesced instead and committed
+    /// once the drag settles.
+    /// </summary>
     private void OnOpacityChanged()
     {
         opacityValueLabel.Text = opacitySlider.Value.ToString();
         if (opacitySlider.Value == uiSettings.TintOpacityPercent)
         {
+            pendingTintPercent = null;
+            opacityCommitTimer.Stop();
             return;
         }
 
-        uiSettings = uiSettings with { TintOpacityPercent = opacitySlider.Value };
+        pendingTintPercent = opacitySlider.Value;
+        opacityCommitTimer.Stop();
+        opacityCommitTimer.Start();
+    }
+
+    private void CommitPendingTint()
+    {
+        opacityCommitTimer.Stop();
+        if (pendingTintPercent is not { } percent)
+        {
+            return;
+        }
+
+        pendingTintPercent = null;
+        if (percent == uiSettings.TintOpacityPercent)
+        {
+            return;
+        }
+
+        uiSettings = uiSettings with { TintOpacityPercent = percent };
         uiSettings.Save();
     }
 

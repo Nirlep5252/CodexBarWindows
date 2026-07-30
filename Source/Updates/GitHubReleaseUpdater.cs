@@ -130,7 +130,10 @@ public sealed class GitHubReleaseUpdater
     private static void LaunchMsiAfterCurrentProcessExits(string msiPath)
     {
         var currentProcessId = Environment.ProcessId;
-        var executablePath = Application.ExecutablePath;
+        // Environment.ProcessPath rather than WinForms' Application.ExecutablePath: this file is
+        // otherwise UI-agnostic, and the WinForms dependency was invisible because
+        // UseWindowsForms=true injects a repo-wide global using for it.
+        var executablePath = Environment.ProcessPath ?? AppContext.BaseDirectory;
         var workingDirectory = AppContext.BaseDirectory;
 
         var script = string.Join(

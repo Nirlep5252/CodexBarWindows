@@ -18,6 +18,9 @@ public sealed class UsagePopupForm : Form
     private const int StatusHeight = 16;
     private const int BottomMargin = 12;
     private const int ResetRowHeight = 56;
+    private const int HeaderButtonRight = 374;
+    private const int HeaderButtonPitch = 36;
+    private const int HeaderButtonGap = 8;
 
     /// <summary>
     /// Used-percent above which a reset clearly has something to reset. This only adapts the
@@ -40,6 +43,8 @@ public sealed class UsagePopupForm : Form
     private readonly ResetCreditSection resetCreditRow;
     private readonly GlyphButton graphsButton;
     private readonly GlyphButton settingsButton;
+    private readonly IReadOnlyList<GlyphButton> headerButtons;
+    private IReadOnlyList<CodexCliEntry> configuredCodexEntries = [];
     private readonly GlyphButton closeButton;
     private readonly List<Font> ownedFonts = [];
     private UiSettings uiSettings;
@@ -109,10 +114,13 @@ public sealed class UsagePopupForm : Form
         // can be watched live side by side.
         graphsButton.Click += (_, _) => UsageGraphsRequested?.Invoke(this, EventArgs.Empty);
 
+        // Hidden: Settings is reached from the tray context menu. The control stays wired up
+        // so the header can offer it again by flipping Visible back on.
         settingsButton = new GlyphButton(FluentIcons.Settings, "Settings")
         {
             Anchor = AnchorStyles.Top | AnchorStyles.Right,
-            TabIndex = 2
+            TabIndex = 2,
+            Visible = false
         };
         settingsButton.Click += (_, _) => SettingsRequested?.Invoke(this, EventArgs.Empty);
 
@@ -162,6 +170,10 @@ public sealed class UsagePopupForm : Form
         Controls.Add(settingsButton);
         Controls.Add(closeButton);
 
+        // Right-to-left packing order for the header chrome. settingsButton is intentionally
+        // absent (Settings lives in the tray menu); add it back here to restore it.
+        headerButtons = [closeButton, graphsButton];
+
         EnableDragMove(this);
         EnableDragMove(titleLabel);
         EnableDragMove(planLabel);
@@ -175,13 +187,7 @@ public sealed class UsagePopupForm : Form
         // mid-interaction and would hide the popup while the user is changing settings. The
         // foreground window's owning process is the reliable signal, checked after the
         // activation change settles (hence BeginInvoke).
-        Deactivate += (_, _) => BeginInvoke(new Action(() =>
-        {
-            if (!IsDisposed && Visible && !ForegroundWindowBelongsToThisProcess())
-            {
-                Hide();
-            }
-        }));
+        Deactivate += (_, _) => HideIfFocusLeftProcess();
         FormClosing += OnFormClosing;
         UiSettings.Changed += OnUiSettingsChanged;
 
@@ -416,21 +422,30 @@ public sealed class UsagePopupForm : Form
     /// </summary>
     private void NudgeSizeForBackdrop()
     {
-        if (!IsHandleCreated || !Visible || !backdropActive)
+        // nudgePending makes overlapping nudges safe: without it two interleaved calls each
+        // grow by 1px but only restore once, leaving the flyout permanently taller.
+        if (!IsHandleCreated || !Visible || !backdropActive || nudgePending)
         {
             return;
         }
 
+        nudgePending = true;
         var size = ClientSize;
-        ClientSize = new Size(size.Width, size.Height + 1);
+        var nudged = new Size(size.Width, size.Height + 1);
+        ClientSize = nudged;
         BeginInvoke(new Action(() =>
         {
-            if (!IsDisposed && IsHandleCreated)
+            nudgePending = false;
+            // Only restore if nothing else resized us meanwhile, so a legitimate
+            // ApplyScaledLayout that landed in between is not stomped back.
+            if (!IsDisposed && IsHandleCreated && ClientSize == nudged)
             {
                 ClientSize = size;
             }
         }));
     }
+
+    private bool nudgePending;
 
     protected override bool ProcessDialogKey(Keys keyData)
     {
@@ -472,7 +487,16 @@ public sealed class UsagePopupForm : Form
             return;
         }
 
+        var previousSettings = uiSettings;
         uiSettings = UiSettings.Load();
+
+        // A tool being enabled or disabled changes which tabs exist.
+        if (previousSettings.CodexEnabled != uiSettings.CodexEnabled ||
+            previousSettings.ClaudeEnabled != uiSettings.ClaudeEnabled ||
+            previousSettings.CursorEnabled != uiSettings.CursorEnabled)
+        {
+            ConfigureCodexEntries(configuredCodexEntries);
+        }
 
         // Re-attaching the DWM backdrop forces a visible recomposition (the window flashes
         // solid, then glassy again), so it only happens when the effective material actually
@@ -485,7 +509,12 @@ public sealed class UsagePopupForm : Form
 
         RefreshTheme(force: true);
         ApplyScaledLayout();
-        if (materialChanged)
+
+        // Repaint synchronously so a tint change is not deferred to idle, then force DWM to
+        // recomposite. Re-attaching the backdrop attribute is what caused the solid-then-glass
+        // flash 536b2fa removed, so that stays gated above — the 1px nudge does not flash.
+        Update();
+        if (backdropActive && Visible)
         {
             NudgeSizeForBackdrop();
         }
@@ -546,23 +575,33 @@ public sealed class UsagePopupForm : Form
 
         SuspendLayout();
 
+        // Pin the bottom edge to wherever the window currently sits rather than to the screen,
+        // so switching providers grows/shrinks upward in place. Re-deriving it from the working
+        // area instead teleported a flyout the user had dragged elsewhere back down to the
+        // taskbar on every tab switch.
+        var previousBottom = Bottom;
+        var repin = Visible && IsHandleCreated && anchorToBottom;
+
         ClientSize = new Size(ScaleInt(BaseWidth, scale), clientHeight);
-        if (Visible && IsHandleCreated && anchorToBottom)
+        if (repin)
         {
-            // The top edge stays fixed while content expands/collapses from the bottom;
-            // CalculateLocation reserved room for the tallest provider, so growth normally
-            // cannot reach the taskbar. Shift up only if a live data change outgrows that.
-            var maxBottom = Screen.FromControl(this).WorkingArea.Bottom - 8;
-            if (Top + Height > maxBottom)
-            {
-                Top = maxBottom - Height;
-            }
+            Top = previousBottom - Height;
         }
 
-        closeButton.Bounds = ScaleRect(374, 14, 32, 32, scale);
-        settingsButton.Bounds = ScaleRect(338, 14, 32, 32, scale);
-        graphsButton.Bounds = ScaleRect(302, 14, 32, 32, scale);
-        var firstTabLeft = LayoutTabButtons(scale);
+        // Header chrome packs right-to-left so a hidden button yields its slot and the
+        // remaining buttons (and the tab strip) close the gap instead of leaving a hole.
+        // headerButtons holds only the buttons meant to show: Control.Visible reports the
+        // EFFECTIVE visibility, so while the form itself is still hidden (construction and
+        // the first layout pass) every child reads false — testing it here left the whole
+        // header unpositioned on the first open.
+        var slot = HeaderButtonRight;
+        foreach (var button in headerButtons)
+        {
+            button.Bounds = ScaleRect(slot, 14, 32, 32, scale);
+            slot -= HeaderButtonPitch;
+        }
+
+        var firstTabLeft = LayoutTabButtons(scale, slot + HeaderButtonPitch - HeaderButtonGap);
         var titleLeft = ScaleInt(OuterMargin, scale);
         var headerTextWidth = Math.Max(ScaleInt(140, scale), firstTabLeft - titleLeft - ScaleInt(8, scale));
         titleLabel.Bounds = new Rectangle(titleLeft, ScaleInt(HeaderTitleTop, scale), headerTextWidth, ScaleInt(28, scale));
@@ -627,11 +666,20 @@ public sealed class UsagePopupForm : Form
 
     public void ConfigureCodexEntries(IReadOnlyList<CodexCliEntry> codexEntries)
     {
+        configuredCodexEntries = codexEntries;
         var descriptors = codexEntries
             .Select(entry => new ProviderDescriptor(CodexProviderKey(entry.Id), entry.Name, UsageProvider.Codex))
             .Append(ClaudeProvider)
             .Append(CursorProvider)
+            .Where(descriptor => uiSettings.IsProviderEnabled(descriptor.Provider))
             .ToList();
+
+        // Everything disabled would leave a chrome-only flyout with no way back, so the tab
+        // strip always keeps at least Codex.
+        if (descriptors.Count == 0)
+        {
+            descriptors.Add(new ProviderDescriptor(CodexProviderKey("default"), "Codex", UsageProvider.Codex));
+        }
 
         ConfigureProviders(descriptors);
     }
@@ -857,9 +905,15 @@ public sealed class UsagePopupForm : Form
             usageSections[index].SetUsage(windows[index]);
         }
 
+        // Subtle freshness line. A retained (stale) snapshot says so explicitly, so an error
+        // paired with old numbers cannot read as if the numbers were just fetched.
+        var fetched = $"Updated {FormatObservedAt(snapshot.ObservedAt)}";
+        var baseStatus = provider.IsCursor ? CursorStatusText(snapshot) : string.Empty;
         statusLabel.Text = !string.IsNullOrWhiteSpace(result.Error)
-            ? result.Error
-            : provider.IsCursor ? CursorStatusText(snapshot) : string.Empty;
+            ? result.IsStale
+                ? $"{result.Error} · showing limits from {FormatObservedAt(snapshot.ObservedAt)}"
+                : result.Error
+            : string.IsNullOrWhiteSpace(baseStatus) ? fetched : $"{baseStatus} · {fetched}";
     }
 
     private ProviderUsageLookupResult GetProviderUsage(string providerKey)
@@ -1053,9 +1107,9 @@ public sealed class UsagePopupForm : Form
         RenderSelectedProvider();
     }
 
-    private int LayoutTabButtons(float scale)
+    private int LayoutTabButtons(float scale, int rightEdge)
     {
-        var right = ScaleInt(294, scale);
+        var right = ScaleInt(rightEdge, scale);
         var width = ScaleInt(32, scale);
         var gap = ScaleInt(4, scale);
         var firstLeft = right;
@@ -1088,6 +1142,33 @@ public sealed class UsagePopupForm : Form
         public bool IsCursor => Provider == UsageProvider.Cursor;
     }
 
+    /// <summary>
+    /// Dismisses the flyout when focus has left this process entirely.
+    /// </summary>
+    /// <remarks>
+    /// The popup's own <see cref="Form.Deactivate"/> only fires while the popup is the active
+    /// window, so once focus moves to a sibling window (settings, graphs) the popup goes inactive
+    /// and never hears about focus changes again — leaving a topmost flyout stranded over
+    /// unrelated applications, which also kept the refresh timer alive. Those siblings therefore
+    /// call this on their own deactivation to re-arm the check.
+    /// </remarks>
+    public void HideIfFocusLeftProcess()
+    {
+        if (IsDisposed || !IsHandleCreated)
+        {
+            return;
+        }
+
+        // Checked after the activation change settles, so the new foreground window is known.
+        BeginInvoke(new Action(() =>
+        {
+            if (!IsDisposed && Visible && !ForegroundWindowBelongsToThisProcess())
+            {
+                Hide();
+            }
+        }));
+    }
+
     private static bool ForegroundWindowBelongsToThisProcess()
     {
         var foreground = GetForegroundWindow();
@@ -1113,34 +1194,15 @@ public sealed class UsagePopupForm : Form
 
         var x = Math.Clamp(anchor.X - Width + 20, workingArea.Left + 8, workingArea.Right - Width - 8);
         anchorToBottom = anchor.Y >= workingArea.Top + (workingArea.Height / 2);
-        // Above the taskbar, place the top edge where the TALLEST provider layout fits, so
-        // switching tabs keeps the top fixed and only the bottom edge moves.
+        // Hug the tray: the bottom edge sits just above the taskbar and the window is only
+        // as tall as the current provider needs, so switching tabs moves the top edge.
+        // Reserving room for the tallest provider instead left the flyout floating far from
+        // the tray whenever the selected provider was shorter than the tallest one.
         var y = anchorToBottom
-            ? workingArea.Bottom - Math.Max(Height, PredictTallestWindowHeight()) - 8
+            ? workingArea.Bottom - Height - 8
             : workingArea.Top + 8;
 
         return new Point(x, y);
-    }
-
-    /// <summary>
-    /// Window height the flyout would need for its tallest configured provider, using the
-    /// same metrics as <see cref="ApplyScaledLayout"/>.
-    /// </summary>
-    private int PredictTallestWindowHeight()
-    {
-        var scale = DpiScale;
-        var nonClientHeight = Math.Max(0, Height - ClientSize.Height);
-        var tallestClient = ClientSize.Height;
-        foreach (var provider in providers)
-        {
-            var cardHeight = (ScaleInt(UsageRowHeight, scale) * GetUsageRowCount(provider)) +
-                (ShouldShowResetCredits(provider) ? ScaleInt(ResetRowHeight, scale) : 0);
-            var clientHeight = ScaleInt(UsageCardTop, scale) + cardHeight + ScaleInt(CardGap, scale) +
-                ScaleInt(StatusHeight, scale) + ScaleInt(BottomMargin, scale);
-            tallestClient = Math.Max(tallestClient, clientHeight);
-        }
-
-        return tallestClient + nonClientHeight;
     }
 
     private static string FormatObservedAt(DateTimeOffset observedAt)
@@ -1517,6 +1579,9 @@ public sealed class UsagePopupForm : Form
             meter.AccentColor = tokens.Accent;
             meter.WarningColor = tokens.Warning;
             meter.DangerColor = tokens.Danger;
+            // Vibes may have just been toggled, which gates the danger pulse without changing the
+            // meter's value or visibility — the events that otherwise re-evaluate it.
+            meter.RefreshAnimationState();
 
             Invalidate(true);
         }

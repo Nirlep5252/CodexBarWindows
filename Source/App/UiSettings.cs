@@ -31,6 +31,9 @@ public sealed record UiSettings
     private const string MaterialValueName = "UiMaterial";
     private const string TintOpacityValueName = "UiTintOpacityPercent";
     private const string VibesValueName = "UiVibes";
+    private const string CodexEnabledValueName = "ProviderCodexEnabled";
+    private const string ClaudeEnabledValueName = "ProviderClaudeEnabled";
+    private const string CursorEnabledValueName = "ProviderCursorEnabled";
 
     public AppThemeMode Theme { get; init; } = AppThemeMode.System;
 
@@ -55,13 +58,33 @@ public sealed record UiSettings
     /// </summary>
     public int TintOpacityPercent { get; init; } = 45;
 
+    /// <summary>
+    /// Per-tool opt-out. A disabled tool gets no tab in the flyout and is never polled, so
+    /// disabling one you do not use also removes its refresh cost.
+    /// </summary>
+    public bool CodexEnabled { get; init; } = true;
+
+    public bool ClaudeEnabled { get; init; } = true;
+
+    public bool CursorEnabled { get; init; } = true;
+
+    public bool IsProviderEnabled(UsageProvider provider) => provider switch
+    {
+        UsageProvider.Claude => ClaudeEnabled,
+        UsageProvider.Cursor => CursorEnabled,
+        _ => CodexEnabled
+    };
+
     public static event EventHandler? Changed;
 
+    /// <remarks>
+    /// Deliberately does not touch the UI theme: <c>FluentTheme</c> observes <see cref="Changed"/>
+    /// instead. Keeping the dependency pointing UI → settings lets this type be shared with the
+    /// UI-free logic layer.
+    /// </remarks>
     public static UiSettings Load()
     {
-        var settings = LoadCore();
-        FluentTheme.VibesActive = settings.VibesEnabled;
-        return settings;
+        return LoadCore();
     }
 
     private static UiSettings LoadCore()
@@ -90,12 +113,19 @@ public sealed record UiSettings
 
             var vibes = key.GetValue(VibesValueName) is int vibesValue && vibesValue != 0;
 
+            // Absent value means enabled: an existing install must not lose its tools.
+            static bool ReadEnabled(RegistryKey key, string name)
+                => key.GetValue(name) is not int value || value != 0;
+
             return new UiSettings
             {
                 Theme = theme,
                 Material = material,
                 TintOpacityPercent = tint,
-                VibesEnabled = vibes
+                VibesEnabled = vibes,
+                CodexEnabled = ReadEnabled(key, CodexEnabledValueName),
+                ClaudeEnabled = ReadEnabled(key, ClaudeEnabledValueName),
+                CursorEnabled = ReadEnabled(key, CursorEnabledValueName)
             };
         }
         catch
@@ -113,9 +143,12 @@ public sealed record UiSettings
             key.SetValue(MaterialValueName, Material.ToString(), RegistryValueKind.String);
             key.SetValue(TintOpacityValueName, Math.Clamp(TintOpacityPercent, 0, 100), RegistryValueKind.DWord);
             key.SetValue(VibesValueName, VibesEnabled ? 1 : 0, RegistryValueKind.DWord);
+            key.SetValue(CodexEnabledValueName, CodexEnabled ? 1 : 0, RegistryValueKind.DWord);
+            key.SetValue(ClaudeEnabledValueName, ClaudeEnabled ? 1 : 0, RegistryValueKind.DWord);
+            key.SetValue(CursorEnabledValueName, CursorEnabled ? 1 : 0, RegistryValueKind.DWord);
         }
 
-        FluentTheme.VibesActive = VibesEnabled;
+        // Listeners (including FluentTheme) re-read from here; this type does not push into the UI.
         Changed?.Invoke(this, EventArgs.Empty);
     }
 

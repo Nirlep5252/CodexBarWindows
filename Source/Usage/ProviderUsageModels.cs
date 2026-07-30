@@ -63,7 +63,20 @@ public sealed record ProviderUsageCost(
     string Period,
     DateTimeOffset? ResetsAt);
 
-public sealed record ProviderUsageLookupResult(ProviderUsageSnapshot? Snapshot, string? Error)
+public sealed record ProviderUsageLookupResult(ProviderUsageSnapshot? Snapshot, string? Error, bool IsStale = false)
 {
     public bool HasSnapshot => Snapshot is not null;
+
+    /// <summary>
+    /// Carries the previous snapshot forward when a limits refresh fails, so the popup keeps
+    /// showing the last known limits (annotated as stale) instead of an error-only view.
+    /// </summary>
+    public static ProviderUsageLookupResult KeepLastGood(
+        ProviderUsageLookupResult? previous,
+        ProviderUsageLookupResult next)
+    {
+        return next.Snapshot is null && previous?.Snapshot is not null
+            ? new ProviderUsageLookupResult(previous.Snapshot, next.Error, IsStale: true)
+            : next;
+    }
 }

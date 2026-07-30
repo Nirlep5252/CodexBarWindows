@@ -13,8 +13,8 @@ static class Program
         }
 
         ApplicationConfiguration.Initialize();
-        // Prime FluentTheme.VibesActive before any UI (including the tray icon) is created.
-        _ = UiSettings.Load();
+        // FluentTheme seeds VibesActive in its own static constructor, so no priming is needed
+        // here — touching it below (via the tray icon) resolves it correctly.
         using var context = new TrayApplicationContext();
         instanceGuard.ActivationRequested += context.NotifyAlreadyRunning;
         Application.Run(context);

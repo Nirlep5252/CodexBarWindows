@@ -6,6 +6,9 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly CursorUsageReader cursorUsageReader = new();
     private readonly GitHubReleaseUpdater releaseUpdater = new();
     private Icon trayIcon = TrayIconFactory.Create();
+    // Program.Main primes FluentTheme.VibesActive before this context is built, so the tray
+    // icon and this flag start in agreement.
+    private bool trayIconVibes = FluentTheme.VibesActive;
     private readonly NotifyIcon notifyIcon;
     private readonly UsagePopupForm popup = new();
     private SettingsForm? settingsForm;
@@ -82,7 +85,17 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
 
         // The tray glyph is vibe-gradient-tinted while vibes are on; rebuild it so toggling
-        // the setting restyles the taskbar too.
+        // the setting restyles the taskbar too. TrayIconFactory.Create() varies only with
+        // FluentTheme.VibesActive (the system light/dark theme never raises this event), so
+        // rebuilding on every broadcast meant a PNG reload, a 64px render and a 4096-pixel
+        // recolour loop on each tick of a tint-slider drag. Only vibes changes matter.
+        var vibes = FluentTheme.VibesActive;
+        if (vibes == trayIconVibes)
+        {
+            return;
+        }
+
+        trayIconVibes = vibes;
         var refreshed = TrayIconFactory.Create();
         notifyIcon.Icon = refreshed;
         trayIcon.Dispose();
@@ -269,14 +282,20 @@ public sealed class TrayApplicationContext : ApplicationContext
                         },
                         cancellation.Token))
                     .ToArray();
+                // Grouped rather than ToDictionary: a duplicated Codex account id would throw
+                // here and take the whole refresh down through the outer catch.
                 var codexResults = (await Task.WhenAll(codexTasks).ConfigureAwait(false))
-                    .ToDictionary(pair => pair.Key, pair => pair.Value);
+                    .GroupBy(pair => pair.Key, StringComparer.Ordinal)
+                    .ToDictionary(group => group.Key, group => group.Last().Value, StringComparer.Ordinal);
                 PostIfCurrent(() =>
                 {
                     foreach (var pair in codexResults)
                     {
-                        latestCodexUsage[pair.Key] = pair.Value;
-                        popup.UpdateUsage(pair.Key, pair.Value);
+                        var merged = ProviderUsageLookupResult.KeepLastGood(
+                            latestCodexUsage.TryGetValue(pair.Key, out var previous) ? previous : null,
+                            pair.Value);
+                        latestCodexUsage[pair.Key] = merged;
+                        popup.UpdateUsage(pair.Key, merged);
                     }
 
                     notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage);
@@ -292,8 +311,11 @@ public sealed class TrayApplicationContext : ApplicationContext
                     foreach (var entry in codexCliEntries)
                     {
                         var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
-                        latestHistory[providerKey] = codexHistory;
-                        graphsForm?.UpdateHistory(providerKey, codexHistory);
+                        var merged = ProviderUsageInsightsLookupResult.KeepLastGood(
+                            latestHistory.TryGetValue(providerKey, out var previous) ? previous : null,
+                            codexHistory);
+                        latestHistory[providerKey] = merged;
+                        graphsForm?.UpdateHistory(providerKey, merged);
                     }
                 });
             }
@@ -303,7 +325,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 var claudeResult = await claudeUsageReader.ReadLatestAsync(cancellation.Token).ConfigureAwait(false);
                 PostIfCurrent(() =>
                 {
-                    latestClaudeUsage = claudeResult;
+                    latestClaudeUsage = ProviderUsageLookupResult.KeepLastGood(latestClaudeUsage, claudeResult);
                     popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
                     notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage);
                 });
@@ -315,8 +337,11 @@ public sealed class TrayApplicationContext : ApplicationContext
                     .ConfigureAwait(false);
                 PostIfCurrent(() =>
                 {
-                    latestHistory[UsagePopupForm.ClaudeProviderKey] = claudeHistory;
-                    graphsForm?.UpdateHistory(UsagePopupForm.ClaudeProviderKey, claudeHistory);
+                    var merged = ProviderUsageInsightsLookupResult.KeepLastGood(
+                        latestHistory.TryGetValue(UsagePopupForm.ClaudeProviderKey, out var previous) ? previous : null,
+                        claudeHistory);
+                    latestHistory[UsagePopupForm.ClaudeProviderKey] = merged;
+                    graphsForm?.UpdateHistory(UsagePopupForm.ClaudeProviderKey, merged);
                 });
             }
 
@@ -325,23 +350,42 @@ public sealed class TrayApplicationContext : ApplicationContext
                 var cursorResult = await cursorUsageReader.ReadLatestAsync(cancellation.Token).ConfigureAwait(false);
                 PostIfCurrent(() =>
                 {
-                    latestCursorUsage = cursorResult;
+                    latestCursorUsage = ProviderUsageLookupResult.KeepLastGood(latestCursorUsage, cursorResult);
                     popup.UpdateUsage(UsagePopupForm.CursorProviderKey, latestCursorUsage);
                     notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage);
                 });
             }
 
-            var refreshTasks = new List<Task>
+            // A disabled tool is not polled at all — that is the point of the setting, and it
+            // also removes its share of the refresh cost (notably the Codex app-server spawn).
+            var settings = UiSettings.Load();
+            var refreshTasks = new List<Task>();
+            if (settings.CodexEnabled)
             {
-                RefreshCodexLimitsAsync(),
-                RefreshClaudeLimitsAsync(),
-                RefreshCursorLimitsAsync(),
-            };
+                refreshTasks.Add(RefreshCodexLimitsAsync());
+            }
+
+            if (settings.ClaudeEnabled)
+            {
+                refreshTasks.Add(RefreshClaudeLimitsAsync());
+            }
+
+            if (settings.CursorEnabled)
+            {
+                refreshTasks.Add(RefreshCursorLimitsAsync());
+            }
 
             if (includeHistory)
             {
-                refreshTasks.Add(RefreshCodexHistoryAsync());
-                refreshTasks.Add(RefreshClaudeHistoryAsync());
+                if (settings.CodexEnabled)
+                {
+                    refreshTasks.Add(RefreshCodexHistoryAsync());
+                }
+
+                if (settings.ClaudeEnabled)
+                {
+                    refreshTasks.Add(RefreshClaudeHistoryAsync());
+                }
             }
 
             try
@@ -353,21 +397,31 @@ public sealed class TrayApplicationContext : ApplicationContext
             }
             catch (Exception exception)
             {
+                // Every provider refresh reports its own failure as a result, so this only
+                // catches an orchestration fault. It used to overwrite EVERY provider with the
+                // same error, so one provider failing blanked the others' good data — the
+                // retention above would then be pointless. Annotate without discarding.
                 PostIfCurrent(() =>
                 {
-                    var failed = new ProviderUsageLookupResult(
-                        null,
-                        $"Could not refresh usage limits: {exception.Message}");
+                    var message = $"Could not refresh usage limits: {exception.Message}";
                     foreach (var entry in codexCliEntries)
                     {
                         var providerKey = UsagePopupForm.CodexProviderKey(entry.Id);
-                        latestCodexUsage[providerKey] = failed;
-                        popup.UpdateUsage(providerKey, failed);
+                        var previous = latestCodexUsage.TryGetValue(providerKey, out var existing) ? existing : null;
+                        var annotated = ProviderUsageLookupResult.KeepLastGood(
+                            previous,
+                            new ProviderUsageLookupResult(null, message));
+                        latestCodexUsage[providerKey] = annotated;
+                        popup.UpdateUsage(providerKey, annotated);
                     }
 
-                    latestClaudeUsage = failed;
+                    latestClaudeUsage = ProviderUsageLookupResult.KeepLastGood(
+                        latestClaudeUsage,
+                        new ProviderUsageLookupResult(null, message));
                     popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
-                    latestCursorUsage = failed;
+                    latestCursorUsage = ProviderUsageLookupResult.KeepLastGood(
+                        latestCursorUsage,
+                        new ProviderUsageLookupResult(null, message));
                     popup.UpdateUsage(UsagePopupForm.CursorProviderKey, latestCursorUsage);
                     notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage);
                 });
@@ -414,6 +468,9 @@ public sealed class TrayApplicationContext : ApplicationContext
             }
         };
         graphsForm.VisibleChanged += (_, _) => UpdateRefreshTimerState();
+        // The popup deliberately stays open when this window takes focus, which also makes it
+        // deaf to further focus changes. Re-arm its dismissal check from here.
+        graphsForm.Deactivate += (_, _) => popup.HideIfFocusLeftProcess();
         graphsForm.FormClosed += (_, _) =>
         {
             graphsForm = null;
@@ -462,6 +519,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         settingsForm.CodexCliEntriesChanged += (_, _) => ReloadCodexCliEntries();
         settingsForm.CursorSettingsChanged += (_, _) => BeginRefresh(showLoading: true);
         settingsForm.FormClosed += (_, _) => settingsForm = null;
+        // See the graphs window: re-arm the popup's dismissal check when focus leaves here.
+        settingsForm.Deactivate += (_, _) => popup.HideIfFocusLeftProcess();
         settingsForm.Show();
         settingsForm.Activate();
     }

@@ -46,12 +46,31 @@ internal static class ModelsDevPricing
         });
     }
 
+    /// <summary>
+    /// Memoized per (provider, model). The uncached path takes <see cref="CacheLock"/> and walks
+    /// the catalog with EnumerateObject — ~30µs a call. History replay calls this once per usage
+    /// row (tens of thousands per refresh), where it measured ~2s on a cold scan and ~1.2s on
+    /// every subsequent refresh. Distinct model ids are a handful, so the memo is tiny.
+    /// The catalog is immutable once loaded; <see cref="InvalidateLookupMemo"/> clears the memo
+    /// wherever it is replaced.
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string Provider, string Model), ModelsDevPricingInfo?> LookupMemo =
+        new();
+
     public static ModelsDevPricingInfo? Lookup(string providerId, string modelId)
     {
-        var load = Load();
-        return load.Catalog is { } catalog
-            ? Lookup(catalog, providerId, modelId)
-            : null;
+        return LookupMemo.GetOrAdd((providerId, modelId), static key =>
+        {
+            var load = Load();
+            return load.Catalog is { } catalog
+                ? Lookup(catalog, key.Provider, key.Model)
+                : null;
+        });
+    }
+
+    private static void InvalidateLookupMemo()
+    {
+        LookupMemo.Clear();
     }
 
     private static async Task RefreshIfNeededAsync(CancellationToken cancellationToken)
@@ -119,29 +138,50 @@ internal static class ModelsDevPricing
 
     private static void Save(JsonElement catalog, DateTimeOffset fetchedAt)
     {
+        string? temp = null;
         try
         {
             var path = CacheFilePath();
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            var temp = Path.Combine(Path.GetDirectoryName(path)!, $".tmp-{Guid.NewGuid():N}.json");
+            temp = Path.Combine(Path.GetDirectoryName(path)!, $".tmp-{Guid.NewGuid():N}.json");
             var artifact = new CacheArtifact(ArtifactVersion, fetchedAt, catalog);
             File.WriteAllText(temp, JsonSerializer.Serialize(artifact, JsonOptions()));
-            if (File.Exists(path))
-            {
-                File.Delete(path);
-            }
 
-            File.Move(temp, path);
+            // Single atomic replace. Deleting first left a window where the file did not exist,
+            // so a crash in between lost the cache and raced a second app instance.
+            File.Move(temp, path, overwrite: true);
             lock (CacheLock)
             {
                 cachedCatalog = catalog.Clone();
                 cachedFetchedAt = fetchedAt;
                 cacheLoaded = true;
             }
+
+            // Outside the lock: memoized lookups were resolved against the previous catalog.
+            InvalidateLookupMemo();
         }
         catch
         {
             // Cache writes are non-critical.
+            TryDeleteTemp(temp);
+        }
+    }
+
+    /// <summary>Best-effort cleanup so a failed write does not leave the temp file behind.</summary>
+    private static void TryDeleteTemp(string? temp)
+    {
+        if (temp is null)
+        {
+            return;
+        }
+
+        try
+        {
+            File.Delete(temp);
+        }
+        catch
+        {
+            // Nothing useful to do if cleanup itself fails.
         }
     }
 

@@ -167,6 +167,20 @@ public sealed class UsageMeterControl : Control
     /// stronger toward 100% — a motion cue that reads regardless of the provider hue
     /// (Claude's identity is already orange).
     /// </summary>
+    /// <summary>
+    /// Re-evaluates animation state after something outside this control changed it.
+    /// </summary>
+    /// <remarks>
+    /// The danger pulse is gated on <see cref="FluentTheme.VibesActive"/>, but that flag can flip
+    /// without the meter's value or visibility changing — the events that otherwise drive
+    /// <see cref="UpdateDangerPulse"/>. Toggling vibes off therefore left a 20 FPS invalidate
+    /// running against painting that ignores it, until the popup happened to hide.
+    /// </remarks>
+    public void RefreshAnimationState()
+    {
+        UpdateDangerPulse();
+    }
+
     private void UpdateDangerPulse()
     {
         var shouldPulse = FluentTheme.VibesActive &&

@@ -23,7 +23,10 @@ public static class StartupSettings
 
         if (enabled)
         {
-            key.SetValue(AppInfo.AppName, $"\"{Application.ExecutablePath}\"", RegistryValueKind.String);
+            // Environment.ProcessPath rather than WinForms' Application.ExecutablePath — see
+            // GitHubReleaseUpdater for why that dependency was easy to miss.
+            var executablePath = Environment.ProcessPath ?? AppContext.BaseDirectory;
+            key.SetValue(AppInfo.AppName, $"\"{executablePath}\"", RegistryValueKind.String);
             return;
         }
 

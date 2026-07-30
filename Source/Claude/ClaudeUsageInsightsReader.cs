@@ -8,6 +8,9 @@ public sealed class ClaudeUsageInsightsReader
     private const int DaysToReport = 30;
     private const int ScanLookbackDays = 32;
     private const int MaxFilesToScan = 1200;
+
+    /// <summary>Bounded so a refresh leaves cores free for the rest of the machine.</summary>
+    private static int ScanParallelism => Math.Clamp(Environment.ProcessorCount - 2, 1, 8);
     private readonly IReadOnlyList<string>? projectsRoots;
     private readonly bool refreshModelsDevPricing;
 
@@ -25,7 +28,14 @@ public sealed class ClaudeUsageInsightsReader
     {
         this.projectsRoots = projectsRoots;
         this.refreshModelsDevPricing = refreshModelsDevPricing;
+
+        // The on-disk cache is a single shared file keyed by absolute path, so only the reader
+        // scanning the real projects roots may write it — a custom-rooted reader (tests,
+        // fixtures) scans a different corpus and would otherwise clobber the user's cache.
+        persistCache = projectsRoots is null;
     }
+
+    private readonly bool persistCache;
 
     public ProviderUsageInsightsLookupResult ReadLatest()
     {
@@ -54,19 +64,51 @@ public sealed class ClaudeUsageInsightsReader
                     $"No Claude session logs were found under {string.Join("; ", roots)}.");
             }
 
-            var rows = new List<ClaudeUsageRow>();
-            foreach (var file in files)
+            EnsurePersistedCacheLoaded();
+
+            // Scanned in parallel (independent, CPU-bound, ConcurrentDictionary cache). Results
+            // are collected by index rather than appended as they complete: DeduplicateAcrossFiles
+            // is itself order-independent (RowWins is a total order and the output is re-sorted),
+            // but a stable row order keeps runs reproducible and diffable.
+            var perFile = new IReadOnlyList<ClaudeUsageRow>[files.Length];
+            var options = new ParallelOptions { MaxDegreeOfParallelism = ScanParallelism };
+            Parallel.For(0, files.Length, options, index =>
             {
-                rows.AddRange(GetOrReadRowsFromFile(file, firstScanDay));
+                perFile[index] = GetOrReadRowsFromFile(files[index], firstScanDay);
+            });
+
+            var rows = new List<ClaudeUsageRow>(perFile.Sum(list => list.Count));
+            foreach (var list in perFile)
+            {
+                rows.AddRange(list);
             }
 
-            PruneFileRowsCache();
+            PruneFileRowsCache(files.ToHashSet(StringComparer.OrdinalIgnoreCase));
+            SavePersistedCache(firstReportDay);
 
             var daily = new Dictionary<DateOnly, MutableUsage>();
             var models = new Dictionary<string, MutableUsage>(StringComparer.OrdinalIgnoreCase);
             foreach (var row in DeduplicateAcrossFiles(rows))
             {
+                // Aggregate over the REPORTED window. Files are selected with a wider lookback
+                // (ScanLookbackDays), and cached rows outlive the window they were scanned for,
+                // so without this guard the model breakdown grows past the chart beside it —
+                // unboundedly, for as long as the cache lives.
+                if (row.Day < firstReportDay)
+                {
+                    continue;
+                }
+
                 var label = NormalizeClaudeModel(row.Model);
+
+                // Claude History is Claude usage only. The projects tree also holds Claude Code's
+                // own subagent and workflow transcripts, which can record another vendor's models
+                // (a Codex subagent logs gpt-*). Those tokens were not spent on Anthropic, so
+                // counting them inflated the totals and then surfaced as "no pricing" warnings.
+                if (!IsAnthropicModel(label))
+                {
+                    continue;
+                }
                 Add(daily, row.Day, row.Model, row.Tokens, row.CostUsd, row.CostPriced, label);
                 Add(models, label, row.Model, row.Tokens, row.CostUsd, row.CostPriced, label);
             }
@@ -103,8 +145,20 @@ public sealed class ClaudeUsageInsightsReader
                 dailyRows.Sum(row => row.EstimatedCostUsd),
                 HasIncompleteCost: hasIncompleteCost);
 
+            // Name the unpriced models: "some models" gave no way to tell whether a new model
+            // needs a pricing entry or a non-Claude id is leaking into this reader.
+            var unpricedModels = modelRows
+                .Where(row => row.HasIncompleteCost)
+                .Select(row => row.Model)
+                .Where(model => !string.IsNullOrWhiteSpace(model))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(model => model, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
             var warning = hasIncompleteCost
-                ? "Some Claude models had no pricing; cost may be incomplete."
+                ? unpricedModels.Length > 0
+                    ? $"No pricing for {string.Join(", ", unpricedModels)}; cost excludes these models."
+                    : "Some Claude models had no pricing; cost may be incomplete."
                 : result.HasUsage ? null : "No token usage entries were found in recent Claude session logs.";
             return new ProviderUsageInsightsLookupResult(result, warning);
         }
@@ -200,21 +254,101 @@ public sealed class ClaudeUsageInsightsReader
     private sealed record CachedFileRows(
         long Length,
         long LastWriteUtcTicks,
+        long CreationUtcTicks,
         DateOnly FirstScanDay,
         IReadOnlyList<ClaudeUsageRow> Rows);
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, CachedFileRows> FileRowsCache =
         new(StringComparer.OrdinalIgnoreCase);
 
+    private const string CacheProviderName = "claude";
+    private static int persistedCacheLoaded;
+
+    /// <summary>Set whenever a file is actually (re)scanned, so an unchanged refresh skips the write.</summary>
+    private static int cacheDirty;
+
+    /// <summary>
+    /// Seeds the in-memory cache from disk once per process, on the first history read. Entries
+    /// land in the same dictionary the scanner already consults, so the normal freshness check
+    /// decides what still needs rescanning and <see cref="RepriceRow"/> still runs on every hit.
+    /// </summary>
+    private void EnsurePersistedCacheLoaded()
+    {
+        if (!persistCache || Interlocked.Exchange(ref persistedCacheLoaded, 1) == 1)
+        {
+            return;
+        }
+
+        var entries = UsageScanCache.TryLoad<ClaudeUsageRow>(CacheProviderName);
+        if (entries is null)
+        {
+            return;
+        }
+
+        foreach (var (path, entry) in entries)
+        {
+            // FilePath is rehydrated from the key it was stripped against: DeduplicateAcrossFiles
+            // tie-breaks on it via RowWins, so a blank path would change conflict resolution.
+            var rows = entry.Rows.Count == 0
+                ? entry.Rows
+                : entry.Rows.Select(row => row with { FilePath = path }).ToArray();
+
+            FileRowsCache.TryAdd(
+                path,
+                new CachedFileRows(entry.Length, entry.LastWriteUtcTicks, entry.CreationUtcTicks, entry.FirstScanDay, rows));
+        }
+    }
+
+    /// <summary>
+    /// Writes the current cache to disk, keeping only files that still exist and still carry rows
+    /// inside the reported window. Cost fields are dropped: they are recomputed at replay, so
+    /// persisting them would both waste space and freeze a stale price into the snapshot.
+    /// </summary>
+    private void SavePersistedCache(DateOnly firstReportDay)
+    {
+        if (!persistCache || Interlocked.Exchange(ref cacheDirty, 0) == 0)
+        {
+            return;
+        }
+
+        var entries = new Dictionary<string, UsageScanCacheEntry<ClaudeUsageRow>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (path, cached) in FileRowsCache)
+        {
+            if (!File.Exists(path))
+            {
+                continue;
+            }
+
+            // Entries with no rows are kept (see PruneFileRowsCache). Cost is dropped because
+            // RepriceRow recomputes it on every hit, and FilePath because it merely repeats the
+            // dictionary key — it dominated the serialized size otherwise.
+            var rows = cached.Rows
+                .Where(row => row.Day >= firstReportDay)
+                .Select(row => row with { CostUsd = null, CostPriced = false, FilePath = string.Empty })
+                .ToArray();
+
+            entries[path] = new UsageScanCacheEntry<ClaudeUsageRow>(
+                cached.Length,
+                cached.LastWriteUtcTicks,
+                cached.CreationUtcTicks,
+                cached.FirstScanDay > firstReportDay ? cached.FirstScanDay : firstReportDay,
+                rows);
+        }
+
+        UsageScanCache.TrySave(CacheProviderName, entries);
+    }
+
     private static IReadOnlyList<ClaudeUsageRow> GetOrReadRowsFromFile(string file, DateOnly firstScanDay)
     {
         long length;
         long lastWriteUtcTicks;
+        long creationUtcTicks;
         try
         {
             var info = new FileInfo(file);
             length = info.Length;
             lastWriteUtcTicks = info.LastWriteTimeUtc.Ticks;
+            creationUtcTicks = info.CreationTimeUtc.Ticks;
         }
         catch
         {
@@ -227,15 +361,18 @@ public sealed class ClaudeUsageInsightsReader
         if (FileRowsCache.TryGetValue(file, out var cached) &&
             cached.Length == length &&
             cached.LastWriteUtcTicks == lastWriteUtcTicks &&
+            cached.CreationUtcTicks == creationUtcTicks &&
             cached.FirstScanDay <= firstScanDay)
         {
             // Cost is recomputed on every replay so a models.dev pricing refresh that landed
-            // after the file was cached still prices these rows.
+            // after the file was cached still prices these rows. This is also why the on-disk
+            // cache can store rows with no cost at all.
             return cached.Rows.Select(RepriceRow).ToArray();
         }
 
         var rows = ReadRowsFromFile(file, firstScanDay);
-        FileRowsCache[file] = new CachedFileRows(length, lastWriteUtcTicks, firstScanDay, rows);
+        FileRowsCache[file] = new CachedFileRows(length, lastWriteUtcTicks, creationUtcTicks, firstScanDay, rows);
+        Interlocked.Exchange(ref cacheDirty, 1);
         return rows;
     }
 
@@ -246,16 +383,14 @@ public sealed class ClaudeUsageInsightsReader
         return row with { CostUsd = cost, CostPriced = cost is not null };
     }
 
-    private static void PruneFileRowsCache()
+    private static void PruneFileRowsCache(IReadOnlySet<string> scannedPaths)
     {
-        if (FileRowsCache.Count <= 2048)
-        {
-            return;
-        }
-
+        // Retain exactly the files enumerated this pass: enumeration already applies the mtime
+        // window, so this is both exact and free. Entries with no rows are kept deliberately —
+        // "this file yields nothing" is a result worth caching, not a reason to discard it.
         foreach (var path in FileRowsCache.Keys)
         {
-            if (!File.Exists(path))
+            if (!scannedPaths.Contains(path))
             {
                 FileRowsCache.TryRemove(path, out _);
             }
@@ -432,6 +567,13 @@ public sealed class ClaudeUsageInsightsReader
 
     private static decimal? EstimateCost(string model, long rawInput, long cacheRead, long cacheCreate, long output)
     {
+        // Synthetic/local entries cost nothing; report zero rather than "unpriced" so they do
+        // not trigger the incomplete-cost warning.
+        if (IsNonBillableModel(model))
+        {
+            return 0m;
+        }
+
         var pricing = ModelsDevPricing.Lookup("anthropic", model) ?? BuiltInPricingFor(model);
         if (pricing is null)
         {
@@ -463,9 +605,55 @@ public sealed class ClaudeUsageInsightsReader
         return ClaudePricing.TryGetValue(normalized, out var pricing) ? pricing : null;
     }
 
+    /// <summary>
+    /// Pseudo-models that carry no billable usage. Claude Code writes "&lt;synthetic&gt;" for messages
+    /// it generates locally; these must not count as unpriced models or the cost warning fires
+    /// on every scan.
+    /// </summary>
+    /// <summary>
+    /// True when a NORMALIZED model id belongs to Anthropic.
+    /// </summary>
+    /// <remarks>
+    /// Checked after <see cref="NormalizeClaudeModel"/>, which already resolves bare aliases
+    /// ("opus" → "claude-opus-5") and strips the Bedrock "anthropic." prefix, so every Anthropic
+    /// id — first-party, Bedrock, or Vertex ("claude-opus-4-5@20251101") — begins with "claude"
+    /// by that point. Synthetic markers are excluded too: they carry no usage either way.
+    /// </remarks>
+    private static bool IsAnthropicModel(string normalizedModel)
+    {
+        return !IsNonBillableModel(normalizedModel) &&
+            normalizedModel.TrimStart().StartsWith("claude", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsNonBillableModel(string raw)
+    {
+        var value = raw.Trim();
+        return value.Length == 0 ||
+            value.Equals("<synthetic>", StringComparison.OrdinalIgnoreCase) ||
+            value.StartsWith('<');
+    }
+
+    /// <summary>
+    /// Session logs sometimes record a bare family name instead of a full model id. Map those to
+    /// the current model in each family so they price rather than falling through as unknown.
+    /// </summary>
+    private static readonly IReadOnlyDictionary<string, string> ClaudeModelAliases =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["fable"] = "claude-fable-5",
+            ["opus"] = "claude-opus-5",
+            ["sonnet"] = "claude-sonnet-5",
+            ["haiku"] = "claude-haiku-4-5"
+        };
+
     private static string NormalizeClaudeModel(string raw)
     {
         var value = raw.Trim();
+        if (ClaudeModelAliases.TryGetValue(value, out var aliased))
+        {
+            return aliased;
+        }
+
         if (value.StartsWith("anthropic.", StringComparison.OrdinalIgnoreCase))
         {
             value = value["anthropic.".Length..];
@@ -705,6 +893,14 @@ public sealed class ClaudeUsageInsightsReader
 
     private static readonly IReadOnlyDictionary<string, ModelsDevPricingInfo> ClaudePricing = new Dictionary<string, ModelsDevPricingInfo>(StringComparer.OrdinalIgnoreCase)
     {
+        // Claude 5 family. Cache read is 0.1x input and cache write 1.25x input (5-minute TTL),
+        // matching every other row here. None of these carry a long-context premium: the 1M
+        // window bills at the standard rate, so no threshold tier.
+        ["claude-fable-5"] = new(10.00m, 50.00m, 1.00m, 12.50m, null, null, null, null, null),
+        ["claude-opus-5"] = new(5.00m, 25.00m, 0.50m, 6.25m, null, null, null, null, null),
+        ["claude-sonnet-5"] = new(3.00m, 15.00m, 0.30m, 3.75m, null, null, null, null, null),
+        ["claude-opus-4-8"] = new(5.00m, 25.00m, 0.50m, 6.25m, null, null, null, null, null),
+
         ["claude-haiku-4-5-20251001"] = new(1.00m, 5.00m, 0.10m, 1.25m, null, null, null, null, null),
         ["claude-haiku-4-5"] = new(1.00m, 5.00m, 0.10m, 1.25m, null, null, null, null, null),
         ["claude-opus-4-5-20251101"] = new(5.00m, 25.00m, 0.50m, 6.25m, null, null, null, null, null),
