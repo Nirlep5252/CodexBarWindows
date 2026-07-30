@@ -56,16 +56,18 @@ public sealed class TrayApplicationContext : ApplicationContext
         };
         popup.UsageGraphsRequested += (_, _) => ShowUsageGraphs();
         popup.ResetCreditRedeemRequested += (_, request) => BeginResetCreditRedeem(request);
+        popup.VisibleChanged += (_, _) => UpdateRefreshTimerState();
 
+        // Usage is only recalculated while a window is showing it: the timer runs while the
+        // popup or graphs window is open and stops when both close. Nothing refreshes in the
+        // background; opening the popup or graphs triggers the first refresh.
         refreshTimer.Interval = (int)TimeSpan.FromMinutes(1).TotalMilliseconds;
         refreshTimer.Tick += (_, _) => BeginRefresh(showLoading: false);
-        refreshTimer.Start();
 
         updateTimer.Interval = (int)TimeSpan.FromHours(6).TotalMilliseconds;
         updateTimer.Tick += (_, _) => BeginUpdateCheck();
         updateTimer.Start();
 
-        BeginRefresh(showLoading: false);
         _ = Task.Delay(TimeSpan.FromSeconds(10)).ContinueWith(_ => BeginUpdateCheck(), TaskScheduler.Default);
     }
 
@@ -170,6 +172,19 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
+    private void UpdateRefreshTimerState()
+    {
+        var anyUsageWindowOpen = popup.Visible || graphsForm is { IsDisposed: false, Visible: true };
+        if (anyUsageWindowOpen && !refreshTimer.Enabled)
+        {
+            refreshTimer.Start();
+        }
+        else if (!anyUsageWindowOpen && refreshTimer.Enabled)
+        {
+            refreshTimer.Stop();
+        }
+    }
+
     private void BeginRefresh(bool showLoading)
     {
         if (showLoading)
@@ -185,6 +200,9 @@ public sealed class TrayApplicationContext : ApplicationContext
         refreshCancellation?.Cancel();
         refreshCancellation?.Dispose();
 
+        // The 30-day history rebuild parses local session logs; only the graphs window shows
+        // it, so the scan is skipped entirely unless that window is open.
+        var includeHistory = graphsForm is { IsDisposed: false, Visible: true };
         var generation = Interlocked.Increment(ref refreshGeneration);
         var cancellation = new CancellationTokenSource();
         refreshCancellation = cancellation;
@@ -294,14 +312,18 @@ public sealed class TrayApplicationContext : ApplicationContext
                 });
             }
 
-            var refreshTasks = new[]
+            var refreshTasks = new List<Task>
             {
                 RefreshCodexLimitsAsync(),
-                RefreshCodexHistoryAsync(),
                 RefreshClaudeLimitsAsync(),
-                RefreshClaudeHistoryAsync(),
                 RefreshCursorLimitsAsync(),
             };
+
+            if (includeHistory)
+            {
+                refreshTasks.Add(RefreshCodexHistoryAsync());
+                refreshTasks.Add(RefreshClaudeHistoryAsync());
+            }
 
             try
             {
@@ -358,6 +380,8 @@ public sealed class TrayApplicationContext : ApplicationContext
             }
 
             graphsForm.Activate();
+            UpdateRefreshTimerState();
+            BeginRefresh(showLoading: false);
             return;
         }
 
@@ -370,16 +394,24 @@ public sealed class TrayApplicationContext : ApplicationContext
                 BeginRefresh(showLoading: false);
             }
         };
-        graphsForm.FormClosed += (_, _) => graphsForm = null;
+        graphsForm.VisibleChanged += (_, _) => UpdateRefreshTimerState();
+        graphsForm.FormClosed += (_, _) =>
+        {
+            graphsForm = null;
+            UpdateRefreshTimerState();
+        };
         PushHistoryToGraphs();
         graphsForm.Show();
         graphsForm.Activate();
+        UpdateRefreshTimerState();
 
         if (!GetLatestHistory(graphsForm.SelectedProvider).HasInsights)
         {
             graphsForm.SetLoading(graphsForm.SelectedProvider);
-            BeginRefresh(showLoading: false);
         }
+
+        // History is never refreshed in the background, so opening the window always fetches.
+        BeginRefresh(showLoading: false);
     }
 
     private void PushHistoryToGraphs()

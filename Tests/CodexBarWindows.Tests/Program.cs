@@ -23,6 +23,30 @@ if (args.Contains("--scan-real-codex", StringComparer.OrdinalIgnoreCase))
     return;
 }
 
+if (args.Contains("--bench-real-history", StringComparer.OrdinalIgnoreCase))
+{
+    // Times a cold scan against the real session logs, then a warm scan served from the
+    // per-file row cache, and verifies both agree.
+    foreach (var (name, read) in new (string, Func<ProviderUsageInsightsLookupResult>)[]
+    {
+        ("codex", () => new CodexUsageInsightsReader().ReadLatest()),
+        ("claude", () => new ClaudeUsageInsightsReader(null, refreshModelsDevPricing: false).ReadLatest()),
+    })
+    {
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var cold = read();
+        var coldMs = stopwatch.ElapsedMilliseconds;
+        stopwatch.Restart();
+        var warm = read();
+        var warmMs = stopwatch.ElapsedMilliseconds;
+        var matches = cold.Insights?.Last30DaysTokens == warm.Insights?.Last30DaysTokens &&
+            cold.Insights?.Last30DaysEstimatedCostUsd == warm.Insights?.Last30DaysEstimatedCostUsd;
+        Console.WriteLine($"{name}: cold={coldMs}ms warm={warmMs}ms tokens={warm.Insights?.Last30DaysTokens} agree={matches}");
+    }
+
+    return;
+}
+
 if (args.Contains("--scan-real-reset-credits", StringComparer.OrdinalIgnoreCase))
 {
     // Read-only: prints the banked reset inventory the popup renders from.
@@ -100,11 +124,13 @@ var tests = new (string Name, Action Run)[]
     ("Codex history counts priority client metadata turns as fast", CodexHistoryCountsPriorityClientMetadataTurnsAsFast),
     ("Codex history treats primary limit increase as regular", CodexHistoryTreatsPrimaryLimitIncreaseAsRegular),
     ("Codex history ignores stale primary limit for regular turns", CodexHistoryIgnoresStalePrimaryLimitForRegularTurns),
+    ("Codex history rescans a session file after it changes", CodexHistoryRescansChangedSessionFiles),
     ("Usage labels preserve fast suffix", UsageLabelsPreserveFastSuffix),
     ("Claude history aggregates tokens and cost", ClaudeHistoryAggregatesTokensAndCost),
     ("Claude history dedupes streaming and subagent rows", ClaudeHistoryDedupesRows),
     ("Claude history reports incomplete cost for unknown models", ClaudeHistoryReportsIncompleteCost),
     ("Claude history is usable without Claude credentials", ClaudeHistoryDoesNotRequireCredentials),
+    ("Claude history rescans a session file after it changes", ClaudeHistoryRescansChangedSessionFiles),
     ("Claude usage maps Fable from scoped limits", ClaudeUsageMapsScopedFableLimit),
     ("Claude usage maps Fable from the legacy window", ClaudeUsageMapsLegacyFableLimit),
     ("Claude usage omits Fable when Anthropic omits it", ClaudeUsageOmitsMissingFableLimit),
@@ -862,6 +888,27 @@ static void UsageLabelsPreserveFastSuffix()
     AssertEqual("5.5 fast", (string)method.Invoke(null, ["gpt-5.5 fast"])!, "fast model label");
 }
 
+static void CodexHistoryRescansChangedSessionFiles()
+{
+    using var fixture = new CodexFixture();
+    fixture.WriteSessionLog("session.jsonl", CodexTokenCountLine(
+        model: "gpt-5.4", input: 1000, cacheRead: 100, output: 20, limitId: "codex"));
+
+    var first = Today(fixture.Read());
+    // The second read of the unchanged file is served from the per-file row cache.
+    var second = Today(fixture.Read());
+    AssertEqual(first.TotalTokens, second.TotalTokens, "cached codex totals match a fresh scan");
+    AssertClose(first.EstimatedCostUsd, second.EstimatedCostUsd, "cached codex cost matches a fresh scan");
+
+    fixture.WriteSessionLog("session.jsonl",
+        CodexTokenCountLine(model: "gpt-5.4", input: 1000, cacheRead: 100, output: 20, limitId: "codex"),
+        CodexTokenCountLine(model: "gpt-5.4", input: 3000, cacheRead: 100, output: 60, limitId: "codex"));
+
+    var third = Today(fixture.Read());
+    AssertEqual(3000L, third.InputTokens, "changed codex file is rescanned");
+    AssertEqual(60L, third.OutputTokens, "changed codex file output tokens");
+}
+
 static void ClaudeHistoryAggregatesTokensAndCost()
 {
     using var fixture = new ClaudeFixture();
@@ -936,6 +983,26 @@ static void ClaudeHistoryDoesNotRequireCredentials()
     var result = fixture.Read();
     Assert(result.Insights is not null, "history should be read from files only");
     AssertEqual(15L, Today(result).TotalTokens, "local tokens");
+}
+
+static void ClaudeHistoryRescansChangedSessionFiles()
+{
+    using var fixture = new ClaudeFixture();
+    fixture.WriteProjectLog("project", "session.jsonl",
+        AssistantLine("claude-sonnet-4-5", "msg_1", "req_1", input: 1000, cacheRead: 100, cacheCreate: 200, output: 300));
+
+    var first = Today(fixture.Read());
+    // The second read of the unchanged file is served from the per-file row cache.
+    var second = Today(fixture.Read());
+    AssertEqual(first.TotalTokens, second.TotalTokens, "cached claude totals match a fresh scan");
+    AssertClose(first.EstimatedCostUsd, second.EstimatedCostUsd, "cached claude cost matches a fresh scan");
+
+    fixture.WriteProjectLog("project", "session.jsonl",
+        AssistantLine("claude-sonnet-4-5", "msg_1", "req_1", input: 1000, cacheRead: 100, cacheCreate: 200, output: 300),
+        AssistantLine("claude-sonnet-4-5", "msg_2", "req_2", input: 500, cacheRead: 0, cacheCreate: 0, output: 50));
+
+    var third = Today(fixture.Read());
+    AssertEqual(2150L, third.TotalTokens, "changed claude file is rescanned");
 }
 
 static void ClaudeUsageMapsScopedFableLimit()

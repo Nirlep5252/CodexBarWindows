@@ -57,8 +57,10 @@ public sealed class ClaudeUsageInsightsReader
             var rows = new List<ClaudeUsageRow>();
             foreach (var file in files)
             {
-                rows.AddRange(ReadRowsFromFile(file, firstScanDay));
+                rows.AddRange(GetOrReadRowsFromFile(file, firstScanDay));
             }
+
+            PruneFileRowsCache();
 
             var daily = new Dictionary<DateOnly, MutableUsage>();
             var models = new Dictionary<string, MutableUsage>(StringComparer.OrdinalIgnoreCase);
@@ -192,6 +194,71 @@ public sealed class ClaudeUsageInsightsReader
         catch
         {
             return false;
+        }
+    }
+
+    private sealed record CachedFileRows(
+        long Length,
+        long LastWriteUtcTicks,
+        DateOnly FirstScanDay,
+        IReadOnlyList<ClaudeUsageRow> Rows);
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, CachedFileRows> FileRowsCache =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private static IReadOnlyList<ClaudeUsageRow> GetOrReadRowsFromFile(string file, DateOnly firstScanDay)
+    {
+        long length;
+        long lastWriteUtcTicks;
+        try
+        {
+            var info = new FileInfo(file);
+            length = info.Length;
+            lastWriteUtcTicks = info.LastWriteTimeUtc.Ticks;
+        }
+        catch
+        {
+            return ReadRowsFromFile(file, firstScanDay);
+        }
+
+        // A cached scan taken with an earlier lookback window is still valid: rows older than the
+        // current window were already excluded then, and days only move forward. Filtering out
+        // rows that have since aged out happens downstream against the report window.
+        if (FileRowsCache.TryGetValue(file, out var cached) &&
+            cached.Length == length &&
+            cached.LastWriteUtcTicks == lastWriteUtcTicks &&
+            cached.FirstScanDay <= firstScanDay)
+        {
+            // Cost is recomputed on every replay so a models.dev pricing refresh that landed
+            // after the file was cached still prices these rows.
+            return cached.Rows.Select(RepriceRow).ToArray();
+        }
+
+        var rows = ReadRowsFromFile(file, firstScanDay);
+        FileRowsCache[file] = new CachedFileRows(length, lastWriteUtcTicks, firstScanDay, rows);
+        return rows;
+    }
+
+    private static ClaudeUsageRow RepriceRow(ClaudeUsageRow row)
+    {
+        var rawInput = Math.Max(0, row.Tokens.InputTokens - row.Tokens.CachedInputTokens);
+        var cost = EstimateCost(row.Model, rawInput, row.Tokens.CachedInputTokens, row.Tokens.CacheCreationTokens, row.Tokens.OutputTokens);
+        return row with { CostUsd = cost, CostPriced = cost is not null };
+    }
+
+    private static void PruneFileRowsCache()
+    {
+        if (FileRowsCache.Count <= 2048)
+        {
+            return;
+        }
+
+        foreach (var path in FileRowsCache.Keys)
+        {
+            if (!File.Exists(path))
+            {
+                FileRowsCache.TryRemove(path, out _);
+            }
         }
     }
 

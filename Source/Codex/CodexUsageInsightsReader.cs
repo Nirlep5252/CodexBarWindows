@@ -53,13 +53,21 @@ public sealed class CodexUsageInsightsReader
 
             foreach (var file in codexFiles)
             {
-                ScanCodexFile(file, firstScanDay, daily, models, fastTurnIds);
+                foreach (var row in GetOrScanFileRows(file, firstScanDay, isPiFile: false))
+                {
+                    ApplyRow(row, firstScanDay, daily, models, fastTurnIds);
+                }
             }
 
             foreach (var file in piFiles)
             {
-                ScanPiFile(file, firstScanDay, daily, models);
+                foreach (var row in GetOrScanFileRows(file, firstScanDay, isPiFile: true))
+                {
+                    ApplyRow(row, firstScanDay, daily, models, fastTurnIds);
+                }
             }
+
+            PruneFileRowsCache();
 
             var dailyRows = Enumerable.Range(0, DaysToReport)
                 .Select(offset => firstReportDay.AddDays(offset))
@@ -191,22 +199,20 @@ public sealed class CodexUsageInsightsReader
         }
     }
 
-    private static void ScanCodexFile(
-        string file,
-        DateOnly firstScanDay,
-        IDictionary<DateOnly, MutableUsage> daily,
-        IDictionary<string, MutableUsage> models,
-        IReadOnlySet<string> fastTurnIds)
+    private static IReadOnlyList<CodexScanRow> ScanCodexFile(string file, DateOnly firstScanDay)
     {
+        var rows = new List<CodexScanRow>();
         var shape = ClassifyCodexRollout(file);
         if (shape.SuppressWholeFile)
         {
-            return;
+            return rows;
         }
 
         string? currentModel = null;
         string? currentTurnId = null;
-        var currentIsFastMode = false;
+        // Fast-turn-id membership is resolved at apply time so cached rows stay valid when the
+        // Codex log databases (and therefore the fast-turn set) change between refreshes.
+        var currentBaseFast = false;
         var accountant = new CodexTotalsAccountant(shape.OwnedSuffixBaseline, shape.PrefersTotalsAccounting);
         var lineIndex = -1;
 
@@ -235,8 +241,7 @@ public sealed class CodexUsageInsightsReader
                 {
                     currentModel = ReadModel(root) ?? currentModel;
                     currentTurnId = ReadTurnId(root);
-                    currentIsFastMode = IsFastMode(currentModel ?? "Codex model", default, null, root) ||
-                        (currentTurnId is not null && fastTurnIds.Contains(currentTurnId));
+                    currentBaseFast = IsFastMode(currentModel ?? "Codex model", default, null, root);
                     continue;
                 }
 
@@ -265,24 +270,20 @@ public sealed class CodexUsageInsightsReader
                 var rowIsFastMode = payload.TryGetProperty("rate_limits", out var rateLimits)
                     ? IsFastMode(model, delta, null, root, payload, rateLimits)
                     : IsFastMode(model, delta, null, root, payload);
-                var isFastMode = currentIsFastMode || rowIsFastMode;
-                var categoryLabel = ModelBreakdownLabel(model, isFastMode);
-                Add(daily, day.Value, model, delta, isFastMode, categoryLabel: categoryLabel);
-                Add(models, ModelBreakdownKey(model, isFastMode), model, delta, isFastMode, displayName: categoryLabel);
+                rows.Add(new CodexScanRow(day.Value, model, delta, currentBaseFast || rowIsFastMode, currentTurnId, null));
             }
             catch
             {
                 // Session logs may contain partial or future-format rows. Ignore only the bad row.
             }
         }
+
+        return rows;
     }
 
-    private static void ScanPiFile(
-        string file,
-        DateOnly firstScanDay,
-        IDictionary<DateOnly, MutableUsage> daily,
-        IDictionary<string, MutableUsage> models)
+    private static IReadOnlyList<CodexScanRow> ScanPiFile(string file, DateOnly firstScanDay)
     {
+        var rows = new List<CodexScanRow>();
         string? currentModel = null;
         var currentProviderIsCodex = false;
 
@@ -358,15 +359,101 @@ public sealed class CodexUsageInsightsReader
                 var effectiveInput = Math.Max(input + cacheRead + cacheWrite, Math.Max(0, directTotal - output));
                 var tokens = new TokenTotals(effectiveInput, Math.Min(cacheRead, effectiveInput), output);
                 var isFastMode = IsFastMode(model, tokens, exactCost, root, message, usage);
-                var categoryLabel = ModelBreakdownLabel(model, isFastMode);
-                Add(daily, day.Value, model, tokens, isFastMode, exactCost, categoryLabel);
-                Add(models, ModelBreakdownKey(model, isFastMode), model, tokens, isFastMode, exactCost, categoryLabel);
+                rows.Add(new CodexScanRow(day.Value, model, tokens, isFastMode, null, exactCost));
             }
             catch
             {
                 // pi session logs may contain partial or future-format rows. Ignore only the bad row.
             }
         }
+
+        return rows;
+    }
+
+    /// <summary>
+    /// One usage entry extracted from a session file, kept file-shape-agnostic so a file's rows
+    /// can be cached and replayed without re-parsing. <see cref="BaseFast"/> excludes fast-turn-id
+    /// membership, which is re-evaluated on every apply against the current fast-turn set.
+    /// </summary>
+    private sealed record CodexScanRow(
+        DateOnly Day,
+        string Model,
+        TokenTotals Tokens,
+        bool BaseFast,
+        string? TurnId,
+        decimal? ExactCostUsd);
+
+    private sealed record CachedFileRows(
+        long Length,
+        long LastWriteUtcTicks,
+        DateOnly FirstScanDay,
+        IReadOnlyList<CodexScanRow> Rows);
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, CachedFileRows> FileRowsCache =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private static IReadOnlyList<CodexScanRow> GetOrScanFileRows(string file, DateOnly firstScanDay, bool isPiFile)
+    {
+        long length;
+        long lastWriteUtcTicks;
+        try
+        {
+            var info = new FileInfo(file);
+            length = info.Length;
+            lastWriteUtcTicks = info.LastWriteTimeUtc.Ticks;
+        }
+        catch
+        {
+            return isPiFile ? ScanPiFile(file, firstScanDay) : ScanCodexFile(file, firstScanDay);
+        }
+
+        // A cached scan taken with an earlier lookback window is still valid: rows older than the
+        // current window were already excluded then, and days only move forward.
+        if (FileRowsCache.TryGetValue(file, out var cached) &&
+            cached.Length == length &&
+            cached.LastWriteUtcTicks == lastWriteUtcTicks &&
+            cached.FirstScanDay <= firstScanDay)
+        {
+            return cached.Rows;
+        }
+
+        var rows = isPiFile ? ScanPiFile(file, firstScanDay) : ScanCodexFile(file, firstScanDay);
+        FileRowsCache[file] = new CachedFileRows(length, lastWriteUtcTicks, firstScanDay, rows);
+        return rows;
+    }
+
+    private static void PruneFileRowsCache()
+    {
+        if (FileRowsCache.Count <= 2048)
+        {
+            return;
+        }
+
+        foreach (var path in FileRowsCache.Keys)
+        {
+            if (!File.Exists(path))
+            {
+                FileRowsCache.TryRemove(path, out _);
+            }
+        }
+    }
+
+    private static void ApplyRow(
+        CodexScanRow row,
+        DateOnly firstScanDay,
+        IDictionary<DateOnly, MutableUsage> daily,
+        IDictionary<string, MutableUsage> models,
+        IReadOnlySet<string> fastTurnIds)
+    {
+        if (row.Day < firstScanDay)
+        {
+            return;
+        }
+
+        var isFastMode = row.BaseFast || (row.TurnId is not null && fastTurnIds.Contains(row.TurnId));
+        var categoryLabel = ModelBreakdownLabel(row.Model, isFastMode);
+        Add(daily, row.Day, row.Model, row.Tokens, isFastMode, row.ExactCostUsd, categoryLabel);
+        Add(models, ModelBreakdownKey(row.Model, isFastMode), row.Model, row.Tokens, isFastMode, row.ExactCostUsd, categoryLabel);
     }
 
     private static IEnumerable<string> ReadSharedLines(string path)
