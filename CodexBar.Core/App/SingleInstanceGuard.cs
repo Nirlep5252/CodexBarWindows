@@ -24,9 +24,15 @@ public sealed class SingleInstanceGuard : IDisposable
             executeOnlyOnce: false);
     }
 
-    public static SingleInstanceGuard? TryAcquire()
+    /// <param name="scope">
+    /// Optional suffix isolating one build of the app from another. Omitting it keeps the
+    /// original names, so the shipping WinForms app is unaffected; the in-progress WinUI 3
+    /// app passes its own scope so both can run side by side during the rewrite.
+    /// </param>
+    public static SingleInstanceGuard? TryAcquire(string? scope = null)
     {
-        var mutex = new Mutex(initiallyOwned: true, MutexName, out var createdNew);
+        var suffix = Suffix(scope);
+        var mutex = new Mutex(initiallyOwned: true, MutexName + suffix, out var createdNew);
         if (!createdNew)
         {
             mutex.Dispose();
@@ -35,20 +41,25 @@ public sealed class SingleInstanceGuard : IDisposable
 
         return new SingleInstanceGuard(
             mutex,
-            new EventWaitHandle(initialState: false, EventResetMode.AutoReset, ActivationEventName));
+            new EventWaitHandle(initialState: false, EventResetMode.AutoReset, ActivationEventName + suffix));
     }
 
-    public static void SignalExistingInstance()
+    public static void SignalExistingInstance(string? scope = null)
     {
         try
         {
-            using var activationEvent = EventWaitHandle.OpenExisting(ActivationEventName);
+            using var activationEvent = EventWaitHandle.OpenExisting(ActivationEventName + Suffix(scope));
             activationEvent.Set();
         }
         catch (WaitHandleCannotBeOpenedException)
         {
             // The running instance owns the mutex but has not created its event yet.
         }
+    }
+
+    private static string Suffix(string? scope)
+    {
+        return string.IsNullOrWhiteSpace(scope) ? string.Empty : "." + scope;
     }
 
     public void Dispose()

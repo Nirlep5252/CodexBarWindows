@@ -115,12 +115,28 @@ CodexBar.Core/Codex/      Codex CLI/RPC usage reading
 CodexBar.Core/Cursor/     Cursor usage reading
 CodexBar.Core/Usage/      Shared provider usage models
 CodexBar.Core/Updates/    GitHub Releases update checker
+CodexBar.WinUI/            WinUI 3 shell (in-progress rewrite, built side by side)
 Source/App/                Program entry point and tray application context
 Source/UI/                 Popup form, meter control, and tray icon rendering
 .github/workflows/         Release workflow for building and publishing MSI files
 ```
 
 The PowerShell scripts are grouped under `Scripts/` because they are the primary local commands for development, install, uninstall, and MSI packaging.
+
+`CodexBar.WinUI/` is the in-progress WinUI 3 replacement for the WinForms UI. It is a separate,
+unpackaged self-contained app that shares `CodexBar.Core` with the shipping app, so both can run
+at the same time (they use different single-instance mutex names). It is not wired into the
+installer or the release workflow yet:
+
+```powershell
+dotnet build .\CodexBar.WinUI\CodexBar.WinUI.csproj -p:Platform=x64
+.\CodexBar.WinUI\bin\x64\Debug\net10.0-windows10.0.19041.0\win-x64\CodexBar.WinUI.exe
+```
+
+Set `CODEXBAR_WINUI_DIAG=1` to log the flyout's show/dismiss lifecycle to
+`%TEMP%\codexbar-winui.log`; `CODEXBAR_WINUI_AUTOSHOW=1` opens the flyout at startup and
+`CODEXBAR_WINUI_AUTOEXIT=<seconds>` shuts the app down again, which is how the shell is verified
+without a human clicking the tray icon.
 
 ## Versioning
 

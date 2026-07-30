@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      WinUI 3 shell for CodexBar. Built SIDE BY SIDE with the WinForms app
+      (CodexBarWindows.csproj) until the cutover; both consume CodexBar.Core.
+    -->
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <OutputType>WinExe</OutputType>
+    <RootNamespace>CodexBar.WinUI</RootNamespace>
+    <!-- Must stay CodexBar.WinUI: CodexBar.Core grants InternalsVisibleTo to this name. -->
+    <AssemblyName>CodexBar.WinUI</AssemblyName>
+
+    <!-- WinUI 3, UNPACKAGED (no MSIX: it needs signing and breaks the self-updater). -->
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>None</WindowsPackageType>
+    <EnableMsixTooling>false</EnableMsixTooling>
+
+    <!-- Custom entry point (Program.Main) instead of the XAML-generated one. -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+
+    <!-- Self-contained: the Windows App Runtime ships next to the exe, so the
+         installer needs no runtime prerequisite. -->
+    <SelfContained>true</SelfContained>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Platforms>x64</Platforms>
+    <UseRidGraph>true</UseRidGraph>
+
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\Assets\CodexBarWindows.ico</ApplicationIcon>
+
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260710003" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.7175" />
+    <PackageReference Include="H.NotifyIcon.WinUI" Version="2.4.1" />
+    <Manifest Include="$(ApplicationManifest)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CodexBar.Core\CodexBar.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- One shared icon file for both apps; copied into Assets\ next to the exe. -->
+    <Content Include="..\Assets\CodexBarWindows.ico" Link="Assets\CodexBarWindows.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

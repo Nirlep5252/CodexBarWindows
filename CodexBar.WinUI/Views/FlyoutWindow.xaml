@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<Window
+    x:Class="CodexBar.WinUI.FlyoutWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:CodexBar.WinUI">
+
+    <!-- Transparent root so the system backdrop shows through; TintLayer paints the
+         user-configured tint on top of the material. -->
+    <Grid x:Name="RootGrid" Background="Transparent">
+        <Border x:Name="TintLayer" />
+
+        <Grid x:Name="ContentRoot" Padding="16,14,16,14" RowSpacing="12">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <!-- Header -->
+            <Grid Grid.Row="0" ColumnSpacing="10">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0" Spacing="1">
+                    <TextBlock
+                        Text="CodexBar"
+                        Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <TextBlock
+                        x:Name="SubtitleText"
+                        Style="{StaticResource CaptionTextBlockStyle}"
+                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                </StackPanel>
+
+                <Button
+                    Grid.Column="1"
+                    x:Name="RefreshButton"
+                    VerticalAlignment="Top"
+                    Padding="8"
+                    Style="{StaticResource SubtleButtonStyle}"
+                    ToolTipService.ToolTip="Refresh">
+                    <FontIcon FontSize="15" Glyph="&#xE72C;" />
+                </Button>
+            </Grid>
+
+            <!-- Providers -->
+            <Border
+                Grid.Row="1"
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1"
+                CornerRadius="8">
+                <!-- Rows come from a template, never from brushes looked up in code: a brush
+                     resolved off Application.Current.Resources freezes to the APP theme and
+                     renders dark-on-light when the user forces the opposite theme. -->
+                <ItemsControl x:Name="ProviderList" Padding="4">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="local:ProviderRow">
+                            <Grid Padding="10,8,10,8" ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+
+                                <StackPanel Grid.Column="0" Spacing="1">
+                                    <TextBlock
+                                        Text="{x:Bind Name}"
+                                        Style="{StaticResource BodyStrongTextBlockStyle}" />
+                                    <TextBlock
+                                        Text="{x:Bind Description}"
+                                        Style="{StaticResource CaptionTextBlockStyle}"
+                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                </StackPanel>
+
+                                <TextBlock
+                                    Grid.Column="1"
+                                    VerticalAlignment="Center"
+                                    Text="{x:Bind Status}"
+                                    Style="{StaticResource CaptionTextBlockStyle}"
+                                    Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                            </Grid>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </Border>
+
+            <!-- Status line -->
+            <TextBlock
+                Grid.Row="2"
+                x:Name="StatusText"
+                TextWrapping="NoWrap"
+                TextTrimming="CharacterEllipsis"
+                Style="{StaticResource CaptionTextBlockStyle}"
+                Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+
+            <!-- Footer actions -->
+            <StackPanel
+                Grid.Row="3"
+                Orientation="Horizontal"
+                HorizontalAlignment="Right"
+                Spacing="8">
+                <Button x:Name="GraphsButton" Content="Usage graphs" />
+                <Button x:Name="SettingsButton" Content="Settings" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>

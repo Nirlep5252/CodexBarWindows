@@ -13,6 +13,8 @@
     <Compile Remove="Tests\**\*.cs" />
     <!-- Shared UI-free logic lives in its own assembly; see CodexBar.Core. -->
     <Compile Remove="CodexBar.Core\**\*.cs" />
+    <!-- The WinUI 3 shell is a separate app; this project globs the whole repo root. -->
+    <Compile Remove="CodexBar.WinUI\**\*.cs" />
   </ItemGroup>
 
   <ItemGroup>
