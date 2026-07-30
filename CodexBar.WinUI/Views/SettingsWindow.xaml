@@ -193,9 +193,21 @@
                             </tk:SettingsExpander.Items>
                         </tk:SettingsExpander>
 
+                        <!--
+                            The "vibes" appearance is NOT implemented in this shell. The WinForms
+                            app backs it with Source/UI/Fluent/VibeTheme.cs (a custom palette,
+                            gradient meters and celebration animations) wired through six UI files;
+                            none of that has been ported. The toggle is hidden rather than deleted
+                            because the setting is still read (UiSettings.EffectiveMaterial and
+                            ResolveIsDark honour it) and it lives in a registry key SHARED with the
+                            WinForms app — offering it here would advertise a feature that does
+                            nothing while silently restyling the other shell. Restore the card once
+                            VibeTheme is ported.
+                        -->
                         <tk:SettingsCard
                             Description="V3 Code theme, animated meters, and little celebrations."
-                            Header="Turn on the vibes">
+                            Header="Turn on the vibes"
+                            Visibility="Collapsed">
                             <tk:SettingsCard.HeaderIcon>
                                 <FontIcon Glyph="&#xE945;" />
                             </tk:SettingsCard.HeaderIcon>
