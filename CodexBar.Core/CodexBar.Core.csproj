@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      UI-free provider/usage logic shared by the WinForms app and the WinUI 3 app.
+
+      TargetFramework is deliberately net10.0-windows (windows7.0) rather than
+      net10.0-windows10.0.19041: the WinForms app targets net10.0-windows and a
+      project cannot reference one with a HIGHER Windows platform version
+      (NU1201). The WinUI 3 app (net10.0-windows10.0.19041.0) can reference this
+      one because consuming a lower platform version is allowed.
+    -->
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <OutputType>Library</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- No UseWindowsForms: this assembly must stay usable from WinUI 3. -->
+    <RootNamespace>CodexBarWindows</RootNamespace>
+    <AssemblyName>CodexBar.Core</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      CursorSettings uses DPAPI. WinForms/WPF apps get this from the
+      Microsoft.WindowsDesktop.App shared framework, but this library (and the
+      WinUI 3 app) do not reference it, so the package is required.
+    -->
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CodexBarWindows" />
+    <InternalsVisibleTo Include="CodexBarWindows.Tests" />
+    <InternalsVisibleTo Include="CodexBar.WinUI" />
+  </ItemGroup>
+
+</Project>

@@ -108,12 +108,15 @@ dotnet publish .\CodexBarWindows.csproj -c Release -r win-x64 --self-contained:t
 Assets/                    App icon and tray logo assets
 Installer/                 WiX MSI package definition
 Scripts/                   Local run, install, uninstall, and MSI build scripts
+CodexBar.Core/            UI-free shared library (settings, providers, updates)
+CodexBar.Core/App/        App settings, version info, single-instance guard
+CodexBar.Core/Claude/     Claude Code OAuth usage reading
+CodexBar.Core/Codex/      Codex CLI/RPC usage reading
+CodexBar.Core/Cursor/     Cursor usage reading
+CodexBar.Core/Usage/      Shared provider usage models
+CodexBar.Core/Updates/    GitHub Releases update checker
 Source/App/                Program entry point and tray application context
-Source/Claude/             Claude Code OAuth usage reading
-Source/Codex/              Codex CLI/RPC usage reading
-Source/Usage/              Shared provider usage models
 Source/UI/                 Popup form, meter control, and tray icon rendering
-Source/Updates/            GitHub Releases update checker
 .github/workflows/         Release workflow for building and publishing MSI files
 ```
 

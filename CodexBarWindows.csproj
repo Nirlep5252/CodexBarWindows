@@ -11,6 +11,12 @@
 
   <ItemGroup>
     <Compile Remove="Tests\**\*.cs" />
+    <!-- Shared UI-free logic lives in its own assembly; see CodexBar.Core. -->
+    <Compile Remove="CodexBar.Core\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="CodexBar.Core\CodexBar.Core.csproj" />
   </ItemGroup>
 
   <ItemGroup>

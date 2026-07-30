@@ -8,6 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\CodexBar.Core\CodexBar.Core.csproj" />
     <ProjectReference Include="..\..\CodexBarWindows.csproj" />
   </ItemGroup>
 </Project>
