@@ -38,6 +38,28 @@ internal static class NativeWindow
     }
 
     /// <summary>
+    /// Screen cursor position in physical pixels, or null if the call fails. Used to pick which
+    /// display the flyout opens on: the tray icon that was clicked sits next to the cursor.
+    /// </summary>
+    public static Windows.Graphics.PointInt32? TryGetCursorPosition()
+    {
+        return GetCursorPos(out var point)
+            ? new Windows.Graphics.PointInt32(point.X, point.Y)
+            : null;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetCursorPos(out POINT lpPoint);
+
+    /// <summary>
     /// True when the window that currently has the foreground belongs to THIS process.
     /// <para>
     /// This is the process-level check ported from the WinForms

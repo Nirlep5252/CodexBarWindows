@@ -139,7 +139,9 @@ public partial class App : Application
             ToolTipText = AppInfo.AppName,
             ContextFlyout = menu,
             ContextMenuMode = ContextMenuMode.SecondWindow,
-            Icon = new System.Drawing.Icon(Path.Combine(AppContext.BaseDirectory, "Assets", "CodexBarWindows.ico")),
+            // The Codex glyph rendered for the current taskbar theme, not the boxed app icon —
+            // the .ico has a light plate and reads as a bright tile beside other tray marks.
+            Icon = TrayGlyph.Create(),
             LeftClickCommand = new RelayCommand(ToggleFlyout),
             NoLeftClickDelay = true
         };
@@ -147,6 +149,48 @@ public partial class App : Application
         // false: do NOT opt the process into Efficiency Mode - background polling timers
         // (added in a later phase) must not be throttled.
         trayIcon.ForceCreate(enablesEfficiencyMode: false);
+
+        WatchSystemThemeForTrayIcon();
+    }
+
+    private Windows.UI.ViewManagement.UISettings? trayThemeWatcher;
+    private bool trayIconIsLight = TrayGlyph.IsLightSystemTheme();
+
+    /// <summary>
+    /// Re-renders the tray glyph when the user switches between a light and dark taskbar.
+    /// </summary>
+    /// <remarks>
+    /// Held in a field: ColorValuesChanged fires on a background thread from a COM object that is
+    /// collected the moment nothing roots it, which would silently stop the updates (the same
+    /// failure mode already documented for the update timer). The handler filters on the taskbar
+    /// theme specifically, because ColorValuesChanged also fires for accent-colour changes that
+    /// do not affect a monochrome glyph.
+    /// </remarks>
+    private void WatchSystemThemeForTrayIcon()
+    {
+        trayThemeWatcher = new Windows.UI.ViewManagement.UISettings();
+        trayThemeWatcher.ColorValuesChanged += (_, _) =>
+        {
+            var isLight = TrayGlyph.IsLightSystemTheme();
+            if (isLight == trayIconIsLight)
+            {
+                return;
+            }
+
+            trayIconIsLight = isLight;
+            queue?.TryEnqueue(() =>
+            {
+                if (trayIcon is null)
+                {
+                    return;
+                }
+
+                var previous = trayIcon.Icon;
+                trayIcon.Icon = TrayGlyph.Create();
+                previous?.Dispose();
+                DiagnosticLog.Write("tray glyph rebuilt for {0} taskbar", isLight ? "light" : "dark");
+            });
+        };
     }
 
     /// <summary>

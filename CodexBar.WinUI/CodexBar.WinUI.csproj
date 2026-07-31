@@ -60,6 +60,15 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
+    <!-- The monochrome Codex marks TrayGlyph renders; one per taskbar theme. -->
+    <Content Include="..\Assets\OpenAICodexLogoWhite.png" Link="Assets\OpenAICodexLogoWhite.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <Content Include="..\Assets\OpenAICodexLogoBlack.png" Link="Assets\OpenAICodexLogoBlack.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
   </ItemGroup>
 
   <!--

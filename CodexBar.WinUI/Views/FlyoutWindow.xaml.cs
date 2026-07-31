@@ -147,6 +147,10 @@ public sealed partial class FlyoutWindow : Window
 
     public void ShowFlyout()
     {
+        // Capture the cursor BEFORE showing anything: it is next to the tray icon that was
+        // clicked, and is what picks the monitor on a multi-display setup.
+        anchorPoint = NativeWindow.TryGetCursorPosition();
+
         // Render before the window is placed: PositionNearTray sizes to the measured content,
         // so the content has to be the CURRENT content or the first frame is the wrong height.
         Render();
@@ -931,10 +935,24 @@ public sealed partial class FlyoutWindow : Window
         AppWindow.MoveAndResize(new RectInt32(position.X, y, size.Width, height));
     }
 
+    /// <summary>
+    /// Cursor position captured when the tray was clicked, used to pick the display.
+    /// </summary>
+    /// <remarks>
+    /// Resolving the display from the flyout's OWN window handle picks whichever monitor the
+    /// hidden window happens to sit on — on first show that is WinUI's default placement, so a
+    /// tray click on a secondary monitor opened the flyout on the primary one. The tray icon
+    /// that was clicked is next to the cursor, so the cursor is the correct anchor. The WinForms
+    /// original used Cursor.Position for exactly this reason.
+    /// </remarks>
+    private PointInt32? anchorPoint;
+
     private RectInt32 WorkArea(out RectInt32 outerBounds)
     {
-        var displayArea = DisplayArea.GetFromWindowId(
-            Win32Interop.GetWindowIdFromWindow(hwnd), DisplayAreaFallback.Nearest);
+        var displayArea = anchorPoint is { } anchor
+            ? DisplayArea.GetFromPoint(anchor, DisplayAreaFallback.Nearest)
+            : DisplayArea.GetFromWindowId(Win32Interop.GetWindowIdFromWindow(hwnd), DisplayAreaFallback.Nearest);
+
         outerBounds = displayArea.OuterBounds;
         return displayArea.WorkArea;
     }
