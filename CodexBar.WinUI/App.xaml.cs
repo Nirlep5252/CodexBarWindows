@@ -48,7 +48,75 @@ public partial class App : Application
     public App(SingleInstanceGuard? singleInstance = null)
     {
         this.singleInstance = singleInstance;
+
+        // Hooked BEFORE InitializeComponent, because XAML resource loading is itself a place
+        // this can throw. See OnUnhandledException for why the app survives a UI-thread fault.
+        UnhandledException += OnUnhandledException;
+        AppDomain.CurrentDomain.UnhandledException += OnDomainUnhandledException;
+        TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
+
         InitializeComponent();
+    }
+
+    // -------------------------------------------------------------- crash reporting
+
+    /// <summary>
+    /// The last line of defence on the UI thread.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This shell is UNPACKAGED, so the default outcome of a XAML-thread exception is a silent
+    /// fail-fast: the tray icon vanishes mid-session with no dialog, no log and nothing in the
+    /// event log the user can act on. That is the worst possible failure for a background app -
+    /// the crash costs the user the app itself, and costs us the report.
+    /// </para>
+    /// <para>
+    /// So the exception is written out in full and then <c>Handled</c> is set. The trade is
+    /// deliberate: the alternative to a possibly-inconsistent window is NO APP AT ALL, and the
+    /// state that matters here (settings, account list, cached usage) lives outside the visual
+    /// tree and is re-read on the next refresh. This is a backstop, NOT a licence to leave
+    /// throwing code in place - anything that lands here is a bug, and the log line is what makes
+    /// it findable.
+    /// </para>
+    /// <para>
+    /// It does NOT catch access violations from native code (Skia, the compositor); those bypass
+    /// managed exception handling entirely. Preventing those is a matter of orderly teardown -
+    /// see <c>GraphsWindow.Teardown</c>.
+    /// </para>
+    /// </remarks>
+    private void OnUnhandledException(object sender, Microsoft.UI.Xaml.UnhandledExceptionEventArgs e)
+    {
+        // BOTH are logged on purpose: WinUI's Exception is frequently a bare COMException whose
+        // stack has already been lost across the XAML/CLR boundary, while Message still carries
+        // the original type and text.
+        DiagnosticLog.WriteCrash(
+            "UNHANDLED (ui thread, handled - process kept alive): {0}{1}{2}",
+            e.Message,
+            Environment.NewLine,
+            e.Exception?.ToString() ?? "<no exception object>");
+
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// A fault on a thread nobody owns. Nothing can be salvaged here - the runtime is already on
+    /// its way down - so this exists purely so the crash leaves a trace.
+    /// </summary>
+    private static void OnDomainUnhandledException(object sender, System.UnhandledExceptionEventArgs e) =>
+        DiagnosticLog.WriteCrash(
+            "UNHANDLED (appdomain, terminating={0}): {1}{2}",
+            e.IsTerminating,
+            Environment.NewLine,
+            e.ExceptionObject?.ToString() ?? "<no exception object>");
+
+    /// <summary>
+    /// A faulted Task whose exception nobody ever looked at. Harmless by default on modern .NET,
+    /// but it is exactly how a background refresh failure would otherwise disappear.
+    /// </summary>
+    private static void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
+    {
+        DiagnosticLog.WriteCrash("UNOBSERVED task exception:{0}{1}", Environment.NewLine, e.Exception);
+        e.SetObserved();
     }
 
     /// <summary>
@@ -215,11 +283,24 @@ public partial class App : Application
 
     private void ShowFlyout() => EnsureFlyout().ShowFlyout();
 
-    private void ShowSettings()
+    /// <param name="historyImport">
+    /// Land on Settings ▸ Graphs, where the history import lives, instead of on whichever section
+    /// the (cached, process-lifetime) window was left on. Set by the graphs window's "Import
+    /// history" link, which asks for the surface and never starts the import itself.
+    /// </param>
+    private void ShowSettings(bool historyImport = false)
     {
         if (settingsWindow is not null)
         {
-            settingsWindow.ShowAndFocus();
+            if (historyImport)
+            {
+                settingsWindow.ShowHistoryImport();
+            }
+            else
+            {
+                settingsWindow.ShowAndFocus();
+            }
+
             return;
         }
 
@@ -228,7 +309,14 @@ public partial class App : Application
         window.Closed += (_, _) => settingsWindow = null;
         // A sibling window losing focus is invisible to the flyout, so it re-arms the check.
         window.ActivationChanged += (_, _) => flyout?.ReArmDismissCheck();
-        window.ShowAndFocus();
+        if (historyImport)
+        {
+            window.ShowHistoryImport();
+        }
+        else
+        {
+            window.ShowAndFocus();
+        }
     }
 
     /// <summary>
@@ -249,6 +337,10 @@ public partial class App : Application
         window.Closed += (_, _) => graphsWindow = null;
         // A sibling window losing focus is invisible to the flyout, so it re-arms the check.
         window.ActivationChanged += (_, _) => flyout?.ReArmDismissCheck();
+        // The timeline strip's "Import history" link. The backfill UI lives in Settings ▸ Graphs
+        // and the shell is the only thing that can see both windows, so the wiring belongs here -
+        // without it the link falls back to printing directions at the user.
+        window.ImportHistoryRequested += (_, _) => ShowSettings(historyImport: true);
         window.ShowAndFocus();
     }
 

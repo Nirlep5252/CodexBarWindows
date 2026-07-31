@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using CodexBarWindows;
 using Microsoft.UI.Xaml;
 using SkiaSharp;
 using Windows.UI;
@@ -24,9 +26,12 @@ namespace CodexBar.WinUI;
 /// </remarks>
 internal sealed class ChartPalette
 {
-    private ChartPalette(bool isDark)
+    private readonly IReadOnlyDictionary<string, string> overrides;
+
+    private ChartPalette(bool isDark, IReadOnlyDictionary<string, string> overrides)
     {
         IsDark = isDark;
+        this.overrides = overrides;
 
         Accent = ToSkia(SystemAccent(isDark));
         Success = isDark ? new SKColor(0x6C, 0xCB, 0x5F) : new SKColor(0x0F, 0x7B, 0x0F);
@@ -69,9 +74,27 @@ internal sealed class ChartPalette
     /// <summary>The unfilled part of a model row's bar.</summary>
     public SKColor Track { get; }
 
-    public static ChartPalette For(FrameworkElement element) =>
-        new(element.ActualTheme == ElementTheme.Dark ||
-            (element.ActualTheme == ElementTheme.Default && Application.Current.RequestedTheme == ApplicationTheme.Dark));
+    /// <summary>
+    /// Builds the palette for one element's resolved theme, with the user's per-model colour
+    /// overrides folded in.
+    /// </summary>
+    /// <remarks>
+    /// The overrides are PASSED IN rather than read from <c>AppTheme.Settings</c> here, keeping
+    /// this type's only dependency the element it is themed from - the same UI → settings
+    /// direction <see cref="UiSettings"/> documents.
+    /// </remarks>
+    public static ChartPalette For(FrameworkElement element, IReadOnlyDictionary<string, string>? overrides = null) =>
+        new(
+            element.ActualTheme == ElementTheme.Dark ||
+                (element.ActualTheme == ElementTheme.Default && Application.Current.RequestedTheme == ApplicationTheme.Dark),
+            overrides ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// Whether this label's colour was chosen by the user. A picked colour is used EXACTLY as
+    /// picked, so callers skip <see cref="Nudge"/> for it - a silently lightened swatch would not
+    /// match the hex the settings page shows.
+    /// </summary>
+    public bool IsOverridden(string label) => TryGetOverride(label, out _);
 
     /// <summary>
     /// The colour for one spend category ("gpt-5.5", "opus fast", "regular", …). Ported rule for
@@ -79,6 +102,13 @@ internal sealed class ChartPalette
     /// </summary>
     public SKColor ForCategory(string label)
     {
+        // FIRST, before the "fast" short-circuit below: that rule returns for any label merely
+        // CONTAINING "fast", so an override on "gpt-5.3 fast" would otherwise be unreachable.
+        if (TryGetOverride(label, out var chosen))
+        {
+            return chosen;
+        }
+
         var normalized = label.Replace(" fast", string.Empty, StringComparison.OrdinalIgnoreCase).ToLowerInvariant();
         if (label.Contains("fast", StringComparison.OrdinalIgnoreCase))
         {
@@ -111,6 +141,35 @@ internal sealed class ChartPalette
 
         SKColor[] palette = [Accent, Success, SeriesAlt, Warning];
         return palette[StableColorIndex(normalized, palette.Length)];
+    }
+
+    /// <summary>
+    /// Parses a stored <c>"#RRGGBB"</c> override. Anything else is treated as absent so a corrupt
+    /// entry degrades to the automatic colour instead of throwing while a chart is being drawn.
+    /// </summary>
+    public static bool TryParseHex(string? hex, out SKColor color)
+    {
+        color = default;
+        if (UiSettings.NormalizeHexColor(hex) is not { } normalized)
+        {
+            return false;
+        }
+
+        color = new SKColor(
+            Convert.ToByte(normalized.Substring(1, 2), 16),
+            Convert.ToByte(normalized.Substring(3, 2), 16),
+            Convert.ToByte(normalized.Substring(5, 2), 16));
+        return true;
+    }
+
+    public static string ToHex(SKColor color) => $"#{color.Red:X2}{color.Green:X2}{color.Blue:X2}";
+
+    private bool TryGetOverride(string label, out SKColor color)
+    {
+        color = default;
+        return !string.IsNullOrWhiteSpace(label) &&
+            overrides.TryGetValue(label.Trim(), out var hex) &&
+            TryParseHex(hex, out color);
     }
 
     /// <summary>

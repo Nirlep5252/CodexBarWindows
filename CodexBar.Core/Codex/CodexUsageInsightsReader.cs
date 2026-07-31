@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace CodexBarWindows;
 
@@ -72,15 +73,26 @@ public sealed class CodexUsageInsightsReader
             EnsurePersistedCacheLoaded();
             var scanned = ScanFilesInParallel(codexFiles, piFiles, firstScanDay);
 
+            // Same gate as the scan cache: a reader pointed at a custom home scans a different
+            // corpus, and the ledger is durable user data rather than an accelerator.
+            var ledger = persistCache ? new CodexLedgerSink() : null;
+            if (codexFiles.Length >= MaxFilesToScan || piFiles.Length >= MaxFilesToScan)
+            {
+                // Enumeration was cut off, so this batch is a lower bound on the days it touched.
+                // Claiming otherwise would let replace-by-scope delete real history.
+                ledger?.Builder.MarkIncomplete();
+            }
+
             foreach (var row in scanned)
             {
-                ApplyRow(row, firstReportDay, daily, models, fastTurnIds);
+                ApplyRow(row, firstReportDay, daily, models, fastTurnIds, ledger);
             }
 
             var piPaths = piFiles.ToHashSet(StringComparer.OrdinalIgnoreCase);
             var scannedPaths = codexFiles.Concat(piFiles).ToHashSet(StringComparer.OrdinalIgnoreCase);
             PruneFileRowsCache(scannedPaths);
             SavePersistedCache(firstReportDay, piPaths);
+            MergeIntoLedger(ledger?.Builder, firstReportDay, today, now);
 
             var dailyRows = Enumerable.Range(0, DaysToReport)
                 .Select(offset => firstReportDay.AddDays(offset))
@@ -273,8 +285,8 @@ public sealed class CodexUsageInsightsReader
                     continue;
                 }
 
-                var day = ReadDay(root);
-                if (day is null || day < firstScanDay)
+                var at = ReadTimestamp(root);
+                if (at is null || DateOnly.FromDateTime(at.Value.DateTime) < firstScanDay)
                 {
                     continue;
                 }
@@ -283,7 +295,7 @@ public sealed class CodexUsageInsightsReader
                 var rowIsFastMode = payload.TryGetProperty("rate_limits", out var rateLimits)
                     ? IsFastMode(model, delta, null, root, payload, rateLimits)
                     : IsFastMode(model, delta, null, root, payload);
-                rows.Add(new CodexScanRow(day.Value, model, delta, currentBaseFast || rowIsFastMode, currentTurnId, null));
+                rows.Add(new CodexScanRow(at.Value, model, delta, currentBaseFast || rowIsFastMode, currentTurnId, null));
             }
             catch
             {
@@ -340,8 +352,8 @@ public sealed class CodexUsageInsightsReader
                     continue;
                 }
 
-                var day = ReadDay(message) ?? ReadDay(root);
-                if (day is null || day < firstScanDay)
+                var at = ReadTimestamp(message) ?? ReadTimestamp(root);
+                if (at is null || DateOnly.FromDateTime(at.Value.DateTime) < firstScanDay)
                 {
                     continue;
                 }
@@ -372,7 +384,7 @@ public sealed class CodexUsageInsightsReader
                 var effectiveInput = Math.Max(input + cacheRead + cacheWrite, Math.Max(0, directTotal - output));
                 var tokens = new TokenTotals(effectiveInput, Math.Min(cacheRead, effectiveInput), output);
                 var isFastMode = IsFastMode(model, tokens, exactCost, root, message, usage);
-                rows.Add(new CodexScanRow(day.Value, model, tokens, isFastMode, null, exactCost));
+                rows.Add(new CodexScanRow(at.Value, model, tokens, isFastMode, null, exactCost));
             }
             catch
             {
@@ -389,12 +401,20 @@ public sealed class CodexUsageInsightsReader
     /// membership, which is re-evaluated on every apply against the current fast-turn set.
     /// </summary>
     private sealed record CodexScanRow(
-        DateOnly Day,
+        DateTimeOffset Timestamp,
         string Model,
         TokenTotals Tokens,
         bool BaseFast,
         string? TurnId,
-        decimal? ExactCostUsd);
+        decimal? ExactCostUsd)
+    {
+        /// <summary>
+        /// The calendar day the log wrote, unconverted — identical to the DateOnly this row used to
+        /// carry. Ignored by the serializer: it is derivable, and the cache pays for every byte.
+        /// </summary>
+        [JsonIgnore]
+        public DateOnly Day => DateOnly.FromDateTime(Timestamp.DateTime);
+    }
 
     private sealed record CachedFileRows(
         long Length,
@@ -536,12 +556,65 @@ public sealed class CodexUsageInsightsReader
         }
     }
 
+    /// <summary>
+    /// Collects the ledger's view of a scan alongside the reader's own aggregation.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Fed at the APPLY site, not from the per-file cache: forks and subagent rollouts are
+    /// suppressed by the file classifier and the fast-turn set is resolved here, so anything
+    /// upstream of this point would record tokens the flyout never counted.
+    /// </para>
+    /// <para>
+    /// The threshold memo matters more than it looks: resolving one costs a model-name normalise
+    /// (regex) plus a pricing lookup, and this runs for every in-window row of a 30-day scan.
+    /// </para>
+    /// </remarks>
+    private sealed class CodexLedgerSink
+    {
+        private readonly Dictionary<string, int?> thresholds = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <param name="builder">
+        /// Supplied by the backfill, which owns one builder per worker thread. Null in the normal
+        /// scan, where the sink owns the only builder there is.
+        /// </param>
+        public CodexLedgerSink(UsageLedgerBatchBuilder? builder = null)
+        {
+            Builder = builder ?? new UsageLedgerBatchBuilder(LedgerAccountingVersion);
+        }
+
+        public UsageLedgerBatchBuilder Builder { get; }
+
+        public void Add(CodexScanRow row, bool isFastMode)
+        {
+            if (!thresholds.TryGetValue(row.Model, out var threshold))
+            {
+                threshold = CodexModelPricing.ThresholdTokensFor(row.Model);
+                thresholds[row.Model] = threshold;
+            }
+
+            Builder.AddCodexRow(
+                row.Timestamp,
+                row.Model,
+                row.Tokens.InputTokens,
+                row.Tokens.CachedInputTokens,
+                row.Tokens.OutputTokens,
+                isFastMode,
+                threshold,
+                // pi rows carry a vendor-supplied dollar figure that no token count reproduces. The
+                // ledger records the fact, never the money, so a reader reports the tokens and an
+                // underivable cost instead of inventing one.
+                vendorPriced: row.ExactCostUsd is not null);
+        }
+    }
+
     private static void ApplyRow(
         CodexScanRow row,
         DateOnly firstReportDay,
         IDictionary<DateOnly, MutableUsage> daily,
         IDictionary<string, MutableUsage> models,
-        IReadOnlySet<string> fastTurnIds)
+        IReadOnlySet<string> fastTurnIds,
+        CodexLedgerSink? ledger)
     {
         // Aggregate over the REPORTED window, not the scan window. Files are selected with a
         // wider lookback (ScanLookbackDays) so a file whose mtime is just outside the window can
@@ -556,6 +629,163 @@ public sealed class CodexUsageInsightsReader
         var categoryLabel = ModelBreakdownLabel(row.Model, isFastMode);
         Add(daily, row.Day, row.Model, row.Tokens, isFastMode, row.ExactCostUsd, categoryLabel);
         Add(models, ModelBreakdownKey(row.Model, isFastMode), row.Model, row.Tokens, isFastMode, row.ExactCostUsd, categoryLabel);
+        ledger?.Add(row, isFastMode);
+    }
+
+    /// <summary>
+    /// Scanner SEMANTICS version stamped on every batch. Bump it when an accounting rule changes,
+    /// so days written by older logic are identifiable as suspect rather than silently mixed in.
+    /// </summary>
+    private const int LedgerAccountingVersion = 3;
+
+    /// <summary>
+    /// Hands the scan's records to the ledger and returns immediately.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The covered-day declaration is what gives replace-by-scope its authority: rows are bucketed
+    /// on the calendar day the log spelled (UTC for both CLIs), so the reported window maps onto UTC
+    /// day numbers directly. A row that lands outside it — a log written in a frame ahead of local
+    /// time — still carries its own day into the merge, which is why a complete batch also asserts
+    /// authority over the days it emitted records for.
+    /// </para>
+    /// <para>
+    /// Off-thread on purpose. This runs inside the history scan (and therefore only while a window
+    /// is open — property #1 is untouched), but the shard write is file I/O that the numbers on
+    /// screen should not wait behind. The batch is immutable, so nothing is shared with the scan.
+    /// </para>
+    /// </remarks>
+    private static void MergeIntoLedger(UsageLedgerBatchBuilder? builder, DateOnly firstReportDay, DateOnly today, DateTimeOffset scannedAt)
+    {
+        if (builder is null)
+        {
+            return;
+        }
+
+        builder.CoverDays(UtcMidnight(firstReportDay), UtcMidnight(today));
+        var batch = builder.Build(scannedAt);
+        _ = Task.Run(() => UsageLedger.TryMerge(UsageLedgerScope.Codex, batch));
+    }
+
+    private static DateTimeOffset UtcMidnight(DateOnly day) => new(day.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
+
+    /// <summary>
+    /// The whole-corpus source used by <see cref="UsageLedgerBackfill"/>.
+    /// </summary>
+    /// <remarks>
+    /// It reuses <see cref="ScanCodexFile"/>, <see cref="ScanPiFile"/> and <see cref="ApplyRow"/>'s
+    /// fast-turn resolution verbatim, so a backfilled month is arithmetically the same thing the
+    /// 30-day scan would have written had it been able to reach that month. What it deliberately
+    /// does NOT touch is <see cref="FileRowsCache"/>: that cache is sized for a 32-day window and
+    /// exists to make the next refresh cheap, and pushing years of rows through it would both blow
+    /// the process's working set and hand the next <see cref="SavePersistedCache"/> a file orders of
+    /// magnitude larger than it is designed to write.
+    /// </remarks>
+    internal static IUsageLedgerBackfillSource CreateBackfillSource() => new CodexBackfillSource();
+
+    private sealed class CodexBackfillSource : IUsageLedgerBackfillSource
+    {
+        private readonly string codexHome = ResolveCodexHome();
+        private readonly string piSessionsRoot = ResolvePiSessionsRoot();
+
+        /// <summary>
+        /// Resolved once, up front, so every worker reads one immutable set. The fast-turn set comes
+        /// from the Codex log databases, whose retained tail only reaches back days — so old rows
+        /// simply are not classifiable as fast, exactly as a scan run at the time would have left
+        /// them.
+        /// </summary>
+        private readonly IReadOnlySet<string> fastTurnIds;
+
+        public CodexBackfillSource()
+        {
+            fastTurnIds = ReadFastTurnIdsFromCodexLogs(codexHome);
+        }
+
+        public UsageLedgerScope Scope => UsageLedgerScope.Codex;
+
+        public string DisplayName => "Codex";
+
+        public int AccountingVersion => LedgerAccountingVersion;
+
+        public IReadOnlyList<UsageLedgerBackfillFile> EnumerateFiles()
+        {
+            var files = new List<UsageLedgerBackfillFile>();
+            foreach (var root in new[] { Path.Combine(codexHome, "sessions"), Path.Combine(codexHome, "archived_sessions") })
+            {
+                Collect(root, isSecondary: false, files);
+            }
+
+            Collect(piSessionsRoot, isSecondary: true, files);
+
+            // Oldest first so the progress label walks forward through the months rather than
+            // jumping about the alphabet of session ids.
+            files.Sort((left, right) =>
+            {
+                var byStamp = left.Stamp.CompareTo(right.Stamp);
+                return byStamp != 0 ? byStamp : string.Compare(left.Path, right.Path, StringComparison.OrdinalIgnoreCase);
+            });
+
+            return files;
+        }
+
+        public void Scan(UsageLedgerBackfillFile file, UsageLedgerBatchBuilder builder)
+        {
+            // DateOnly.MinValue: no lower bound at all. This is the entire point of the backfill —
+            // the scan's 32-day floor is what puts the older months out of reach.
+            var rows = file.IsSecondary
+                ? ScanPiFile(file.Path, DateOnly.MinValue)
+                : ScanCodexFile(file.Path, DateOnly.MinValue);
+
+            var sink = new CodexLedgerSink(builder);
+            foreach (var row in rows)
+            {
+                sink.Add(row, row.BaseFast || (row.TurnId is not null && fastTurnIds.Contains(row.TurnId)));
+            }
+        }
+
+        private static void Collect(string root, bool isSecondary, List<UsageLedgerBackfillFile> files)
+        {
+            if (!Directory.Exists(root))
+            {
+                return;
+            }
+
+            IEnumerable<string> found;
+            try
+            {
+                found = Directory.EnumerateFiles(root, "*.jsonl", SearchOption.AllDirectories);
+            }
+            catch
+            {
+                return;
+            }
+
+            foreach (var path in found)
+            {
+                files.Add(new UsageLedgerBackfillFile(path, StampFor(path), isSecondary));
+            }
+        }
+    }
+
+    /// <summary>
+    /// The day a log file is ABOUT, for ordering and for the progress label only. Codex names its
+    /// rollouts with the date, so the name is preferred; anything else falls back to the write time.
+    /// </summary>
+    internal static DateOnly StampFor(string path)
+    {
+        if (DayFromText(Path.GetFileName(path)) is { } fromName)
+        {
+            return fromName;
+        }
+
+        try
+        {
+            return DateOnly.FromDateTime(File.GetLastWriteTime(path));
+        }
+        catch
+        {
+            return DateOnly.MinValue;
+        }
     }
 
     /// <summary>Bounded so a refresh leaves cores free for the rest of the machine.</summary>
@@ -1234,29 +1464,37 @@ public sealed class CodexUsageInsightsReader
         return null;
     }
 
-    private static DateOnly? ReadDay(JsonElement element)
+    /// <summary>
+    /// The hour a session line belongs to, in the frame the line was written in.
+    /// </summary>
+    /// <remarks>
+    /// The DATE this yields is bit-for-bit the one the old day-only path produced — the calendar
+    /// date as the log spells it, not a converted one — because the reported day buckets, and every
+    /// figure derived from them, must not move just because rows grew an hour column. The offset is
+    /// carried alongside purely so the ledger can recover the true instant.
+    /// </remarks>
+    private static DateTimeOffset? ReadTimestamp(JsonElement element)
     {
         if (!element.TryGetProperty("timestamp", out var timestampElement))
         {
             return null;
         }
 
-        var timestamp = timestampElement.ValueKind switch
+        return timestampElement.ValueKind switch
         {
-            JsonValueKind.String => timestampElement.GetString(),
-            JsonValueKind.Number when timestampElement.TryGetInt64(out var raw) => UnixTimestampToLocalDateText(raw),
+            JsonValueKind.String => TimestampFromText(timestampElement.GetString()),
+            JsonValueKind.Number when timestampElement.TryGetInt64(out var raw) => UnixTimestampToLocalHour(raw),
             _ => null
         };
-
-        return DayFromText(timestamp);
     }
 
-    private static string UnixTimestampToLocalDateText(long raw)
+    /// <summary>Numeric timestamps were already interpreted in LOCAL time; keep that exactly.</summary>
+    private static DateTimeOffset UnixTimestampToLocalHour(long raw)
     {
-        var timestamp = raw > 1_000_000_000_000
+        var timestamp = (raw > 1_000_000_000_000
             ? DateTimeOffset.FromUnixTimeMilliseconds(raw)
-            : DateTimeOffset.FromUnixTimeSeconds(raw);
-        return timestamp.ToLocalTime().ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            : DateTimeOffset.FromUnixTimeSeconds(raw)).ToLocalTime();
+        return new DateTimeOffset(timestamp.Year, timestamp.Month, timestamp.Day, timestamp.Hour, 0, 0, timestamp.Offset);
     }
 
     private static string? ReadString(JsonElement element, string propertyName)
@@ -1549,15 +1787,19 @@ public sealed class CodexUsageInsightsReader
 
     private static DateOnly? DayFromText(string? value)
     {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return null;
-        }
-
-        var match = System.Text.RegularExpressions.Regex.Match(value, "\\d{4}-\\d{2}-\\d{2}");
-        return match.Success && DateOnly.TryParseExact(match.Value, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var day)
-            ? day
+        return UsageTimestampText.TryFindDate(value, out _, out var year, out var month, out var day) &&
+            UsageTimestampText.TryMakeDate(year, month, day, out var parsed)
+            ? parsed
             : null;
+    }
+
+    /// <summary>
+    /// Truncates to the HOUR on purpose: the ledger's finest bucket is an hour, so minutes and
+    /// seconds are parsed by nobody and would only inflate every cached row on disk.
+    /// </summary>
+    private static DateTimeOffset? TimestampFromText(string? value)
+    {
+        return UsageTimestampText.TryParseHour(value, out var timestamp) ? timestamp : null;
     }
 
     private static void Add(IDictionary<DateOnly, MutableUsage> daily, DateOnly day, string model, TokenTotals tokens, bool isFastMode = false, decimal? exactCostUsd = null, string? categoryLabel = null)
@@ -1592,22 +1834,15 @@ public sealed class CodexUsageInsightsReader
         return new ProviderModelUsage(usage.DisplayName ?? model, usage.InputTokens, usage.CachedInputTokens, 0, usage.OutputTokens, usage.EstimatedCostUsd, usage.FastEstimatedCostUsd);
     }
 
-    private static string NormalizeModelName(string model)
-    {
-        return string.IsNullOrWhiteSpace(model) ? "Codex model" : model.Trim().ToLowerInvariant();
-    }
-
     private static string ModelBreakdownKey(string model, bool isFastMode)
     {
-        var normalized = NormalizePricingModelName(model);
+        var normalized = CodexModelPricing.NormalizeModelName(model);
         return isFastMode ? normalized + "|fast" : normalized;
     }
 
-    private static string ModelBreakdownLabel(string model, bool isFastMode)
-    {
-        var label = string.IsNullOrWhiteSpace(model) ? "Codex model" : NormalizePricingModelName(model);
-        return isFastMode ? label + " fast" : label;
-    }
+    // Shared with the ledger read path so the same row carries the same label whichever source
+    // answered; see CodexModelPricing.BreakdownLabel.
+    private static string ModelBreakdownLabel(string model, bool isFastMode) => CodexModelPricing.BreakdownLabel(model, isFastMode);
 
     private static string ResolveCodexHome()
     {
@@ -1725,46 +1960,38 @@ public sealed class CodexUsageInsightsReader
         }
     }
 
+    // The rates and the arithmetic now live in CodexModelPricing, which the ledger read path also
+    // consumes. These wrappers keep this file's call sites unchanged and, more importantly, keep
+    // the tier DECISION in one place: a fast row over the priority ceiling has to fall back to base
+    // rates here and in the ledger identically, or the same tokens price two ways.
     private static decimal EstimateCost(string model, TokenTotals tokens)
     {
-        return PricingFor(model) is { } pricing
-            ? EstimateCost(pricing, tokens, usePriorityRates: false)
+        return CodexModelPricing.For(model) is { } pricing
+            ? CodexModelPricing.Estimate(
+                pricing,
+                tokens.InputTokens,
+                tokens.CachedInputTokens,
+                tokens.OutputTokens,
+                CodexModelPricing.TierFor(pricing, isFast: false, tokens.InputTokens))
             : 0m;
     }
 
     private static decimal? EstimatePriorityCost(string model, TokenTotals tokens)
     {
-        if (PricingFor(model) is not { } pricing ||
-            tokens.InputTokens > PriorityInputTokenLimit ||
-            pricing.PriorityInputPerMillion is null ||
-            pricing.PriorityOutputPerMillion is null)
+        if (CodexModelPricing.For(model) is not { } pricing ||
+            CodexModelPricing.TierFor(pricing, isFast: true, tokens.InputTokens) != CodexRateTier.Priority)
         {
             return null;
         }
 
-        return EstimateCost(pricing, tokens, usePriorityRates: true);
+        return CodexModelPricing.Estimate(
+            pricing,
+            tokens.InputTokens,
+            tokens.CachedInputTokens,
+            tokens.OutputTokens,
+            CodexRateTier.Priority);
     }
 
-    private static decimal EstimateCost(ModelPricing pricing, TokenTotals tokens, bool usePriorityRates)
-    {
-        var billableInput = Math.Max(0, tokens.InputTokens - tokens.CachedInputTokens);
-        var usesLongContextRates = !usePriorityRates && pricing.ThresholdTokens is { } threshold && tokens.InputTokens > threshold;
-        var inputPerMillion = usePriorityRates
-            ? pricing.PriorityInputPerMillion ?? pricing.InputPerMillion
-            : usesLongContextRates ? pricing.InputPerMillionAboveThreshold ?? pricing.InputPerMillion : pricing.InputPerMillion;
-        var cachedInputPerMillion = usePriorityRates
-            ? pricing.PriorityCachedInputPerMillion ?? pricing.CachedInputPerMillion
-            : usesLongContextRates ? pricing.CachedInputPerMillionAboveThreshold ?? pricing.CachedInputPerMillion : pricing.CachedInputPerMillion;
-        var outputPerMillion = usePriorityRates
-            ? pricing.PriorityOutputPerMillion ?? pricing.OutputPerMillion
-            : usesLongContextRates ? pricing.OutputPerMillionAboveThreshold ?? pricing.OutputPerMillion : pricing.OutputPerMillion;
-
-        return ((decimal)billableInput / 1_000_000m * inputPerMillion) +
-               ((decimal)tokens.CachedInputTokens / 1_000_000m * cachedInputPerMillion) +
-               ((decimal)tokens.OutputTokens / 1_000_000m * outputPerMillion);
-    }
-
-    private const int PriorityInputTokenLimit = 272_000;
     private const int MaxCodexLogScanBytes = 64 * 1024 * 1024;
     private const int CodexLogChunkBytes = 1024 * 1024;
     private const int CodexLogTurnIdBacktrackChars = 1_200_000;
@@ -1775,124 +2002,4 @@ public sealed class CodexUsageInsightsReader
     private static readonly object FastTurnIdsCacheLock = new();
     private static string? cachedFastTurnIdsSignature;
     private static IReadOnlySet<string> cachedFastTurnIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// Resolves per-million rates for a Codex model, or <c>null</c> when the model is unknown.
-    /// Unknown models must not borrow another model's rates: a silent fallback is how a whole
-    /// generation of models (gpt-5.6) got billed at gpt-5 rates without anything looking wrong.
-    /// </summary>
-    private static ModelPricing? PricingFor(string model)
-    {
-        var normalized = NormalizePricingModelName(model);
-        if (CodexPricing.TryGetValue(normalized, out var pricing))
-        {
-            return pricing;
-        }
-
-        if (normalized.Contains("gpt-4.1", StringComparison.OrdinalIgnoreCase))
-        {
-            return new ModelPricing(2.00m, 0.50m, 8.00m);
-        }
-
-        if (normalized.Contains("o4-mini", StringComparison.OrdinalIgnoreCase))
-        {
-            return new ModelPricing(1.10m, 0.275m, 4.40m);
-        }
-
-        if (normalized.Contains("o3", StringComparison.OrdinalIgnoreCase))
-        {
-            return new ModelPricing(2.00m, 0.50m, 8.00m);
-        }
-
-        return ModelsDevPricingFor(normalized);
-    }
-
-    private static ModelPricing? ModelsDevPricingFor(string normalized)
-    {
-        if (string.IsNullOrWhiteSpace(normalized) || ModelsDevPricing.Lookup("openai", normalized) is not { } info)
-        {
-            return null;
-        }
-
-        return new ModelPricing(
-            info.InputPerMillion,
-            info.CacheReadPerMillion ?? info.InputPerMillion,
-            info.OutputPerMillion,
-            info.ThresholdTokens,
-            info.InputPerMillionAboveThreshold,
-            info.CacheReadPerMillionAboveThreshold,
-            info.OutputPerMillionAboveThreshold);
-    }
-
-    private static string NormalizePricingModelName(string model)
-    {
-        var normalized = model.Trim().ToLowerInvariant();
-        const string openAiPrefix = "openai/";
-        if (normalized.StartsWith(openAiPrefix, StringComparison.Ordinal))
-        {
-            normalized = normalized[openAiPrefix.Length..];
-        }
-
-        // OpenAI routes the unsuffixed gpt-5.6 alias to Sol.
-        if (string.Equals(normalized, "gpt-5.6", StringComparison.Ordinal))
-        {
-            return "gpt-5.6-sol";
-        }
-
-        if (CodexPricing.ContainsKey(normalized))
-        {
-            return normalized;
-        }
-
-        var datedSuffix = System.Text.RegularExpressions.Regex.Match(normalized, "-\\d{4}-\\d{2}-\\d{2}$");
-        if (datedSuffix.Success)
-        {
-            var withoutDate = normalized[..datedSuffix.Index];
-            if (CodexPricing.ContainsKey(withoutDate))
-            {
-                return withoutDate;
-            }
-        }
-
-        return normalized;
-    }
-
-    private static readonly IReadOnlyDictionary<string, ModelPricing> CodexPricing = new Dictionary<string, ModelPricing>(StringComparer.OrdinalIgnoreCase)
-    {
-        ["gpt-5"] = new(1.25m, 0.125m, 10.00m),
-        ["gpt-5-codex"] = new(1.25m, 0.125m, 10.00m),
-        ["gpt-5-mini"] = new(0.25m, 0.025m, 2.00m),
-        ["gpt-5-nano"] = new(0.05m, 0.005m, 0.40m),
-        ["gpt-5-pro"] = new(15.00m, 15.00m, 120.00m),
-        ["gpt-5.1"] = new(1.25m, 0.125m, 10.00m),
-        ["gpt-5.1-codex"] = new(1.25m, 0.125m, 10.00m),
-        ["gpt-5.1-codex-max"] = new(1.25m, 0.125m, 10.00m),
-        ["gpt-5.1-codex-mini"] = new(0.25m, 0.025m, 2.00m),
-        ["gpt-5.2"] = new(1.75m, 0.175m, 14.00m),
-        ["gpt-5.2-codex"] = new(1.75m, 0.175m, 14.00m),
-        ["gpt-5.2-pro"] = new(21.00m, 21.00m, 168.00m),
-        ["gpt-5.3-codex"] = new(1.75m, 0.175m, 14.00m),
-        ["gpt-5.3-codex-spark"] = new(0.00m, 0.00m, 0.00m),
-        ["gpt-5.4"] = new(2.50m, 0.25m, 15.00m, ThresholdTokens: 272_000, InputPerMillionAboveThreshold: 5.00m, CachedInputPerMillionAboveThreshold: 0.50m, OutputPerMillionAboveThreshold: 22.50m, PriorityInputPerMillion: 5.00m, PriorityCachedInputPerMillion: 0.50m, PriorityOutputPerMillion: 30.00m),
-        ["gpt-5.4-mini"] = new(0.75m, 0.075m, 4.50m, PriorityInputPerMillion: 1.50m, PriorityCachedInputPerMillion: 0.15m, PriorityOutputPerMillion: 9.00m),
-        ["gpt-5.4-nano"] = new(0.20m, 0.020m, 1.25m),
-        ["gpt-5.4-pro"] = new(30.00m, 30.00m, 180.00m),
-        ["gpt-5.5"] = new(5.00m, 0.50m, 30.00m, ThresholdTokens: 272_000, InputPerMillionAboveThreshold: 10.00m, CachedInputPerMillionAboveThreshold: 1.00m, OutputPerMillionAboveThreshold: 45.00m, PriorityInputPerMillion: 12.50m, PriorityCachedInputPerMillion: 1.25m, PriorityOutputPerMillion: 75.00m),
-        ["gpt-5.5-pro"] = new(30.00m, 30.00m, 180.00m),
-        ["gpt-5.6-sol"] = new(5.00m, 0.50m, 30.00m, ThresholdTokens: 272_000, InputPerMillionAboveThreshold: 10.00m, CachedInputPerMillionAboveThreshold: 1.00m, OutputPerMillionAboveThreshold: 45.00m, PriorityInputPerMillion: 10.00m, PriorityCachedInputPerMillion: 1.00m, PriorityOutputPerMillion: 60.00m),
-        ["gpt-5.6-terra"] = new(2.50m, 0.25m, 15.00m, ThresholdTokens: 272_000, InputPerMillionAboveThreshold: 5.00m, CachedInputPerMillionAboveThreshold: 0.50m, OutputPerMillionAboveThreshold: 22.50m, PriorityInputPerMillion: 5.00m, PriorityCachedInputPerMillion: 0.50m, PriorityOutputPerMillion: 30.00m),
-        ["gpt-5.6-luna"] = new(1.00m, 0.10m, 6.00m, ThresholdTokens: 272_000, InputPerMillionAboveThreshold: 2.00m, CachedInputPerMillionAboveThreshold: 0.20m, OutputPerMillionAboveThreshold: 9.00m, PriorityInputPerMillion: 2.00m, PriorityCachedInputPerMillion: 0.20m, PriorityOutputPerMillion: 12.00m),
-    };
-
-    private readonly record struct ModelPricing(
-        decimal InputPerMillion,
-        decimal CachedInputPerMillion,
-        decimal OutputPerMillion,
-        int? ThresholdTokens = null,
-        decimal? InputPerMillionAboveThreshold = null,
-        decimal? CachedInputPerMillionAboveThreshold = null,
-        decimal? OutputPerMillionAboveThreshold = null,
-        decimal? PriorityInputPerMillion = null,
-        decimal? PriorityCachedInputPerMillion = null,
-        decimal? PriorityOutputPerMillion = null);
 }

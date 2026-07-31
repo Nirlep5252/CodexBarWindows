@@ -15,6 +15,19 @@ internal static class DiagnosticLog
     private static readonly object Gate = new();
     private static readonly string? Path = ResolvePath();
 
+    /// <summary>
+    /// Where a CRASH is recorded when ordinary diagnostics are off.
+    /// </summary>
+    /// <remarks>
+    /// This shell is UNPACKAGED, so an unhandled exception on the UI thread fail-fasts the
+    /// process: no dialog, no Windows Error Reporting bucket the user can read, and - until this
+    /// existed - no trace at all unless they happened to have CODEXBAR_WINUI_DIAG set BEFORE the
+    /// crash, which nobody ever does. A crash is the one event always worth a line on disk, so
+    /// it gets a file of its own rather than relaxing the opt-in rule for everything else.
+    /// </remarks>
+    private static readonly string CrashPath =
+        System.IO.Path.Combine(System.IO.Path.GetTempPath(), "codexbar-winui-crash.log");
+
     public static bool IsEnabled => Path is not null;
 
     private static string? ResolvePath()
@@ -37,19 +50,47 @@ internal static class DiagnosticLog
             return;
         }
 
-        var line = string.Format(CultureInfo.InvariantCulture, format, args);
-        var stamped = string.Format(
-            CultureInfo.InvariantCulture,
-            "{0:HH:mm:ss.fff} {1}{2}",
-            DateTime.Now,
-            line,
-            Environment.NewLine);
+        Append(Path, format, args);
+    }
+
+    /// <summary>
+    /// Writes unconditionally: to the configured diagnostic log when there is one, otherwise to
+    /// <see cref="CrashPath"/>. Reserved for crashes - see the field remarks. Everything else
+    /// must keep going through <see cref="Write"/> so diagnostics stay off by default.
+    /// </summary>
+    public static void WriteCrash(string format, params object?[] args) =>
+        Append(Path ?? CrashPath, format, args);
+
+    private static void Append(string path, string format, params object?[] args)
+    {
+        string stamped;
+        try
+        {
+            var line = string.Format(CultureInfo.InvariantCulture, format, args);
+            stamped = string.Format(
+                CultureInfo.InvariantCulture,
+                "{0:HH:mm:ss.fff} {1}{2}",
+                DateTime.Now,
+                line,
+                Environment.NewLine);
+        }
+        catch (FormatException)
+        {
+            // A crash message is built from exception text that can contain stray braces, and a
+            // logger that throws while reporting a crash loses the very report it was called for.
+            stamped = string.Format(
+                CultureInfo.InvariantCulture,
+                "{0:HH:mm:ss.fff} {1}{2}",
+                DateTime.Now,
+                format,
+                Environment.NewLine);
+        }
 
         try
         {
             lock (Gate)
             {
-                File.AppendAllText(Path, stamped);
+                File.AppendAllText(path, stamped);
             }
         }
         catch (IOException)

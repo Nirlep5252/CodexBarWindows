@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Linq;
 using CodexBarWindows;
 using Microsoft.UI;
 using Microsoft.UI.Dispatching;
+using Microsoft.UI.Input;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -11,6 +13,7 @@ using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Shapes;
 using Windows.ApplicationModel.DataTransfer;
 using Windows.Graphics;
 using WinRT.Interop;
@@ -18,14 +21,15 @@ using WinRT.Interop;
 namespace CodexBar.WinUI;
 
 /// <summary>
-/// The tray flyout, and the app's primary surface: a provider tab strip, the selected
-/// provider's rate-limit windows, the Codex banked-reset row and a status line.
+/// The tray flyout, and the app's primary surface: every enabled provider's rate-limit windows
+/// in one compact list, the Codex banked-reset rows and a status line.
 /// </summary>
 /// <remarks>
 /// Chrome-less, always on top, hidden from the taskbar and Alt-Tab, rounded, backed by the
 /// configured system material, anchored next to the notification area and dismissed when focus
 /// leaves the app. It is HIDDEN, never closed, so it keeps its state and its (expensive) XAML
-/// tree between shows.
+/// tree between shows. The header doubles as a drag handle (see
+/// <see cref="OnHeaderPointerPressed"/>).
 /// </remarks>
 public sealed partial class FlyoutWindow : Window
 {
@@ -54,11 +58,23 @@ public sealed partial class FlyoutWindow : Window
     private readonly UsageRefreshService service;
     private readonly List<ProviderDescriptor> providers = [];
 
+    /// <summary>Live group cards, keyed by provider key. Reused across renders, never rebuilt.</summary>
+    private readonly Dictionary<string, ProviderGroupView> groups = new(StringComparer.Ordinal);
+
     private FlyoutPalette palette;
-    private string selectedProviderKey = ProviderKeys.Codex("default");
     private string statusFullText = string.Empty;
-    private bool confirmingRedeem;
+    private bool renderQueued;
+    private bool isDragging;
     private bool isOpen;
+
+    /// <summary>
+    /// Set by <see cref="ShutDown"/>. Unlike the other two windows this one is HIDDEN rather than
+    /// closed for its whole life, so it is only ever true during app exit - but the hazard is the
+    /// same one <c>GraphsWindow.isClosed</c> guards: <see cref="RequestRender"/> defers a render
+    /// to the end of the dispatcher turn, and a request made just before the shutdown would
+    /// otherwise be delivered to a window whose XAML tree is already gone.
+    /// </summary>
+    private bool isClosed;
     private bool hasBeenForeground;
     private bool anchorToBottom = true;
     private DateTime lastHiddenUtc = DateTime.MinValue;
@@ -94,13 +110,6 @@ public sealed partial class FlyoutWindow : Window
         // can be watched live side by side.
         GraphsButton.Click += (_, _) => GraphsRequested?.Invoke(this, EventArgs.Empty);
         RefreshButton.Click += (_, _) => RequestRefresh();
-        RedeemButton.Click += (_, _) => BeginConfirmRedeem();
-        ConfirmRedeemButton.Click += (_, _) => CommitRedeem();
-        CancelRedeemButton.Click += (_, _) =>
-        {
-            confirmingRedeem = false;
-            Render();
-        };
 
         RootGrid.KeyboardAccelerators.Add(CreateAccelerator(Windows.System.VirtualKey.Escape, HideFlyout));
         RootGrid.KeyboardAccelerators.Add(CreateAccelerator(Windows.System.VirtualKey.F5, RequestRefresh));
@@ -125,8 +134,6 @@ public sealed partial class FlyoutWindow : Window
 
     public bool IsOpen => isOpen;
 
-    public string SelectedProvider => selectedProviderKey;
-
     /// <summary>
     /// Overrides the status line with a one-off notice (used for update-check results). The
     /// next render replaces it, which is the intent: it is a notice, not state.
@@ -148,7 +155,9 @@ public sealed partial class FlyoutWindow : Window
     public void ShowFlyout()
     {
         // Capture the cursor BEFORE showing anything: it is next to the tray icon that was
-        // clicked, and is what picks the monitor on a multi-display setup.
+        // clicked, and is what picks the monitor on a multi-display setup. This also discards
+        // whatever display a previous drag left the window on - by policy every open re-anchors
+        // to the tray corner.
         anchorPoint = NativeWindow.TryGetCursorPosition();
 
         // Render before the window is placed: PositionNearTray sizes to the measured content,
@@ -195,7 +204,11 @@ public sealed partial class FlyoutWindow : Window
 
         // A pending "spend this credit?" confirm must not be waiting one click away the next
         // time the flyout opens, and last session's outcome notes are stale.
-        confirmingRedeem = false;
+        foreach (var group in groups.Values)
+        {
+            group.Confirming = false;
+        }
+
         service.ClearResetCreditMessages();
 
         DiagnosticLog.Write("flyout hidden polling={0}", service.IsPolling);
@@ -208,6 +221,9 @@ public sealed partial class FlyoutWindow : Window
     /// </summary>
     public void ShutDown()
     {
+        // Set FIRST, so a render already queued for the end of this turn finds the window shut
+        // rather than half-detached.
+        isClosed = true;
         foregroundWatch.Stop();
         isOpen = false;
         Activated -= OnActivated;
@@ -245,7 +261,8 @@ public sealed partial class FlyoutWindow : Window
     }
 
     /// <summary>
-    /// Rebuilds the tab strip from the configured Codex accounts and the per-tool opt-outs.
+    /// Rebuilds the provider list from the configured Codex accounts and the per-tool opt-outs.
+    /// Every one of them is on screen at once, so this is purely about WHICH cards exist.
     /// </summary>
     private void ConfigureProviders()
     {
@@ -257,8 +274,8 @@ public sealed partial class FlyoutWindow : Window
             .Where(descriptor => settings.IsProviderEnabled(descriptor.Provider))
             .ToList();
 
-        // Everything disabled would leave a chrome-only flyout with no way back, so the tab
-        // strip always keeps at least Codex.
+        // Everything disabled would leave a chrome-only flyout with no way back, so the list
+        // always keeps at least Codex.
         if (descriptors.Count == 0)
         {
             descriptors.Add(new ProviderDescriptor(ProviderKeys.Codex("default"), "Codex", UsageProvider.Codex));
@@ -267,65 +284,22 @@ public sealed partial class FlyoutWindow : Window
         providers.Clear();
         providers.AddRange(descriptors);
 
-        if (providers.All(provider => provider.Key != selectedProviderKey))
-        {
-            selectedProviderKey = providers[0].Key;
-        }
-
         Render();
     }
 
-    private ProviderDescriptor CurrentProvider =>
-        providers.FirstOrDefault(provider => provider.Key == selectedProviderKey)
-        ?? providers.FirstOrDefault()
-        ?? new ProviderDescriptor(ProviderKeys.Codex("default"), "Codex", UsageProvider.Codex);
+    // ---------------------------------------------------------------- render scheduling
 
-    private void OnProviderTabClick(object sender, RoutedEventArgs e)
-    {
-        if (sender is not ToggleButton { Tag: string providerKey })
-        {
-            return;
-        }
-
-        if (providerKey == selectedProviderKey)
-        {
-            // Clicking the selected tab unchecked it; the re-render restores the state.
-            Render();
-            return;
-        }
-
-        selectedProviderKey = providerKey;
-        // A half-finished confirm belongs to the account it was started on.
-        confirmingRedeem = false;
-        Render();
-
-        if (!service.GetUsage(providerKey).HasSnapshot)
-        {
-            service.Refresh();
-        }
-    }
-
-    // ---------------------------------------------------------------- rendering
-
-    private void OnUsageUpdated(string providerKey, ProviderUsageLookupResult result)
-    {
-        if (providerKey == selectedProviderKey)
-        {
-            Render();
-        }
-    }
+    private void OnUsageUpdated(string providerKey, ProviderUsageLookupResult result) => RequestRender();
 
     private void OnResetCreditStateChanged(string providerKey, ResetCreditState state)
     {
-        if (providerKey == selectedProviderKey)
+        // A redemption that has already started must not leave its own confirm on screen.
+        if (state.Busy && groups.TryGetValue(providerKey, out var group))
         {
-            if (state.Busy)
-            {
-                confirmingRedeem = false;
-            }
-
-            Render();
+            group.Confirming = false;
         }
+
+        RequestRender();
     }
 
     private void OnRefreshingChanged(bool refreshing)
@@ -334,155 +308,595 @@ public sealed partial class FlyoutWindow : Window
         RefreshGlyph.Visibility = refreshing ? Visibility.Collapsed : Visibility.Visible;
         RefreshSpinner.Visibility = refreshing ? Visibility.Visible : Visibility.Collapsed;
         RefreshSpinner.IsActive = refreshing;
-        Render();
-    }
-
-    /// <summary>Rebuilds every data-driven surface for the selected provider, then resizes.</summary>
-    private void Render()
-    {
-        var provider = CurrentProvider;
-        var result = service.GetUsage(provider.Key);
-
-        RenderTabs();
-
-        TitleText.Text = $"{provider.Name} rate limits";
-        PlanText.Text = BuildPlanText(provider, result.Snapshot);
-
-        RenderUsageRows(provider, result);
-        RenderResetRow(provider, result);
-        RenderStatus(provider, result);
-
-        ResizeToContent();
+        RequestRender();
     }
 
     /// <summary>
-    /// Rebuilds the tab strip as real controls rather than a templated ItemsControl.
+    /// Coalesces renders that land in the same dispatcher turn.
     /// </summary>
     /// <remarks>
-    /// The icon is a vector element, and hosting a <c>UIElement</c> through a templated
-    /// <c>ContentPresenter</c> crashed the process outright (0xc000027b out of
-    /// CoreMessagingXP). Building the handful of buttons directly is both simpler and stable.
-    /// It stays theme-safe because every control keeps its stock style - whose setters are
-    /// <c>ThemeResource</c>s that re-resolve per element - and the only colour set here comes
-    /// from <see cref="palette"/>, which is rebuilt whenever the actual theme changes.
+    /// A single refresh raises <c>RefreshingChanged(true)</c> synchronously on the caller's
+    /// stack, then the data event, then <c>RefreshingChanged(false)</c> - and the manual path
+    /// adds one more of its own. Rendering each of those separately is what produced the
+    /// visible double animation. Rows survive a render now, so the duplicates are cheap, but
+    /// they are still redundant work and still resize the window, so back-to-back requests are
+    /// folded into one pass at the end of the turn.
     /// </remarks>
-    private void RenderTabs()
+    private void RequestRender()
     {
-        ProviderTabs.Children.Clear();
-        foreach (var provider in providers)
+        if (isClosed)
         {
-            var content = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 7 };
-            // Anthropic's mark keeps its own colour; the other two read as monochrome UI.
-            var icon = ProviderGeometry.CreateIcon(
-                provider.Provider,
-                provider.IsClaude ? palette.ClaudeGlyph : palette.Glyph);
-            if (icon is not null)
+            return;
+        }
+
+        if (renderQueued)
+        {
+            return;
+        }
+
+        renderQueued = true;
+        if (!queue.TryEnqueue(() =>
+        {
+            renderQueued = false;
+            if (!isClosed)
             {
-                content.Children.Add(icon);
+                Render();
             }
-
-            content.Children.Add(new TextBlock
-            {
-                Text = provider.Name,
-                Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
-                VerticalAlignment = VerticalAlignment.Center
-            });
-
-            var tab = new ToggleButton
-            {
-                Content = content,
-                Tag = provider.Key,
-                MinWidth = 0,
-                Padding = new Thickness(10, 4, 12, 4),
-                CornerRadius = new CornerRadius(14),
-                IsChecked = provider.Key == selectedProviderKey
-            };
-            AutomationProperties.SetName(tab, provider.Name);
-            tab.Click += OnProviderTabClick;
-            ProviderTabs.Children.Add(tab);
+        }))
+        {
+            renderQueued = false;
+            Render();
         }
     }
 
-    private string BuildPlanText(ProviderDescriptor provider, ProviderUsageSnapshot? snapshot)
+    /// <summary>Updates every data-driven surface in place, then resizes.</summary>
+    private void Render()
+    {
+        SyncGroups();
+
+        DateTimeOffset? newest = null;
+        foreach (var descriptor in providers)
+        {
+            var result = service.GetUsage(descriptor.Key);
+            RenderGroup(groups[descriptor.Key], descriptor, result);
+
+            if (result.Snapshot is { } snapshot && (newest is null || snapshot.ObservedAt > newest))
+            {
+                newest = snapshot.ObservedAt;
+            }
+        }
+
+        RenderStatus(newest);
+        ResizeToContent();
+    }
+
+    // ---------------------------------------------------------------- provider groups
+
+    /// <summary>
+    /// The retained visual + state for one provider card. Holding the elements (rather than
+    /// re-creating them per render) is what keeps the meters, the hover state of the reset
+    /// button and the scroll offset alive across a refresh.
+    /// </summary>
+    private sealed class ProviderGroupView
+    {
+        public required string Key { get; init; }
+
+        public required ProviderDescriptor Descriptor { get; set; }
+
+        public required Border Card { get; init; }
+
+        /// <summary>Kept so the mark can be re-tinted when the actual theme flips.</summary>
+        public Shape? IconShape { get; init; }
+
+        public required TextBlock NameText { get; init; }
+
+        public required TextBlock PlanText { get; init; }
+
+        public required TextBlock AccountText { get; init; }
+
+        public required ItemsControl Rows { get; init; }
+
+        public ObservableCollection<UsageRowModel> RowModels { get; } = [];
+
+        public required TextBlock ErrorText { get; init; }
+
+        public required StackPanel ResetRow { get; init; }
+
+        public required Border ResetBadge { get; init; }
+
+        public required TextBlock ResetBadgeText { get; init; }
+
+        public required TextBlock ResetTitleText { get; init; }
+
+        public required TextBlock ResetDetailText { get; init; }
+
+        public required ProgressRing ResetBusyRing { get; init; }
+
+        public required Button RedeemButton { get; init; }
+
+        public required Button ConfirmButton { get; init; }
+
+        public required Button CancelButton { get; init; }
+
+        /// <summary>
+        /// Per-group, NOT per-window: with several accounts on screen a single flag would put
+        /// the "use this reset?" confirm on the wrong account.
+        /// </summary>
+        public bool Confirming { get; set; }
+    }
+
+    /// <summary>Creates missing cards, drops departed ones and fixes the order. Nothing else.</summary>
+    private void SyncGroups()
+    {
+        foreach (var key in groups.Keys.Where(key => providers.All(provider => provider.Key != key)).ToList())
+        {
+            ProviderGroups.Children.Remove(groups[key].Card);
+            groups.Remove(key);
+        }
+
+        for (var index = 0; index < providers.Count; index++)
+        {
+            var descriptor = providers[index];
+            if (!groups.TryGetValue(descriptor.Key, out var group))
+            {
+                group = CreateGroup(descriptor);
+                groups[descriptor.Key] = group;
+            }
+
+            var current = ProviderGroups.Children.IndexOf(group.Card);
+            if (current == index)
+            {
+                continue;
+            }
+
+            if (current >= 0)
+            {
+                ProviderGroups.Children.RemoveAt(current);
+            }
+
+            ProviderGroups.Children.Insert(index, group.Card);
+        }
+    }
+
+    /// <summary>
+    /// Resolves one of the group styles declared in <c>RootGrid.Resources</c>.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately NOT <c>Application.Current.Resources</c>: that dictionary resolves against the
+    /// app theme (which nothing sets) and hands back a captured brush, so a colour taken from it
+    /// freezes to the theme that was current when the group was built. Styles from the window's own
+    /// dictionary carry <c>ThemeResource</c> setters, which re-resolve per element against
+    /// ActualTheme - so a forced theme and a live system flip both reach these groups.
+    /// </remarks>
+    private Style GroupStyle(string key) => (Style)RootGrid.Resources[key];
+
+    private ProviderGroupView CreateGroup(ProviderDescriptor descriptor)
+    {
+        var icon = ProviderGeometry.CreateIcon(
+            descriptor.Provider,
+            descriptor.IsClaude ? palette.ClaudeGlyph : palette.Glyph);
+
+        var nameText = new TextBlock
+        {
+            Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"],
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var planText = new TextBlock
+        {
+            Style = GroupStyle("SecondaryCaptionStyle"),
+            VerticalAlignment = VerticalAlignment.Center,
+            MaxLines = 1,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        var accountText = new TextBlock
+        {
+            Style = GroupStyle("TertiaryCaptionStyle"),
+            VerticalAlignment = VerticalAlignment.Center,
+            MaxLines = 1,
+            MaxWidth = 150,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            HorizontalAlignment = HorizontalAlignment.Right
+        };
+
+        var identity = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 7 };
+        if (icon is not null)
+        {
+            identity.Children.Add(icon);
+        }
+
+        identity.Children.Add(nameText);
+        identity.Children.Add(planText);
+
+        var header = new Grid { Padding = new Thickness(12, 8, 12, 4), ColumnSpacing = 8 };
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.Children.Add(identity);
+        Grid.SetColumn(accountText, 1);
+        header.Children.Add(accountText);
+
+        var rows = new ItemsControl
+        {
+            ItemsSource = null,
+            ItemTemplate = (DataTemplate)RootGrid.Resources["UsageRowTemplate"],
+            Margin = new Thickness(0, 0, 0, 4)
+        };
+
+        // Errors WRAP and are never trimmed: an ellipsised error is the one thing that reliably
+        // makes missing numbers unexplainable. Right-click copies the full text.
+        var errorText = new TextBlock
+        {
+            Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
+            Margin = new Thickness(12, 0, 12, 8),
+            TextWrapping = TextWrapping.Wrap,
+            Visibility = Visibility.Collapsed
+        };
+        var errorMenu = new MenuFlyout();
+        var copyItem = new MenuFlyoutItem { Text = "Copy", MinWidth = 140 };
+        copyItem.Click += (_, _) => CopyToClipboard(errorText.Text);
+        errorMenu.Items.Add(copyItem);
+        errorText.ContextFlyout = errorMenu;
+
+        var group = new ProviderGroupView
+        {
+            Key = descriptor.Key,
+            Descriptor = descriptor,
+            IconShape = icon as Shape,
+            NameText = nameText,
+            PlanText = planText,
+            AccountText = accountText,
+            Rows = rows,
+            ErrorText = errorText,
+            Card = new Border { Style = GroupStyle("ProviderCardStyle") },
+            ResetRow = new StackPanel { Visibility = Visibility.Collapsed },
+            ResetBadge = new Border
+            {
+                Height = 16,
+                MinWidth = 16,
+                Padding = new Thickness(5, 0, 5, 0),
+                CornerRadius = new CornerRadius(8),
+                VerticalAlignment = VerticalAlignment.Center
+            },
+            ResetBadgeText = new TextBlock
+            {
+                FontSize = 10,
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            },
+            ResetTitleText = new TextBlock
+            {
+                Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
+                MaxLines = 1,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                VerticalAlignment = VerticalAlignment.Center
+            },
+            ResetDetailText = new TextBlock
+            {
+                Style = GroupStyle("SecondaryCaptionStyle"),
+                MaxLines = 1,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                VerticalAlignment = VerticalAlignment.Center
+            },
+            ResetBusyRing = new ProgressRing
+            {
+                Width = 14,
+                Height = 14,
+                IsActive = false,
+                Visibility = Visibility.Collapsed
+            },
+            // Neutral, not accent: this opens a confirm rather than committing, and a loud
+            // primary button next to an irreversible spend invites the click we do not want.
+            RedeemButton = new Button
+            {
+                Content = "Use",
+                Padding = new Thickness(10, 2, 10, 2),
+                MinWidth = 0,
+                MinHeight = 0,
+                FontSize = 12
+            },
+            ConfirmButton = new Button
+            {
+                Content = "Use it",
+                Style = (Style)Application.Current.Resources["AccentButtonStyle"],
+                Padding = new Thickness(10, 2, 10, 2),
+                MinWidth = 0,
+                MinHeight = 0,
+                FontSize = 12,
+                Visibility = Visibility.Collapsed
+            },
+            CancelButton = new Button
+            {
+                Content = "Cancel",
+                Padding = new Thickness(10, 2, 10, 2),
+                MinWidth = 0,
+                MinHeight = 0,
+                FontSize = 12,
+                Visibility = Visibility.Collapsed
+            }
+        };
+
+        group.ResetBadge.Child = group.ResetBadgeText;
+        group.RedeemButton.Click += (_, _) => BeginConfirmRedeem(group);
+        group.ConfirmButton.Click += (_, _) => CommitRedeem(group);
+        group.CancelButton.Click += (_, _) =>
+        {
+            group.Confirming = false;
+            RequestRender();
+        };
+
+        var resetActions = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        resetActions.Children.Add(group.ResetBusyRing);
+        resetActions.Children.Add(group.RedeemButton);
+        resetActions.Children.Add(group.ConfirmButton);
+        resetActions.Children.Add(group.CancelButton);
+
+        // ONE LINE, not a stacked title-and-detail block. Banked resets are read constantly and
+        // acted on about once a week, so the old two-line card earned none of the height it took
+        // from the meters above it. Title and detail sit side by side, the detail ellipsised,
+        // which keeps the whole row the height of a single caption.
+        var resetBody = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        resetBody.Children.Add(group.ResetTitleText);
+        resetBody.Children.Add(group.ResetDetailText);
+
+        var resetGrid = new Grid { Padding = new Thickness(12, 3, 12, 8), ColumnSpacing = 8 };
+        resetGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        resetGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        resetGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        resetGrid.Children.Add(group.ResetBadge);
+        Grid.SetColumn(resetBody, 1);
+        resetGrid.Children.Add(resetBody);
+        Grid.SetColumn(resetActions, 2);
+        resetGrid.Children.Add(resetActions);
+
+        var separator = new Border
+        {
+            Style = GroupStyle("ProviderSeparatorStyle"),
+            Margin = new Thickness(0, 2, 0, 0)
+        };
+        group.ResetRow.Children.Add(separator);
+        group.ResetRow.Children.Add(resetGrid);
+
+        var body = new StackPanel();
+        body.Children.Add(header);
+        body.Children.Add(rows);
+        body.Children.Add(errorText);
+        body.Children.Add(group.ResetRow);
+        group.Card.Child = body;
+
+        rows.ItemsSource = group.RowModels;
+        AutomationProperties.SetName(group.Card, descriptor.Name);
+        return group;
+    }
+
+    private void RenderGroup(ProviderGroupView group, ProviderDescriptor descriptor, ProviderUsageLookupResult result)
+    {
+        group.Descriptor = descriptor;
+
+        // Cheap and unconditional: it is also how the mark follows a theme flip, since the
+        // palette is rebuilt on ActualThemeChanged and the group visuals are not.
+        if (group.IconShape is { } shape)
+        {
+            shape.Fill = descriptor.IsClaude ? palette.ClaudeGlyph : palette.Glyph;
+        }
+
+        group.NameText.Text = descriptor.Name;
+
+        var plan = BuildPlanText(descriptor, result.Snapshot);
+        group.PlanText.Text = plan;
+        group.PlanText.Visibility = string.IsNullOrEmpty(plan) ? Visibility.Collapsed : Visibility.Visible;
+
+        var email = result.Snapshot?.AccountEmail;
+        group.AccountText.Text = email ?? string.Empty;
+        group.AccountText.Visibility = string.IsNullOrWhiteSpace(email) ? Visibility.Collapsed : Visibility.Visible;
+
+        RenderRows(group, descriptor, result);
+        RenderGroupError(group, result);
+        RenderResetRow(group, descriptor, result);
+    }
+
+    /// <summary>
+    /// The provider's own error, inline in its own card: with every provider on screen at once a
+    /// single shared status line cannot say WHICH account failed.
+    /// </summary>
+    private void RenderGroupError(ProviderGroupView group, ProviderUsageLookupResult result)
+    {
+        if (string.IsNullOrWhiteSpace(result.Error))
+        {
+            group.ErrorText.Text = string.Empty;
+            group.ErrorText.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        // A retained (stale) snapshot says so explicitly, so an error paired with old numbers
+        // cannot read as if the numbers were just fetched.
+        group.ErrorText.Text = result.IsStale && result.Snapshot is { } snapshot
+            ? $"{result.Error}  ·  showing limits from {FormatObservedAt(snapshot.ObservedAt)}"
+            : result.Error;
+        group.ErrorText.Foreground = palette.Danger;
+        group.ErrorText.Visibility = Visibility.Visible;
+        ToolTipService.SetToolTip(group.ErrorText, group.ErrorText.Text);
+    }
+
+    private string BuildPlanText(ProviderDescriptor descriptor, ProviderUsageSnapshot? snapshot)
     {
         if (snapshot is null)
         {
-            return provider.IsCursor
-                ? "Waiting for Cursor usage data"
-                : $"Waiting for local {provider.Name} usage data";
+            return service.IsRefreshing ? "·  fetching…" : "·  no data yet";
         }
 
-        var plan = provider.IsCursor
-            ? string.IsNullOrWhiteSpace(snapshot.PlanType) ? "Cursor usage data" : snapshot.PlanType
-            : string.IsNullOrWhiteSpace(snapshot.PlanType)
-                ? provider.IsClaude ? "Claude Code usage data" : "Codex CLI usage data"
-                : $"{ProviderPlanFormatter.DisplayName(provider.Provider, snapshot.PlanType)} plan";
+        var segments = new List<string>();
+        if (!string.IsNullOrWhiteSpace(snapshot.PlanType))
+        {
+            segments.Add(ProviderPlanFormatter.DisplayName(descriptor.Provider, snapshot.PlanType));
+        }
 
-        // The account line: which login these numbers belong to. Only shown when the reader
-        // actually knows it, so a provider that cannot report it does not grow an empty dot.
-        return string.IsNullOrWhiteSpace(snapshot.AccountEmail)
-            ? plan
-            : $"{plan}  ·  {snapshot.AccountEmail}";
+        if (descriptor.IsCursor && CursorCostText(snapshot) is { Length: > 0 } cost)
+        {
+            segments.Add(cost);
+        }
+
+        return segments.Count == 0 ? string.Empty : $"·  {string.Join("  ·  ", segments)}";
     }
 
-    private void RenderUsageRows(ProviderDescriptor provider, ProviderUsageLookupResult result)
+    // ---------------------------------------------------------------- usage rows
+
+    /// <summary>One line of the compact layout, before it is applied to a retained row model.</summary>
+    private readonly record struct RowSpec(
+        string Key,
+        string Title,
+        string PercentText,
+        double MeterValue,
+        Brush Heat,
+        string ResetText,
+        string DetailText,
+        bool IsIndeterminate);
+
+    private void RenderRows(ProviderGroupView group, ProviderDescriptor descriptor, ProviderUsageLookupResult result)
     {
-        UsageRows.Items.Clear();
+        var specs = new List<RowSpec>();
 
         if (result.Snapshot is not { } snapshot)
         {
             var loading = service.IsRefreshing;
-            var titles = provider.IsCursor
+            var titles = descriptor.IsCursor
                 ? new[] { "Total", "Auto", "API" }
                 : ["5 hour limit", "Weekly limit"];
 
             for (var index = 0; index < titles.Length; index++)
             {
-                UsageRows.Items.Add(new UsageRowModel(
-                    titles[index],
+                specs.Add(new RowSpec(
+                    $"{index}:{titles[index]}",
+                    ShortWindowLabel(titles[index]),
                     loading ? "…" : "--",
                     0,
                     palette.Accent,
-                    loading ? "Fetching usage…" : "-- remaining",
-                    loading ? "Reset pending" : "Reset unknown",
-                    showSeparator: index > 0,
-                    isIndeterminate: loading));
+                    string.Empty,
+                    loading ? "Fetching usage…" : "No usage data yet",
+                    loading));
+            }
+        }
+        else
+        {
+            var windows = snapshot.Windows;
+            for (var index = 0; index < windows.Count; index++)
+            {
+                var window = windows[index];
+                specs.Add(new RowSpec(
+                    $"{index}:{window.Title}",
+                    ShortWindowLabel(window.Title),
+                    $"{window.UsedPercent:0.#}%",
+                    Math.Clamp(window.UsedPercent, 0, 100),
+                    palette.Heat(window.UsedPercent),
+                    window.ResetsAt is { } resetAt ? $"·  {FormatResetShort(resetAt)}" : string.Empty,
+                    BuildRowDetail(window),
+                    false));
+            }
+        }
+
+        SyncRows(group.RowModels, specs);
+    }
+
+    /// <summary>
+    /// Applies the specs onto the EXISTING row models, adding and trimming only at the ends.
+    /// Rebuilding the collection instead is what made every meter replay its slide-in.
+    /// </summary>
+    private static void SyncRows(ObservableCollection<UsageRowModel> models, List<RowSpec> specs)
+    {
+        for (var index = 0; index < specs.Count; index++)
+        {
+            var spec = specs[index];
+            if (index >= models.Count)
+            {
+                models.Add(new UsageRowModel(spec.Key));
+            }
+            else if (models[index].Key != spec.Key)
+            {
+                // A different window in this slot is genuinely a different row; replacing it is
+                // correct (and, being an ObservableCollection, only regenerates that container).
+                models[index] = new UsageRowModel(spec.Key);
             }
 
-            return;
+            var model = models[index];
+            model.Title = spec.Title;
+            model.PercentText = spec.PercentText;
+            model.HeatBrush = spec.Heat;
+            model.ResetText = spec.ResetText;
+            model.DetailText = spec.DetailText;
+            model.IsIndeterminate = spec.IsIndeterminate;
+            model.MeterValue = spec.MeterValue;
         }
 
-        var windows = snapshot.Windows;
-        for (var index = 0; index < windows.Count; index++)
+        while (models.Count > specs.Count)
         {
-            var window = windows[index];
-            UsageRows.Items.Add(new UsageRowModel(
-                window.Title,
-                $"{window.UsedPercent:0.#}%",
-                Math.Clamp(window.UsedPercent, 0, 100),
-                palette.Heat(window.UsedPercent),
-                $"{window.RemainingPercent:0.#}% remaining",
-                window.ResetsAt is { } resetAt ? $"Resets {FormatReset(resetAt)}" : "Reset unknown",
-                showSeparator: index > 0,
-                isIndeterminate: false));
+            models.RemoveAt(models.Count - 1);
         }
+    }
+
+    /// <summary>
+    /// The compact label for a rate-limit window title. Unknown titles are passed through
+    /// UNCHANGED: a mangled or empty label is strictly worse than a long one.
+    /// </summary>
+    private static string ShortWindowLabel(string title)
+    {
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return title;
+        }
+
+        if (title.Equals("Weekly limit", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Week";
+        }
+
+        if (title.StartsWith("Fable", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Fable";
+        }
+
+        // "5 hour limit" / "3 hour limit" / "45 minute limit" - the readers build these from the
+        // window length, so the number is the only part worth keeping.
+        var parts = title.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length >= 2 && int.TryParse(parts[0], out var amount))
+        {
+            if (parts[1].StartsWith("hour", StringComparison.OrdinalIgnoreCase))
+            {
+                return $"{amount}h";
+            }
+
+            if (parts[1].StartsWith("minute", StringComparison.OrdinalIgnoreCase))
+            {
+                return $"{amount}m";
+            }
+        }
+
+        return title;
+    }
+
+    private static string BuildRowDetail(ProviderUsageWindow window)
+    {
+        var reset = window.ResetsAt is { } resetAt ? $"resets {FormatReset(resetAt)}" : "reset unknown";
+        return $"{window.Title}  ·  {window.UsedPercent:0.#}% used  ·  {window.RemainingPercent:0.#}% remaining  ·  {reset}";
     }
 
     // ---------------------------------------------------------------- reset credits
 
-    private CodexResetCredits Credits => service.GetUsage(selectedProviderKey).Snapshot?.ResetCredits ?? CodexResetCredits.None;
-
-    /// <summary>The credit that would actually be spent: use-it-or-lose-it, soonest expiry first.</summary>
-    private CodexResetCredit? OfferedCredit => Credits.NextExpiring;
-
-    private void RenderResetRow(ProviderDescriptor provider, ProviderUsageLookupResult result)
+    private void RenderResetRow(ProviderGroupView group, ProviderDescriptor descriptor, ProviderUsageLookupResult result)
     {
-        var state = service.GetResetCreditState(provider.Key);
+        var state = service.GetResetCreditState(descriptor.Key);
         var credits = result.Snapshot?.ResetCredits ?? CodexResetCredits.None;
-        var show = provider.Provider == UsageProvider.Codex && (state.HasSomethingToSay || credits.HasAny);
+        var show = descriptor.Provider == UsageProvider.Codex && (state.HasSomethingToSay || credits.HasAny);
 
-        ResetRow.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
-        ResetSeparator.Visibility = UsageRows.Items.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        group.ResetRow.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
         if (!show)
         {
             return;
@@ -490,63 +904,78 @@ public sealed partial class FlyoutWindow : Window
 
         if (state.Busy)
         {
-            ResetBadge.Visibility = Visibility.Collapsed;
-            ResetTitleText.Text = "Applying reset…";
-            ResetDetailText.Text = "Asking Codex to redeem this credit";
-            ResetDetailText.Foreground = null;
-            ResetBusyRing.Visibility = Visibility.Visible;
-            ResetBusyRing.IsActive = true;
-            RedeemButton.Visibility = Visibility.Collapsed;
-            ConfirmRedeemButton.Visibility = Visibility.Collapsed;
-            CancelRedeemButton.Visibility = Visibility.Collapsed;
+            group.ResetBadge.Visibility = Visibility.Collapsed;
+            group.ResetTitleText.Text = "Applying reset…";
+            group.ResetDetailText.Text = "·  Asking Codex to redeem this credit";
+            group.ResetDetailText.ClearValue(TextBlock.ForegroundProperty);
+            group.ResetBusyRing.Visibility = Visibility.Visible;
+            group.ResetBusyRing.IsActive = true;
+            group.RedeemButton.Visibility = Visibility.Collapsed;
+            group.ConfirmButton.Visibility = Visibility.Collapsed;
+            group.CancelButton.Visibility = Visibility.Collapsed;
             return;
         }
 
-        ResetBusyRing.IsActive = false;
-        ResetBusyRing.Visibility = Visibility.Collapsed;
+        group.ResetBusyRing.IsActive = false;
+        group.ResetBusyRing.Visibility = Visibility.Collapsed;
 
         var offered = credits.NextExpiring;
         var expiringSoon = offered?.ExpiresAt is { } expiry && expiry - DateTimeOffset.Now <= ResetExpiryWarningWindow;
 
         // A refresh that replaced the offered credit must not leave a confirm on screen naming
         // one credit while a different one would actually be spent.
-        if (confirmingRedeem && offered is null)
+        if (group.Confirming && offered is null)
         {
-            confirmingRedeem = false;
+            group.Confirming = false;
         }
 
-        if (confirmingRedeem && offered is { } pending)
+        if (group.Confirming && offered is { } pending)
         {
             var nearLimit = IsNearLimit(result.Snapshot);
-            ResetBadge.Visibility = Visibility.Collapsed;
-            ResetTitleText.Text = $"Use “{pending.DisplayTitle}”?";
+            group.ResetBadge.Visibility = Visibility.Collapsed;
+            group.ResetTitleText.Text = $"Use “{pending.DisplayTitle}”?";
             // Below the eligibility mark the spend may reset nothing, which is the one thing
             // worth saying at the moment of commitment.
-            ResetDetailText.Text = nearLimit
-                ? "This can't be undone"
-                : "Nothing's near a limit — may reset nothing";
-            ResetDetailText.Foreground = nearLimit ? null : palette.Warning;
-            RedeemButton.Visibility = Visibility.Collapsed;
-            ConfirmRedeemButton.Visibility = Visibility.Visible;
-            CancelRedeemButton.Visibility = Visibility.Visible;
+            group.ResetDetailText.Text = nearLimit
+                ? "·  can't be undone"
+                : "·  nothing's near a limit";
+            if (nearLimit)
+            {
+                group.ResetDetailText.ClearValue(TextBlock.ForegroundProperty);
+            }
+            else
+            {
+                group.ResetDetailText.Foreground = palette.Warning;
+            }
+
+            group.RedeemButton.Visibility = Visibility.Collapsed;
+            group.ConfirmButton.Visibility = Visibility.Visible;
+            group.CancelButton.Visibility = Visibility.Visible;
             return;
         }
 
-        ResetBadge.Visibility = Visibility.Visible;
-        ResetBadge.Background = expiringSoon ? palette.Warning : palette.Accent;
-        ResetBadgeText.Foreground = expiringSoon ? palette.OnWarningText : palette.OnAccentText;
-        ResetBadgeText.Text = credits.AvailableCount > 99 ? "99+" : credits.AvailableCount.ToString();
+        group.ResetBadge.Visibility = Visibility.Visible;
+        group.ResetBadge.Background = expiringSoon ? palette.Warning : palette.Accent;
+        group.ResetBadgeText.Foreground = expiringSoon ? palette.OnWarningText : palette.OnAccentText;
+        group.ResetBadgeText.Text = credits.AvailableCount > 99 ? "99+" : credits.AvailableCount.ToString();
 
-        ResetTitleText.Text = credits.AvailableCount == 1 ? "reset available" : "resets available";
-        ResetDetailText.Text = state.Message ?? DescribeInventory(offered);
-        ResetDetailText.Foreground = state.Message is null && expiringSoon ? palette.Warning : null;
+        group.ResetTitleText.Text = credits.AvailableCount == 1 ? "reset available" : "resets available";
+        group.ResetDetailText.Text = $"·  {state.Message ?? DescribeInventory(offered)}";
+        if (state.Message is null && expiringSoon)
+        {
+            group.ResetDetailText.Foreground = palette.Warning;
+        }
+        else
+        {
+            group.ResetDetailText.ClearValue(TextBlock.ForegroundProperty);
+        }
 
-        RedeemButton.Visibility = Visibility.Visible;
+        group.RedeemButton.Visibility = Visibility.Visible;
         // Spending below the eligibility mark is the account holder's call, so the only thing
         // that can disable this is having no id to charge.
-        RedeemButton.IsEnabled = offered is not null;
-        ConfirmRedeemButton.Visibility = Visibility.Collapsed;
-        CancelRedeemButton.Visibility = Visibility.Collapsed;
+        group.RedeemButton.IsEnabled = offered is not null;
+        group.ConfirmButton.Visibility = Visibility.Collapsed;
+        group.CancelButton.Visibility = Visibility.Collapsed;
     }
 
     private static string DescribeInventory(CodexResetCredit? offered)
@@ -555,10 +984,10 @@ public sealed partial class FlyoutWindow : Window
         {
             // Count without detail rows: there is no id to charge, so redeeming has to happen
             // in the Codex CLI rather than here.
-            return "Redeem these from the Codex CLI";
+            return "redeem from the Codex CLI";
         }
 
-        return offered.ExpiresAt is { } expiry ? $"Next expires {FormatExpiry(expiry)}" : "These don't expire";
+        return offered.ExpiresAt is { } expiry ? $"expires {FormatExpiry(expiry)}" : "no expiry";
     }
 
     /// <summary>
@@ -568,35 +997,41 @@ public sealed partial class FlyoutWindow : Window
     private static bool IsNearLimit(ProviderUsageSnapshot? snapshot) =>
         snapshot is not null && snapshot.Windows.Any(window => window.UsedPercent >= ResetEligibleUsedPercent);
 
-    private void BeginConfirmRedeem()
+    private void BeginConfirmRedeem(ProviderGroupView group)
     {
-        if (OfferedCredit is null)
+        if (OfferedCreditFor(group.Descriptor.Key) is null)
         {
             return;
         }
 
-        confirmingRedeem = true;
-        Render();
+        group.Confirming = true;
+        RequestRender();
     }
 
-    private void CommitRedeem()
+    private CodexResetCredits CreditsFor(string providerKey) =>
+        service.GetUsage(providerKey).Snapshot?.ResetCredits ?? CodexResetCredits.None;
+
+    /// <summary>The credit that would actually be spent: use-it-or-lose-it, soonest expiry first.</summary>
+    private CodexResetCredit? OfferedCreditFor(string providerKey) => CreditsFor(providerKey).NextExpiring;
+
+    private void CommitRedeem(ProviderGroupView group)
     {
-        var providerKey = selectedProviderKey;
-        var credit = OfferedCredit;
+        var providerKey = group.Descriptor.Key;
+        var credit = OfferedCreditFor(providerKey);
 
         // Re-check against the snapshot the row was rendered from: a refresh may have landed
         // between render and confirm, and the credit must belong to the account being charged.
         if (credit is null ||
-            CurrentProvider.Provider != UsageProvider.Codex ||
-            Credits.Find(credit.Id) is null)
+            group.Descriptor.Provider != UsageProvider.Codex ||
+            CreditsFor(providerKey).Find(credit.Id) is null)
         {
-            confirmingRedeem = false;
+            group.Confirming = false;
             ApplyStatus("That reset is no longer available. Refreshing…", StatusSeverity.Warning);
             service.Refresh();
             return;
         }
 
-        confirmingRedeem = false;
+        group.Confirming = false;
         service.RedeemResetCredit(new CodexResetRedeemRequest(providerKey, credit));
     }
 
@@ -609,39 +1044,29 @@ public sealed partial class FlyoutWindow : Window
         Error
     }
 
-    private void RenderStatus(ProviderDescriptor provider, ProviderUsageLookupResult result)
+    /// <summary>
+    /// The GLOBAL status line: freshness only. Per-provider failures live in their own card, so
+    /// this stays a single stable sentence no matter how many accounts are configured.
+    /// </summary>
+    private void RenderStatus(DateTimeOffset? newestObservedAt)
     {
-        if (result.Snapshot is not { } snapshot)
-        {
-            var message = result.Error ?? "No usage data found.";
-            ApplyStatus(message, result.Error is null ? StatusSeverity.Info : StatusSeverity.Error);
-            return;
-        }
-
-        if (!string.IsNullOrWhiteSpace(result.Error))
-        {
-            // A retained (stale) snapshot says so explicitly, so an error paired with old
-            // numbers cannot read as if the numbers were just fetched.
-            var text = result.IsStale
-                ? $"{result.Error}  ·  showing limits from {FormatObservedAt(snapshot.ObservedAt)}"
-                : result.Error;
-            ApplyStatus(text, StatusSeverity.Error);
-            return;
-        }
-
         if (service.IsRefreshing)
         {
-            ApplyStatus($"Refreshing {provider.Name} limits…", StatusSeverity.Info);
+            ApplyStatus("Refreshing limits…", StatusSeverity.Info);
             return;
         }
 
-        var fetched = $"Updated {FormatObservedAt(snapshot.ObservedAt)}";
-        var prefix = provider.IsCursor ? CursorCostText(snapshot) : string.Empty;
-        ApplyStatus(string.IsNullOrWhiteSpace(prefix) ? fetched : $"{prefix}  ·  {fetched}", StatusSeverity.Info);
+        if (newestObservedAt is not { } observedAt)
+        {
+            ApplyStatus("No usage data found.", StatusSeverity.Info);
+            return;
+        }
+
+        ApplyStatus($"Updated {FormatObservedAt(observedAt)}", StatusSeverity.Info);
     }
 
     /// <summary>
-    /// Writes the status line. Errors keep their FULL text: wrapped to at most three lines on
+    /// Writes the status line. Text keeps its FULL form: wrapped to at most three lines on
     /// screen, complete in the tooltip, and copyable from the right-click menu. The WinForms
     /// popup single-lined and ellipsised this, which routinely cut the only explanation the
     /// app ever gives for missing numbers.
@@ -651,6 +1076,17 @@ public sealed partial class FlyoutWindow : Window
         statusFullText = text;
         StatusText.Text = text;
         ToolTipService.SetToolTip(StatusText, string.IsNullOrWhiteSpace(text) ? null : text);
+
+        // Routine status goes BESIDE THE TITLE and the bottom bar collapses entirely - that row
+        // was buying a permanent chin for the words "Updated just now". Anything the user needs to
+        // act on keeps the bottom bar, which is the only place an error has room to wrap to three
+        // lines and stay copyable.
+        var routine = severity == StatusSeverity.Info;
+        HeaderStatusText.Text = routine ? text : string.Empty;
+        HeaderStatusText.Visibility = routine && !string.IsNullOrWhiteSpace(text)
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        StatusBar.Visibility = routine ? Visibility.Collapsed : Visibility.Visible;
 
         switch (severity)
         {
@@ -672,15 +1108,17 @@ public sealed partial class FlyoutWindow : Window
         }
     }
 
-    private void OnCopyStatus(object sender, RoutedEventArgs e)
+    private void OnCopyStatus(object sender, RoutedEventArgs e) => CopyToClipboard(statusFullText);
+
+    private static void CopyToClipboard(string text)
     {
-        if (string.IsNullOrWhiteSpace(statusFullText))
+        if (string.IsNullOrWhiteSpace(text))
         {
             return;
         }
 
         var package = new DataPackage();
-        package.SetText(statusFullText);
+        package.SetText(text);
         Clipboard.SetContent(package);
     }
 
@@ -695,7 +1133,9 @@ public sealed partial class FlyoutWindow : Window
         if (service.RequestManualRefresh())
         {
             DiagnosticLog.Write("manual refresh accepted");
-            Render();
+            // BeginRefresh already raised RefreshingChanged synchronously on this stack, so this
+            // only coalesces into that render rather than adding one.
+            RequestRender();
             return;
         }
 
@@ -741,6 +1181,44 @@ public sealed partial class FlyoutWindow : Window
                 : $"in {Math.Max(1, (int)Math.Ceiling(remaining.TotalMinutes))}m";
 
         return $"{relative}, {resetAt.ToLocalTime():h:mm tt}";
+    }
+
+    /// <summary>
+    /// The one-line form: a clock time while the reset is still today, a weekday for the rest of
+    /// the week, a date beyond that. The long form stays on the row's tooltip.
+    /// </summary>
+    private static string FormatResetShort(DateTimeOffset resetAt)
+    {
+        var local = resetAt.ToLocalTime();
+        var now = DateTimeOffset.Now;
+        if (local <= now)
+        {
+            return "now";
+        }
+
+        // The TIME is the point of this line - "Thu" alone does not tell anyone whether they get
+        // their quota back over breakfast or at midnight - so every case carries h:mm. The date
+        // part is what shortens with distance: nothing for today, a weekday inside the week, a
+        // date beyond it.
+        if (local.Date == now.Date)
+        {
+            return local.ToString("h:mm tt");
+        }
+
+        if (local.Date == now.Date.AddDays(1))
+        {
+            // "Tmrw", not "Tomorrow": the row's reset column is a FIXED width shared by every
+            // meter in the window, and "Tomorrow 10:29 AM" (~109 DIP) overflowed it and got
+            // ellipsised - swallowing the clock time, which is the whole point of this line.
+            // "Tmrw" costs ~25 DIP less and puts this case in the same size class as the weekday
+            // form below, so no single string forces the column wider than the rest need. The
+            // unabbreviated wording stays on the row tooltip via FormatReset.
+            return local.ToString(@"\T\m\r\w h:mm tt");
+        }
+
+        return (local - now).TotalDays < 6
+            ? local.ToString("ddd h:mm tt")
+            : local.ToString("dd MMM h:mm tt");
     }
 
     private static string FormatExpiry(DateTimeOffset expiresAt)
@@ -854,14 +1332,14 @@ public sealed partial class FlyoutWindow : Window
     private void OnThemeChanged(object? sender, EventArgs e)
     {
         ApplyTheme();
-        // Tool opt-outs live in the same settings record, so the tab strip may have changed.
+        // Tool opt-outs live in the same settings record, so the provider set may have changed.
         ConfigureProviders();
     }
 
     /// <summary>
     /// The palette is derived from the element's ACTUAL theme, so it has to be rebuilt (and
-    /// every model with it) whenever that resolves differently - otherwise heat colours and
-    /// glyph tints freeze to whichever theme was current when the window was created.
+    /// every brush it handed out re-applied) whenever that resolves differently - otherwise heat
+    /// colours and glyph tints freeze to whichever theme was current when the window was created.
     /// </summary>
     private void OnActualThemeChanged()
     {
@@ -874,6 +1352,166 @@ public sealed partial class FlyoutWindow : Window
     {
         AppTheme.Apply(this, RootGrid, TintLayer);
         palette = FlyoutPalette.For(RootGrid);
+    }
+
+    // ---------------------------------------------------------------- dragging
+
+    /// <summary>
+    /// Press-move-release dragging of the whole window from the header.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This deliberately does NOT hand off to the system move loop
+    /// (<c>ReleaseCapture</c> + <c>WM_NCLBUTTONDOWN</c>/<c>HTCAPTION</c>), which is the usual
+    /// trick for a caption-less window. That loop ends when it sees the button go UP, and the
+    /// button-up here is delivered to the XAML island's own child HWND rather than to this
+    /// window - so the loop never ended, and the window stayed glued to the cursor until the
+    /// next click. That reads as a "drag mode" toggle, not as dragging.
+    /// </para>
+    /// <para>
+    /// Tracking the pointer ourselves is what gives normal hold-to-drag, release-to-drop. The
+    /// arithmetic is done in SCREEN pixels from the cursor - <c>AppWindow.Position</c> is in
+    /// physical pixels too, so nothing has to be scaled, and the window keeps up with the cursor
+    /// across a DPI boundary.
+    /// </para>
+    /// <para>
+    /// Dismissal is unaffected: the pointer is captured by an element in this window, so the
+    /// foreground never leaves the process and <see cref="CheckForegroundOwnership"/> keeps
+    /// seeing us. The buttons are excluded by walking up from the original source, so a press on
+    /// refresh or close can never start a drag.
+    /// </para>
+    /// </remarks>
+    private void OnHeaderPointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (e.Pointer.PointerDeviceType == PointerDeviceType.Mouse &&
+            !e.GetCurrentPoint(ContentRoot).Properties.IsLeftButtonPressed)
+        {
+            return;
+        }
+
+        if (IsDragExempt(e.OriginalSource as DependencyObject))
+        {
+            return;
+        }
+
+        if (NativeWindow.TryGetCursorPosition() is not { } cursor)
+        {
+            return;
+        }
+
+        if (!ContentRoot.CapturePointer(e.Pointer))
+        {
+            return;
+        }
+
+        dragPointerId = e.Pointer.PointerId;
+        dragCursorOrigin = cursor;
+        dragWindowOrigin = AppWindow.Position;
+        isDragging = true;
+        e.Handled = true;
+    }
+
+    private void OnHeaderPointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!isDragging || e.Pointer.PointerId != dragPointerId)
+        {
+            return;
+        }
+
+        if (NativeWindow.TryGetCursorPosition() is not { } cursor)
+        {
+            return;
+        }
+
+        // Move, never MoveAndResize: the size is the content's business, and re-asserting it here
+        // would fight a refresh that lands mid-drag.
+        AppWindow.Move(new PointInt32(
+            dragWindowOrigin.X + (cursor.X - dragCursorOrigin.X),
+            dragWindowOrigin.Y + (cursor.Y - dragCursorOrigin.Y)));
+
+        e.Handled = true;
+    }
+
+    private void OnHeaderPointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (!isDragging || e.Pointer.PointerId != dragPointerId)
+        {
+            return;
+        }
+
+        ContentRoot.ReleasePointerCapture(e.Pointer);
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// The single place a drag ends. Capture-lost fires for a normal release as well as for a
+    /// capture stolen by the system, so ending here cannot leave the window stuck to the cursor.
+    /// </summary>
+    private void OnHeaderPointerCaptureLost(object sender, PointerRoutedEventArgs e)
+    {
+        if (!isDragging || e.Pointer.PointerId != dragPointerId)
+        {
+            return;
+        }
+
+        isDragging = false;
+        dragPointerId = null;
+        AdoptDraggedPosition();
+    }
+
+    private uint? dragPointerId;
+    private PointInt32 dragCursorOrigin;
+    private PointInt32 dragWindowOrigin;
+
+    /// <summary>
+    /// Whether a press at this element must NOT start a window drag.
+    /// </summary>
+    /// <remarks>
+    /// Buttons always opt out, so a press on refresh, close or "Use reset" is a click. The list
+    /// opts out only while it can ACTUALLY scroll: dragging the window and scrolling the list are
+    /// the same gesture, so the list has to win when there is something to scroll to - and when
+    /// there is not (the usual case, since the window sizes to its content) the whole surface
+    /// stays draggable.
+    /// </remarks>
+    private bool IsDragExempt(DependencyObject? source)
+    {
+        while (source is not null && source != ContentRoot)
+        {
+            if (source is ButtonBase)
+            {
+                return true;
+            }
+
+            if (ReferenceEquals(source, ScrollHost) && ScrollHost.ScrollableHeight > 0)
+            {
+                return true;
+            }
+
+            source = VisualTreeHelper.GetParent(source);
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Re-derives the growth anchor after a drop. The window may now be on another display and
+    /// against the opposite edge, so both the display used for measuring and the edge that stays
+    /// pinned while the content grows have to follow it. The position itself is deliberately NOT
+    /// persisted: the next <see cref="ShowFlyout"/> re-anchors to the tray corner, because a
+    /// remembered point is wrong the moment the monitor layout or taskbar edge changes.
+    /// </summary>
+    private void AdoptDraggedPosition()
+    {
+        var position = AppWindow.Position;
+        anchorPoint = new PointInt32(position.X, position.Y);
+
+        var work = WorkArea(out _);
+        var size = AppWindow.Size;
+        var toTop = position.Y - work.Y;
+        var toBottom = work.Y + work.Height - (position.Y + size.Height);
+        anchorToBottom = toBottom <= toTop;
+
+        ResizeToContent();
     }
 
     // ---------------------------------------------------------------- geometry
@@ -907,16 +1545,17 @@ public sealed partial class FlyoutWindow : Window
         }
 
         AppWindow.MoveAndResize(new RectInt32(x, y, width, height));
+        LogScrollState("open");
     }
 
     /// <summary>
-    /// Grows and shrinks the window with its content while keeping the edge nearest the tray
-    /// pinned. Re-deriving the position from the work area instead would teleport a flyout the
-    /// user had moved, and would make every provider switch jump.
+    /// Grows and shrinks the window with its content while keeping the edge nearest the tray -
+    /// or, after a drag, the edge the user parked it against - pinned. Re-deriving the position
+    /// from the work area instead would teleport a flyout the user had moved.
     /// </summary>
     private void ResizeToContent()
     {
-        if (!isOpen)
+        if (!isOpen || isDragging)
         {
             return;
         }
@@ -932,7 +1571,11 @@ public sealed partial class FlyoutWindow : Window
 
         var position = AppWindow.Position;
         var y = anchorToBottom ? position.Y + size.Height - height : position.Y;
+        // Growing must not push the window off the display it was dragged to; this only bites
+        // when the new height would not fit where it currently sits.
+        y = Math.Clamp(y, work.Y, Math.Max(work.Y, work.Y + work.Height - height));
         AppWindow.MoveAndResize(new RectInt32(position.X, y, size.Width, height));
+        LogScrollState("resize");
     }
 
     /// <summary>
@@ -943,7 +1586,8 @@ public sealed partial class FlyoutWindow : Window
     /// hidden window happens to sit on — on first show that is WinUI's default placement, so a
     /// tray click on a secondary monitor opened the flyout on the primary one. The tray icon
     /// that was clicked is next to the cursor, so the cursor is the correct anchor. The WinForms
-    /// original used Cursor.Position for exactly this reason.
+    /// original used Cursor.Position for exactly this reason. A drag replaces it with the
+    /// window's own corner, which is then the truthful anchor until the next open.
     /// </remarks>
     private PointInt32? anchorPoint;
 
@@ -958,21 +1602,134 @@ public sealed partial class FlyoutWindow : Window
     }
 
     /// <summary>
-    /// The height the content actually wants, clamped to the screen. The row count depends on
-    /// the provider (Cursor has three windows, Codex two plus an optional reset row), so a
-    /// fixed height would leave dead space or clip depending on the selected tab.
+    /// Physical pixels the non-client frame eats out of the window's HEIGHT: the difference
+    /// between the window rect (what <see cref="AppWindow.MoveAndResize"/> sets) and the client
+    /// rect (what XAML actually gets to lay out in).
     /// </summary>
+    /// <remarks>
+    /// THIS is what made the flyout scroll by a few pixels no matter how carefully the content
+    /// was measured. <c>MoveAndResize</c> takes an OUTER rect, and this window is not frameless:
+    /// <c>SetBorderAndTitleBar(hasBorder: true, ...)</c> keeps WS_CAPTION|WS_SYSMENU (measured
+    /// style 0x04C80000) so that DWM still rounds and shadows it, and WinUI only suppresses the
+    /// caption BAR, not the frame. Measured on the live window at 96 dpi: window rect 400x280,
+    /// client rect 384x272 - 8px left, 8px right, 8px bottom, 0 top (DWM extended frame bounds
+    /// 386x273, i.e. the client area IS the visible window; the border is invisible).
+    /// So passing the content height straight to MoveAndResize handed the content a client area
+    /// 8px SHORTER than it asked for, and the ScrollViewer dutifully reported ScrollableHeight=8:
+    /// a permanent scrollbar with a tiny scroll, on content that "fits". The delta is read from
+    /// the window itself rather than hard-coded because it scales with DPI (~10px at 150%).
+    /// <para>
+    /// The WIDTH is deliberately left as the outer rect. The same 16px is missing horizontally,
+    /// but nothing depends on it (the row grid is fixed-column plus a star) and widening the
+    /// visible flyout is a change nobody asked for; only the height causes the scrollbar.
+    /// </para>
+    /// </remarks>
+    private int VerticalFramePixels()
+    {
+        var frame = AppWindow.Size.Height - AppWindow.ClientSize.Height;
+
+        // Sanity bounds: a negative or absurd delta means the window is in some state where the
+        // client rect is not meaningful (never observed, but a bad value here would size the
+        // window wrongly forever). Zero is the safe answer - it is the old behaviour.
+        return frame is > 0 and < 200 ? frame : 0;
+    }
+
+    /// <summary>
+    /// The OUTER window height, in physical pixels, whose CLIENT area is exactly as tall as the
+    /// content wants - clamped so the window still fits the work area.
+    /// </summary>
+    /// <remarks>
+    /// The provider list lives in a ScrollViewer, and a ScrollViewer's own DesiredSize is a
+    /// scroll VIEWPORT, not its content - measuring RootGrid alone would size the window to its
+    /// chrome and scroll everything else out of sight. So the inner panel is measured first and
+    /// the viewer is pinned to that height only for the duration of this pass; the star-sized
+    /// row then hands the viewer exactly the height the window ended up with, which is what
+    /// makes the content SCROLL rather than clip once the work-area clamp bites.
+    /// The clamp is applied to the OUTER height (content + frame), because it is the outer rect
+    /// that has to fit between the work-area margins.
+    /// </remarks>
     private int MeasuredHeightPixels(RectInt32 work, double scale)
     {
-        var maxHeightDip = (work.Height / scale) - (2 * MarginDip);
-        RootGrid.Measure(new Windows.Foundation.Size(WidthDip, double.PositiveInfinity));
-        var desired = RootGrid.DesiredSize.Height;
+        // A real layout pass, not hand-rolled Measure calls. Measure() on an element that is
+        // already in the tree is a no-op unless that exact element was invalidated, so measuring
+        // ProviderGroups directly returned a size that predated the rows just synced into it -
+        // the window came out a row or two short and the list scrolled to make up the difference.
+        // UpdateLayout settles the whole subtree first; after it, DesiredSize is trustworthy.
+        ContentRoot.UpdateLayout();
+
+        // The THREE PARTS are summed rather than reading ContentRoot's own DesiredSize. Its middle
+        // row is star-sized, so the grid's height is whatever the window already had - the
+        // measurement that DECIDES the window height would be reading back its own previous
+        // answer, and any error in it would be permanent. A header, a stack of cards and a status
+        // line each know their own height, and the ScrollViewer measures its content unbounded, so
+        // ProviderGroups.DesiredSize is the true content height even while the viewer is clipped.
+        var spacing = 2 * ContentRoot.RowSpacing;
+        var chrome = ContentRoot.Padding.Top + ContentRoot.Padding.Bottom + spacing
+            + HeaderBar.DesiredSize.Height
+            + StatusBar.DesiredSize.Height;
+        var desired = chrome + ProviderGroups.DesiredSize.Height;
+
         if (double.IsNaN(desired) || desired < 1)
         {
             desired = FallbackHeightDip;
         }
 
-        var clamped = Math.Clamp(Math.Ceiling(desired), MinHeightDip, Math.Max(MinHeightDip, maxHeightDip));
-        return (int)Math.Round(clamped * scale);
+        // Everything above is in DIPs and describes the CLIENT area; everything below is physical
+        // pixels and describes the WINDOW rect, because that is what AppWindow speaks.
+        var frame = VerticalFramePixels();
+        var marginPx = (int)Math.Round(MarginDip * scale);
+        var minPx = (int)Math.Round(MinHeightDip * scale) + frame;
+        var maxPx = Math.Max(minPx, work.Height - (2 * marginPx));
+
+        // The window is sized to the content whenever the work area allows it, so the viewer only
+        // ever scrolls when there are genuinely more providers than fit on screen - a scrollbar on
+        // content that fits was the complaint that started this.
+        var desiredPx = (int)Math.Round(Math.Ceiling(desired) * scale) + frame;
+        var clampedPx = Math.Clamp(desiredPx, minPx, maxPx);
+
+        // The one line that says whether the window is the right height: if clamped < desired the
+        // work area genuinely could not fit the content and the list SHOULD scroll; if they match
+        // and it still scrolls, the measurement is wrong. `frame` is logged next to them because it
+        // is the term three previous attempts were missing - all of them reasoned in DIPs about the
+        // client area and then handed the number to an API that sets the OUTER rect.
+        DiagnosticLog.Write(
+            "flyout measure header={0:0} groups={1:0} status={2:0} desiredDip={3:0} frame={4} desiredPx={5} clampedPx={6} maxPx={7}",
+            HeaderBar.DesiredSize.Height,
+            ProviderGroups.DesiredSize.Height,
+            StatusBar.DesiredSize.Height,
+            desired,
+            frame,
+            desiredPx,
+            clampedPx,
+            maxPx);
+
+        return clampedPx;
+    }
+
+    /// <summary>
+    /// Logs what the ScrollViewer ended up with once layout has settled after a resize. Kept
+    /// permanently (behind CODEXBAR_WINUI_DIAG) because a stray scrollbar is the one flyout defect
+    /// that cannot be diagnosed from the measurement alone: it is the gap between the height the
+    /// window was GIVEN and the height the viewport actually GOT. Healthy reading is
+    /// scrollable=0 with viewport == extent; anything else names its own cause - a non-zero
+    /// scrollable with window-client == frame means the frame delta is wrong again.
+    /// </summary>
+    private void LogScrollState(string phase)
+    {
+        if (!DiagnosticLog.IsEnabled)
+        {
+            return;
+        }
+
+        // Low priority: MoveAndResize has to reach the XAML island and a layout pass has to run
+        // before ScrollHost knows its new viewport. Reading it inline reports the PREVIOUS size.
+        _ = queue.TryEnqueue(DispatcherQueuePriority.Low, () => DiagnosticLog.Write(
+            "flyout scroll {0} window={1} client={2} viewport={3:0.##} extent={4:0.##} scrollable={5:0.##}",
+            phase,
+            AppWindow.Size.Height,
+            AppWindow.ClientSize.Height,
+            ScrollHost.ViewportHeight,
+            ScrollHost.ExtentHeight,
+            ScrollHost.ScrollableHeight));
     }
 }

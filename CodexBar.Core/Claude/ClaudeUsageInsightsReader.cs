@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace CodexBarWindows;
 
@@ -88,6 +89,17 @@ public sealed class ClaudeUsageInsightsReader
 
             var daily = new Dictionary<DateOnly, MutableUsage>();
             var models = new Dictionary<string, MutableUsage>(StringComparer.OrdinalIgnoreCase);
+
+            // Same gate as the scan cache: a reader pointed at custom roots scans a different
+            // corpus, and the ledger is durable user data rather than an accelerator.
+            var ledger = persistCache ? new ClaudeLedgerSink() : null;
+            if (files.Length >= MaxFilesToScan)
+            {
+                // Enumeration was cut off, so this batch is a lower bound on the days it touched.
+                // Claiming otherwise would let replace-by-scope delete real history.
+                ledger?.Builder.MarkIncomplete();
+            }
+
             foreach (var row in DeduplicateAcrossFiles(rows))
             {
                 // Aggregate over the REPORTED window. Files are selected with a wider lookback
@@ -111,7 +123,10 @@ public sealed class ClaudeUsageInsightsReader
                 }
                 Add(daily, row.Day, row.Model, row.Tokens, row.CostUsd, row.CostPriced, label);
                 Add(models, label, row.Model, row.Tokens, row.CostUsd, row.CostPriced, label);
+                ledger?.Add(row);
             }
+
+            MergeIntoLedger(ledger?.Builder, firstReportDay, today, now);
 
             var dailyRows = Enumerable.Range(0, DaysToReport)
                 .Select(offset => firstReportDay.AddDays(offset))
@@ -397,6 +412,242 @@ public sealed class ClaudeUsageInsightsReader
         }
     }
 
+    /// <summary>
+    /// Scanner SEMANTICS version stamped on every batch. Bump it when an accounting rule changes,
+    /// so days written by older logic are identifiable as suspect rather than silently mixed in.
+    /// </summary>
+    private const int LedgerAccountingVersion = 3;
+
+    /// <summary>
+    /// Collects the ledger's view of a scan alongside the reader's own aggregation.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Fed POST-dedup and post-<c>IsAnthropicModel</c>, at the exact site that reaches the daily
+    /// buckets. <see cref="DeduplicateAcrossFiles"/> is global across the corpus, so feeding the
+    /// per-file lists instead would count every fork and subagent transcript twice.
+    /// </para>
+    /// <para>
+    /// Each component splits independently at the cutoff because <see cref="Tiered"/> does the same
+    /// per component: within one request only the tokens above the cutoff bill higher. The memo
+    /// exists because resolving a threshold costs a models.dev lookup per row otherwise.
+    /// </para>
+    /// </remarks>
+    private sealed class ClaudeLedgerSink
+    {
+        private readonly Dictionary<string, int?> thresholds = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <param name="builder">
+        /// Supplied by the backfill, which owns one builder per worker thread. Null in the normal
+        /// scan, where the sink owns the only builder there is.
+        /// </param>
+        public ClaudeLedgerSink(UsageLedgerBatchBuilder? builder = null)
+        {
+            Builder = builder ?? new UsageLedgerBatchBuilder(LedgerAccountingVersion);
+        }
+
+        public UsageLedgerBatchBuilder Builder { get; }
+
+        public void Add(ClaudeUsageRow row)
+        {
+            if (!thresholds.TryGetValue(row.Model, out var threshold))
+            {
+                threshold = ThresholdTokensFor(row.Model);
+                thresholds[row.Model] = threshold;
+            }
+
+            Builder.AddClaudeRow(
+                row.Timestamp,
+                row.Model,
+                // TokenTotals.InputTokens is raw + cache read; Tiered() is called with the raw part.
+                Math.Max(0, row.Tokens.InputTokens - row.Tokens.CachedInputTokens),
+                row.Tokens.CachedInputTokens,
+                row.Tokens.CacheCreationTokens,
+                row.Tokens.OutputTokens,
+                threshold);
+        }
+    }
+
+    /// <summary>The live long-context cutoff, resolved exactly as <see cref="EstimateCost"/> resolves it.</summary>
+    /// <remarks>
+    /// Same resolver the ledger QUERY uses. When the two disagreed, a row could be split at 200k on
+    /// write and priced as threshold-less on read.
+    /// </remarks>
+    private static int? ThresholdTokensFor(string model) => ClaudeModelPricing.ThresholdTokensFor(model);
+
+    /// <summary>
+    /// Hands the scan's records to the ledger and returns immediately.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The covered-day declaration is what gives replace-by-scope its authority: rows are bucketed
+    /// on the calendar day the log spelled (Claude Code writes UTC), so the reported window maps
+    /// onto UTC day numbers directly. A row outside it still carries its own day into the merge,
+    /// which is why a complete batch also asserts authority over the days it emitted records for.
+    /// </para>
+    /// <para>
+    /// Off-thread on purpose. This runs inside the history scan (and therefore only while a window
+    /// is open — property #1 is untouched), but the shard write is file I/O that the numbers on
+    /// screen should not wait behind. The batch is immutable, so nothing is shared with the scan.
+    /// </para>
+    /// </remarks>
+    private static void MergeIntoLedger(UsageLedgerBatchBuilder? builder, DateOnly firstReportDay, DateOnly today, DateTimeOffset scannedAt)
+    {
+        if (builder is null)
+        {
+            return;
+        }
+
+        builder.CoverDays(UtcMidnight(firstReportDay), UtcMidnight(today));
+        var batch = builder.Build(scannedAt);
+        _ = Task.Run(() => UsageLedger.TryMerge(UsageLedgerScope.Claude, batch));
+    }
+
+    private static DateTimeOffset UtcMidnight(DateOnly day) => new(day.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
+
+    /// <summary>
+    /// The whole-corpus source used by <see cref="UsageLedgerBackfill"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Reuses <see cref="ReadRowsFromFile"/> and the <see cref="IsAnthropicModel"/> filter verbatim,
+    /// so a backfilled month is what the 30-day scan would have written for it. It does not touch
+    /// <see cref="FileRowsCache"/>: that cache is sized for a 32-day window and pushing years of
+    /// rows through it would blow the working set and hand the next save a file orders of magnitude
+    /// larger than it is designed to write.
+    /// </para>
+    /// <para>
+    /// DEDUP IS THE HARD PART. <see cref="DeduplicateAcrossFiles"/> is global — the same assistant
+    /// message appears in a fork, a sidechain and a subagent transcript — and the scan can afford it
+    /// because 32 days of rows fit in memory. A whole corpus does not. So the backfill keeps only a
+    /// 128-bit FINGERPRINT per (messageId, requestId): ~24 B per row instead of a live row object,
+    /// which turns the one structure that scales with the log size into tens of MB at worst. Two
+    /// distinct messages colliding on 128 bits will not happen; if it somehow did, the cost is one
+    /// undercounted row, which is the same direction the dedup itself errs in.
+    /// </para>
+    /// <para>
+    /// The one fidelity difference: <see cref="RowWins"/> picks WHICH copy of a duplicate survives,
+    /// and first-seen wins here instead. Duplicates are the same API response written twice, so the
+    /// tokens, model and timestamp agree — only the losing copy's identity differs, and the ledger
+    /// stores none of it. Counting it exactly once is the property that matters, and that holds.
+    /// </para>
+    /// </remarks>
+    internal static IUsageLedgerBackfillSource CreateBackfillSource() => new ClaudeBackfillSource();
+
+    private sealed class ClaudeBackfillSource : IUsageLedgerBackfillSource
+    {
+        private readonly ClaudeUsageInsightsReader reader = new(null, refreshModelsDevPricing: false);
+        private readonly HashSet<(ulong High, ulong Low)> seen = [];
+
+        public UsageLedgerScope Scope => UsageLedgerScope.Claude;
+
+        public string DisplayName => "Claude";
+
+        public int AccountingVersion => LedgerAccountingVersion;
+
+        public IReadOnlyList<UsageLedgerBackfillFile> EnumerateFiles()
+        {
+            var files = new List<UsageLedgerBackfillFile>();
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // The two default roots (~/.config/claude and ~/.claude) can be the same tree behind a
+            // junction, and reading a file twice would only be absorbed by the dedup set for rows
+            // that carry both ids. Deduplicate the PATHS as well.
+            foreach (var root in reader.ResolveClaudeProjectsRoots())
+            {
+                if (!Directory.Exists(root))
+                {
+                    continue;
+                }
+
+                IEnumerable<string> found;
+                try
+                {
+                    found = Directory.EnumerateFiles(root, "*.jsonl", SearchOption.AllDirectories);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                foreach (var path in found)
+                {
+                    if (visited.Add(path))
+                    {
+                        files.Add(new UsageLedgerBackfillFile(path, CodexUsageInsightsReader.StampFor(path), false));
+                    }
+                }
+            }
+
+            files.Sort((left, right) =>
+            {
+                var byStamp = left.Stamp.CompareTo(right.Stamp);
+                return byStamp != 0 ? byStamp : string.Compare(left.Path, right.Path, StringComparison.OrdinalIgnoreCase);
+            });
+
+            return files;
+        }
+
+        public void Scan(UsageLedgerBackfillFile file, UsageLedgerBatchBuilder builder)
+        {
+            // DateOnly.MinValue: no lower bound at all. The scan's 32-day floor is exactly what puts
+            // the older months out of reach, and this is the job that goes and gets them.
+            var rows = ReadRowsFromFile(file.Path, DateOnly.MinValue);
+            var sink = new ClaudeLedgerSink(builder);
+
+            foreach (var row in rows)
+            {
+                // Claude History is Claude usage only: the projects tree also holds transcripts that
+                // record another vendor's models, and those tokens were never spent on Anthropic.
+                if (!IsAnthropicModel(NormalizeClaudeModel(row.Model)))
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(row.MessageId) && !string.IsNullOrWhiteSpace(row.RequestId))
+                {
+                    var fingerprint = Fingerprint(row.MessageId, row.RequestId);
+                    lock (seen)
+                    {
+                        if (!seen.Add(fingerprint))
+                        {
+                            continue;
+                        }
+                    }
+                }
+
+                sink.Add(row);
+            }
+        }
+
+        /// <summary>
+        /// A 128-bit fingerprint of a row's identity, as two independently seeded FNV-1a passes.
+        /// Stored in place of the id strings so the dedup set costs bytes per row rather than the
+        /// ~150 B a live key string and its row would.
+        /// </summary>
+        private static (ulong High, ulong Low) Fingerprint(string messageId, string requestId)
+        {
+            const ulong prime = 0x0000_0100_0000_01B3;
+            var high = 0xCBF2_9CE4_8422_2325UL;
+            var low = 0x9E37_79B9_7F4A_7C15UL;
+
+            static void Mix(string value, ref ulong high, ref ulong low)
+            {
+                foreach (var c in value)
+                {
+                    high = (high ^ c) * prime;
+                    low = ((low + c) * 0x2545_F491_4F6C_DD1DUL) ^ (low >> 29);
+                }
+            }
+
+            Mix(messageId, ref high, ref low);
+            // A separator, so ("ab","c") and ("a","bc") cannot fingerprint alike.
+            Mix("\0", ref high, ref low);
+            Mix(requestId, ref high, ref low);
+            return (high, low);
+        }
+    }
+
     private static IReadOnlyList<ClaudeUsageRow> ReadRowsFromFile(string file, DateOnly firstScanDay)
     {
         var keyed = new Dictionary<string, ClaudeUsageRow>(StringComparer.Ordinal);
@@ -426,8 +677,8 @@ public sealed class ClaudeUsageInsightsReader
                     continue;
                 }
 
-                var day = ReadDay(root);
-                if (day is null || day < firstScanDay)
+                var at = ReadTimestamp(root);
+                if (at is null || DateOnly.FromDateTime(at.Value.DateTime) < firstScanDay)
                 {
                     continue;
                 }
@@ -457,7 +708,7 @@ public sealed class ClaudeUsageInsightsReader
                 var cost = EstimateCost(model, rawInput, cacheRead, cacheCreate, output);
                 var row = new ClaudeUsageRow(
                     file,
-                    day.Value,
+                    at.Value,
                     model,
                     ReadString(message, "id"),
                     ReadString(root, "requestId"),
@@ -565,123 +816,15 @@ public sealed class ClaudeUsageInsightsReader
         return new ProviderModelUsage(usage.DisplayName ?? model, usage.InputTokens, usage.CachedInputTokens, usage.CacheCreationTokens, usage.OutputTokens, usage.EstimatedCostUsd, HasIncompleteCost: usage.HasIncompleteCost);
     }
 
+    // Every pricing decision below is delegated to ClaudeModelPricing so the ledger read path prices
+    // the identical row identically. These wrappers stay only because the call sites in this file
+    // read better without the type prefix; they must never grow logic of their own.
     private static decimal? EstimateCost(string model, long rawInput, long cacheRead, long cacheCreate, long output)
-    {
-        // Synthetic/local entries cost nothing; report zero rather than "unpriced" so they do
-        // not trigger the incomplete-cost warning.
-        if (IsNonBillableModel(model))
-        {
-            return 0m;
-        }
+        => ClaudeModelPricing.EstimateCost(model, rawInput, cacheRead, cacheCreate, output);
 
-        var pricing = ModelsDevPricing.Lookup("anthropic", model) ?? BuiltInPricingFor(model);
-        if (pricing is null)
-        {
-            return null;
-        }
+    private static bool IsAnthropicModel(string normalizedModel) => ClaudeModelPricing.IsAnthropicModel(normalizedModel);
 
-        return Tiered(rawInput, pricing.InputPerMillion, pricing.InputPerMillionAboveThreshold, pricing.ThresholdTokens) +
-               Tiered(cacheRead, pricing.CacheReadPerMillion ?? pricing.InputPerMillion, pricing.CacheReadPerMillionAboveThreshold, pricing.ThresholdTokens) +
-               Tiered(cacheCreate, pricing.CacheCreationPerMillion ?? pricing.InputPerMillion, pricing.CacheCreationPerMillionAboveThreshold, pricing.ThresholdTokens) +
-               Tiered(output, pricing.OutputPerMillion, pricing.OutputPerMillionAboveThreshold, pricing.ThresholdTokens);
-    }
-
-    private static decimal Tiered(long tokens, decimal basePerMillion, decimal? abovePerMillion, int? threshold)
-    {
-        tokens = Math.Max(0, tokens);
-        if (threshold is not { } cutoff || abovePerMillion is not { } above)
-        {
-            return tokens / 1_000_000m * basePerMillion;
-        }
-
-        var below = Math.Min(tokens, cutoff);
-        var over = Math.Max(tokens - cutoff, 0);
-        return below / 1_000_000m * basePerMillion + over / 1_000_000m * above;
-    }
-
-    private static ModelsDevPricingInfo? BuiltInPricingFor(string model)
-    {
-        var normalized = NormalizeClaudeModel(model);
-        return ClaudePricing.TryGetValue(normalized, out var pricing) ? pricing : null;
-    }
-
-    /// <summary>
-    /// Pseudo-models that carry no billable usage. Claude Code writes "&lt;synthetic&gt;" for messages
-    /// it generates locally; these must not count as unpriced models or the cost warning fires
-    /// on every scan.
-    /// </summary>
-    /// <summary>
-    /// True when a NORMALIZED model id belongs to Anthropic.
-    /// </summary>
-    /// <remarks>
-    /// Checked after <see cref="NormalizeClaudeModel"/>, which already resolves bare aliases
-    /// ("opus" → "claude-opus-5") and strips the Bedrock "anthropic." prefix, so every Anthropic
-    /// id — first-party, Bedrock, or Vertex ("claude-opus-4-5@20251101") — begins with "claude"
-    /// by that point. Synthetic markers are excluded too: they carry no usage either way.
-    /// </remarks>
-    private static bool IsAnthropicModel(string normalizedModel)
-    {
-        return !IsNonBillableModel(normalizedModel) &&
-            normalizedModel.TrimStart().StartsWith("claude", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsNonBillableModel(string raw)
-    {
-        var value = raw.Trim();
-        return value.Length == 0 ||
-            value.Equals("<synthetic>", StringComparison.OrdinalIgnoreCase) ||
-            value.StartsWith('<');
-    }
-
-    /// <summary>
-    /// Session logs sometimes record a bare family name instead of a full model id. Map those to
-    /// the current model in each family so they price rather than falling through as unknown.
-    /// </summary>
-    private static readonly IReadOnlyDictionary<string, string> ClaudeModelAliases =
-        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["fable"] = "claude-fable-5",
-            ["opus"] = "claude-opus-5",
-            ["sonnet"] = "claude-sonnet-5",
-            ["haiku"] = "claude-haiku-4-5"
-        };
-
-    private static string NormalizeClaudeModel(string raw)
-    {
-        var value = raw.Trim();
-        if (ClaudeModelAliases.TryGetValue(value, out var aliased))
-        {
-            return aliased;
-        }
-
-        if (value.StartsWith("anthropic.", StringComparison.OrdinalIgnoreCase))
-        {
-            value = value["anthropic.".Length..];
-        }
-
-        var lastDot = value.LastIndexOf('.');
-        if (lastDot >= 0 && value.Contains("claude-", StringComparison.OrdinalIgnoreCase))
-        {
-            var tail = value[(lastDot + 1)..];
-            if (tail.StartsWith("claude-", StringComparison.OrdinalIgnoreCase))
-            {
-                value = tail;
-            }
-        }
-
-        value = System.Text.RegularExpressions.Regex.Replace(value, "-v\\d+:\\d+$", string.Empty);
-        var compactDate = System.Text.RegularExpressions.Regex.Match(value, "-\\d{8}$");
-        if (compactDate.Success)
-        {
-            var baseName = value[..compactDate.Index];
-            if (ClaudePricing.ContainsKey(baseName))
-            {
-                return baseName;
-            }
-        }
-
-        return value;
-    }
+    private static string NormalizeClaudeModel(string raw) => ClaudeModelPricing.NormalizeModelName(raw);
 
     private static bool IsVertexAIUsageEntry(JsonElement root)
     {
@@ -765,21 +908,26 @@ public sealed class ClaudeUsageInsightsReader
             "api_type" or "apitype" or "source" or "vendor" or "client";
     }
 
-    private static DateOnly? ReadDay(JsonElement element)
+    /// <summary>
+    /// The hour a transcript line belongs to, in the frame the line was written in.
+    /// </summary>
+    /// <remarks>
+    /// The DATE is bit-for-bit the one the old day-only path produced — the calendar date as the
+    /// log spells it, not a converted one — so no reported figure moves because rows grew an hour
+    /// column. The declared offset rides along only so the ledger can recover the true instant.
+    /// Truncated to the hour: the ledger's finest bucket is an hour, and minutes would cost bytes
+    /// in every cached row for nothing.
+    /// </remarks>
+    private static DateTimeOffset? ReadTimestamp(JsonElement element)
     {
-        return DayFromText(ReadString(element, "timestamp"));
+        return UsageTimestampText.TryParseHour(ReadString(element, "timestamp"), out var timestamp) ? timestamp : null;
     }
 
     private static DateOnly? DayFromText(string? value)
     {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return null;
-        }
-
-        var match = System.Text.RegularExpressions.Regex.Match(value, "\\d{4}-\\d{2}-\\d{2}");
-        return match.Success && DateOnly.TryParseExact(match.Value, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var day)
-            ? day
+        return UsageTimestampText.TryFindDate(value, out _, out var year, out var month, out var day) &&
+            UsageTimestampText.TryMakeDate(year, month, day, out var parsed)
+            ? parsed
             : null;
     }
 
@@ -874,7 +1022,7 @@ public sealed class ClaudeUsageInsightsReader
 
     private sealed record ClaudeUsageRow(
         string FilePath,
-        DateOnly Day,
+        DateTimeOffset Timestamp,
         string Model,
         string? MessageId,
         string? RequestId,
@@ -883,7 +1031,15 @@ public sealed class ClaudeUsageInsightsReader
         ClaudePathRole PathRole,
         TokenTotals Tokens,
         decimal? CostUsd,
-        bool CostPriced);
+        bool CostPriced)
+    {
+        /// <summary>
+        /// The calendar day the log wrote, unconverted — identical to the DateOnly this row used to
+        /// carry. Ignored by the serializer: it is derivable, and the cache pays for every byte.
+        /// </summary>
+        [JsonIgnore]
+        public DateOnly Day => DateOnly.FromDateTime(Timestamp.DateTime);
+    }
 
     private enum ClaudePathRole
     {
@@ -891,28 +1047,4 @@ public sealed class ClaudeUsageInsightsReader
         Subagent
     }
 
-    private static readonly IReadOnlyDictionary<string, ModelsDevPricingInfo> ClaudePricing = new Dictionary<string, ModelsDevPricingInfo>(StringComparer.OrdinalIgnoreCase)
-    {
-        // Claude 5 family. Cache read is 0.1x input and cache write 1.25x input (5-minute TTL),
-        // matching every other row here. None of these carry a long-context premium: the 1M
-        // window bills at the standard rate, so no threshold tier.
-        ["claude-fable-5"] = new(10.00m, 50.00m, 1.00m, 12.50m, null, null, null, null, null),
-        ["claude-opus-5"] = new(5.00m, 25.00m, 0.50m, 6.25m, null, null, null, null, null),
-        ["claude-sonnet-5"] = new(3.00m, 15.00m, 0.30m, 3.75m, null, null, null, null, null),
-        ["claude-opus-4-8"] = new(5.00m, 25.00m, 0.50m, 6.25m, null, null, null, null, null),
-
-        ["claude-haiku-4-5-20251001"] = new(1.00m, 5.00m, 0.10m, 1.25m, null, null, null, null, null),
-        ["claude-haiku-4-5"] = new(1.00m, 5.00m, 0.10m, 1.25m, null, null, null, null, null),
-        ["claude-opus-4-5-20251101"] = new(5.00m, 25.00m, 0.50m, 6.25m, null, null, null, null, null),
-        ["claude-opus-4-5"] = new(5.00m, 25.00m, 0.50m, 6.25m, null, null, null, null, null),
-        ["claude-opus-4-6-20260205"] = new(5.00m, 25.00m, 0.50m, 6.25m, null, null, null, null, null),
-        ["claude-opus-4-6"] = new(5.00m, 25.00m, 0.50m, 6.25m, null, null, null, null, null),
-        ["claude-opus-4-7"] = new(5.00m, 25.00m, 0.50m, 6.25m, null, null, null, null, null),
-        ["claude-sonnet-4-5"] = new(3.00m, 15.00m, 0.30m, 3.75m, 200_000, 6.00m, 22.50m, 0.60m, 7.50m),
-        ["claude-sonnet-4-6"] = new(3.00m, 15.00m, 0.30m, 3.75m, 200_000, 6.00m, 22.50m, 0.60m, 7.50m),
-        ["claude-sonnet-4-5-20250929"] = new(3.00m, 15.00m, 0.30m, 3.75m, 200_000, 6.00m, 22.50m, 0.60m, 7.50m),
-        ["claude-opus-4-20250514"] = new(15.00m, 75.00m, 1.50m, 18.75m, null, null, null, null, null),
-        ["claude-opus-4-1"] = new(15.00m, 75.00m, 1.50m, 18.75m, null, null, null, null, null),
-        ["claude-sonnet-4-20250514"] = new(3.00m, 15.00m, 0.30m, 3.75m, 200_000, 6.00m, 22.50m, 0.60m, 7.50m),
-    };
 }

@@ -2,12 +2,14 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using CodexBarWindows;
-using CommunityToolkit.WinUI.Controls;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
+using Windows.ApplicationModel.DataTransfer;
 using Windows.Graphics;
 using WinRT.Interop;
 
@@ -23,9 +25,16 @@ namespace CodexBar.WinUI;
 /// when something it depends on moved.
 /// </para>
 /// <para>
+/// The chrome deliberately mirrors <see cref="FlyoutWindow"/> and <see cref="GraphsWindow"/> so
+/// the three surfaces read as one app: the same RootGrid/TintLayer pair, the same 16,12,16,12
+/// padding with a single RowSpacing, the same CornerRadius=8 cards with 1px-separated rows
+/// inside them, the same caption-scale muted vocabulary, and ONE status line at the bottom -
+/// which is what replaced the four InfoBars.
+/// </para>
+/// <para>
 /// Every change applies immediately - there is no OK/Cancel. Persisting through
 /// <see cref="UiSettings.Save"/> raises <see cref="UiSettings.Changed"/>, which is what makes
-/// the open flyout re-theme and rebuild its tab strip live.
+/// the open flyout re-theme and rebuild its cards live.
 /// </para>
 /// </summary>
 public sealed partial class SettingsWindow : Window
@@ -38,19 +47,61 @@ public sealed partial class SettingsWindow : Window
     /// </summary>
     private static readonly TimeSpan TintCommitDelay = TimeSpan.FromMilliseconds(150);
 
+    /// <summary>
+    /// The floor the layout is designed down to: below this the two-column rows (label plus a
+    /// 160-wide combo or a 180-wide slider) start crushing their labels. Enforced rather than
+    /// documented - see the presenter minimums in the constructor.
+    /// </summary>
+    private const int MinimumWidthDips = 520;
+    private const int MinimumHeightDips = 420;
+
+    /// <summary>What the status line says when it has nothing to report. Matches the XAML.</summary>
+    private const string DefaultStatus = "Every change applies immediately.";
+
+    private const string ToolsFloorMessage = "At least one tool has to stay on, so Codex was turned back on.";
+
+    /// <summary>What the import row says when it is not running. Matches the XAML.</summary>
+    private const string ImportIdleCaption = "Reads every session log once. Expect a few minutes.";
+
     private readonly UsageRefreshService service;
     private readonly IntPtr hwnd;
     private readonly DispatcherQueue queue;
     private readonly DispatcherQueueTimer tintCommitTimer;
+    /// <summary>
+    /// Same coalescing as the tint slider, for the same reason: a ColorPicker drag raises
+    /// ColorChanged as fast as a slider, and each save writes the registry and re-themes every
+    /// open window.
+    /// </summary>
+    private readonly DispatcherQueueTimer chartColorCommitTimer;
     private readonly List<CodexCliEntry> codexEntries;
+    private readonly List<ChartColorRow> chartColorRows = [];
+
+    /// <summary>The hex each category was last DRAWN in, as recorded by the graphs window.</summary>
+    private Dictionary<string, string> drawnColors = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The handful of colours that cannot be a XAML <c>{ThemeResource}</c>: the provider mark
+    /// tints and the status line's warning/danger. Rebuilt on ActualThemeChanged, because a
+    /// brush is captured once and would otherwise stay frozen to the theme it was born in.
+    /// </summary>
+    private FlyoutPalette palette;
 
     private UiSettings settings;
     private int? pendingTintPercent;
+    private (string Key, string Hex)? pendingChartColor;
+    /// <summary>Seeded with the XAML's text so a right-click Copy works before anything happens.</summary>
+    private string statusFullText = DefaultStatus;
+    private StatusLevel statusLevel = StatusLevel.Info;
     /// <summary>
     /// Set in <see cref="OnClosed"/>. An update check outcome can arrive after the window is
     /// gone, and touching a closed window's controls throws.
     /// </summary>
     private bool isClosed;
+    /// <summary>
+    /// Non-null exactly while a history import is running; also the flag the button reads to decide
+    /// whether a click starts one or cancels the one in flight.
+    /// </summary>
+    private CancellationTokenSource? importCancellation;
     /// <summary>
     /// Suppresses the write-back handlers. Set while the controls are being populated from the
     /// persisted settings, and again around the one place this window drives a control itself
@@ -67,19 +118,28 @@ public sealed partial class SettingsWindow : Window
         hwnd = WindowNative.GetWindowHandle(this);
         queue = DispatcherQueue.GetForCurrentThread();
         settings = AppTheme.Settings;
+        palette = FlyoutPalette.For(RootGrid);
         codexEntries = CodexCliSettings.Load().ToList();
 
         Title = $"Settings - {AppInfo.AppName}";
         AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "Assets", "CodexBarWindows.ico"));
 
+        // Smaller than the 920x660 the rail-and-gutters layout needed: the rail's 196 DIP and the
+        // 28 DIP page padding either side of a 720-wide column are both gone.
         var scale = NativeWindow.ScaleFor(hwnd);
         AppWindow.Resize(new SizeInt32(
-            (int)Math.Round(920 * scale),
-            (int)Math.Round(660 * scale)));
+            (int)Math.Round(760 * scale),
+            (int)Math.Round(640 * scale)));
 
+        // The window is resizable, so the floor is enforced rather than documented:
+        // OverlappedPresenter feeds these straight into WM_GETMINMAXINFO's ptMinTrackSize, which -
+        // like every other size on AppWindow - is in physical pixels, hence the same DPI scale as
+        // the Resize above. Maximising is allowed now that the page column is width-capped rather
+        // than stretched.
         if (AppWindow.Presenter is OverlappedPresenter presenter)
         {
-            presenter.IsMaximizable = false;
+            presenter.PreferredMinimumWidth = (int)Math.Round(MinimumWidthDips * scale);
+            presenter.PreferredMinimumHeight = (int)Math.Round(MinimumHeightDips * scale);
         }
 
         tintCommitTimer = queue.CreateTimer();
@@ -87,10 +147,27 @@ public sealed partial class SettingsWindow : Window
         tintCommitTimer.IsRepeating = false;
         tintCommitTimer.Tick += (_, _) => CommitPendingTint();
 
+        chartColorCommitTimer = queue.CreateTimer();
+        chartColorCommitTimer.Interval = TintCommitDelay;
+        chartColorCommitTimer.IsRepeating = false;
+        chartColorCommitTimer.Tick += (_, _) => CommitPendingChartColor();
+
         LoadValues();
         WireEvents();
 
-        RootGrid.ActualThemeChanged += (_, _) => AppTheme.ApplyTint(RootGrid, TintLayer);
+        RootGrid.ActualThemeChanged += (_, _) =>
+        {
+            AppTheme.ApplyTint(RootGrid, TintLayer);
+            // Everything below is a colour this window assigned in CODE, and none of those
+            // re-resolve for free: the palette follows the element's ActualTheme, so it and every
+            // brush taken from it have to be rebuilt on a flip.
+            palette = FlyoutPalette.For(RootGrid);
+            RenderProviderMarks();
+            ApplyStatusColour();
+            // The swatches show the colour the chart will actually draw, and the automatic ones
+            // are theme-derived, so they have to be re-resolved rather than left frozen.
+            RefreshChartColorSwatches();
+        };
         AppTheme.Changed += OnThemeChanged;
         if (App.Shell is { } shell)
         {
@@ -105,7 +182,7 @@ public sealed partial class SettingsWindow : Window
 
         AppTheme.Apply(this, RootGrid, TintLayer);
 
-        Nav.SelectedItem = Nav.MenuItems[0];
+        SectionBar.SelectedItem = SectionBar.Items[0];
         suppressWrites = false;
     }
 
@@ -117,8 +194,43 @@ public sealed partial class SettingsWindow : Window
 
     public void ShowAndFocus()
     {
+        // Re-read the colour catalog on every show. This window is CACHED for the life of the
+        // process, so a list built once in the constructor is the list as it was the first time
+        // settings was ever opened - which makes the empty state's own instruction ("open the
+        // usage graphs once to populate this list") impossible to follow: the user does exactly
+        // that, comes back, and sees the same empty box until they restart the app.
+        RenderChartColors();
+
         AppWindow.Show(activateWindow: true);
         NativeWindow.ForceForeground(hwnd);
+    }
+
+    /// <summary>
+    /// Shows the window with the Graphs section selected - where the history import lives.
+    /// </summary>
+    /// <remarks>
+    /// The graphs window's "Import history" link lands here. It does NOT start the import: that
+    /// reads every session log on disk, and the one rule this feature ships under is that nothing
+    /// runs unless the user clicks the button themselves.
+    /// <para/>
+    /// No scroll-into-view. The import card is the FIRST thing on the Graphs page, and a Collapsed
+    /// page has never been measured, so bringing a child into view would have to be deferred a
+    /// layout pass to do nothing visible.
+    /// </remarks>
+    public void ShowHistoryImport()
+    {
+        foreach (var item in SectionBar.Items)
+        {
+            if (item is SelectorBarItem { Tag: "graphs" } graphs)
+            {
+                // Assigning SelectedItem raises SelectionChanged, so the page flip is the same code
+                // path a click takes - the selector never disagrees with what is on screen.
+                SectionBar.SelectedItem = graphs;
+                break;
+            }
+        }
+
+        ShowAndFocus();
     }
 
     // ------------------------------------------------------------------ lifetime
@@ -131,7 +243,16 @@ public sealed partial class SettingsWindow : Window
         // would otherwise be silently dropped.
         CommitPendingTint();
         tintCommitTimer.Stop();
+        CommitPendingChartColor();
+        chartColorCommitTimer.Stop();
         AppTheme.Changed -= OnThemeChanged;
+
+        // CLOSING THE WINDOW CANCELS THE IMPORT. The alternative - letting it run on - would leave
+        // minutes of full-rate disk and CPU work with no progress, no result and no way to stop it,
+        // which is the opposite of what makes this feature acceptable at all. Cancelling is free of
+        // consequences by construction: the ledger is written once, after a corpus has been read in
+        // full, so a cancelled run leaves history exactly as it was.
+        importCancellation?.Cancel();
 
         if (App.Shell is { } shell)
         {
@@ -151,7 +272,7 @@ public sealed partial class SettingsWindow : Window
 
     private void LoadValues()
     {
-        VersionCard.Description = AppInfo.VersionText;
+        VersionText.Text = AppInfo.VersionText;
 
         // ShellIdentity, not StartupSettings.IsEnabled: the WinForms app owns the unsuffixed
         // Run value, and this shell must not read or overwrite it while both are installed.
@@ -169,7 +290,9 @@ public sealed partial class SettingsWindow : Window
 
         CursorCookieBox.Password = CursorSettings.LoadCookieHeader();
         RenderCursorSavedState();
+        RenderProviderMarks();
         RenderAccounts();
+        RenderChartColors();
     }
 
     private void WireEvents()
@@ -197,6 +320,8 @@ public sealed partial class SettingsWindow : Window
         VibesToggle.Toggled += (_, _) => OnVibesToggled();
         OpacitySlider.ValueChanged += (_, _) => OnOpacityChanged();
 
+        AddAccountToggle.Click += (_, _) => ShowAddAccountPanel(AddAccountPanel.Visibility != Visibility.Visible);
+        AddCancelButton.Click += (_, _) => ShowAddAccountPanel(false);
         AddBrowseButton.Click += async (_, _) =>
         {
             var picked = await BrowseForCodexCliAsync();
@@ -207,22 +332,112 @@ public sealed partial class SettingsWindow : Window
         };
         AddAccountButton.Click += (_, _) => AddCodexCli();
 
+        ResetAllChartColorsButton.Click += (_, _) => ResetAllChartColors();
+        ImportHistoryButton.Click += (_, _) => ToggleHistoryImport();
+
         SaveCursorButton.Click += (_, _) => SaveCursorCookieHeader();
         ClearCursorButton.Click += (_, _) => ClearCursorCookieHeader();
     }
 
-    private void OnNavSelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
+    /// <summary>
+    /// Shows the page the selector points at.
+    /// </summary>
+    /// <remarks>
+    /// Still a Visibility flip across sibling ScrollViewers rather than a Frame: a Collapsed
+    /// element is neither measured nor arranged, so the only cost is one retained tree per page -
+    /// and in exchange every page keeps its scroll offset and its half-typed text boxes when you
+    /// come back to it, which a navigated Frame throws away on every switch.
+    /// </remarks>
+    private void OnSectionChanged(SelectorBar sender, SelectorBarSelectionChangedEventArgs args)
     {
-        var tag = (args.SelectedItem as NavigationViewItem)?.Tag as string;
+        var tag = sender.SelectedItem?.Tag as string;
         GeneralPage.Visibility = Shown(tag == "general");
         AppearancePage.Visibility = Shown(tag == "appearance");
+        GraphsPage.Visibility = Shown(tag == "graphs");
         AccountsPage.Visibility = Shown(tag == "accounts");
-        CursorPage.Visibility = Shown(tag == "cursor");
     }
 
     private static Visibility Shown(bool visible) => visible ? Visibility.Visible : Visibility.Collapsed;
 
+    // ------------------------------------------------------------------- status
+
+    /// <summary>How loudly the status line says something. Errors are red, warnings amber.</summary>
+    private enum StatusLevel
+    {
+        Info,
+        Warning,
+        Error
+    }
+
+    /// <summary>
+    /// The one status line, and the four InfoBars' replacement. Each of those was a banner that
+    /// reflowed the page under the pointer as it opened, and the update-check result in
+    /// particular was a banner here but a status sentence in the flyout for the same message.
+    /// Text is wrapped rather than trimmed, repeated on the tooltip, selectable and copyable.
+    /// </summary>
+    private void SetStatus(string text, StatusLevel level = StatusLevel.Info)
+    {
+        statusFullText = text;
+        statusLevel = level;
+        StatusText.Text = text;
+        ToolTipService.SetToolTip(StatusText, string.IsNullOrEmpty(text) ? null : text);
+        ApplyStatusColour();
+    }
+
+    private void ApplyStatusColour()
+    {
+        StatusIcon.Visibility = Shown(statusLevel != StatusLevel.Info);
+
+        if (statusLevel == StatusLevel.Info)
+        {
+            // Cleared so TertiaryCaptionStyle's {ThemeResource} setter takes over again - which is
+            // exactly why the muted colour lives on the style and not inline.
+            StatusText.ClearValue(TextBlock.ForegroundProperty);
+            return;
+        }
+
+        // From the palette, NOT from Application.Current.Resources: a brush read out of the app
+        // resources resolves against the APP theme and renders wrong under a forced theme.
+        var brush = statusLevel == StatusLevel.Error ? palette.Danger : palette.Warning;
+        StatusText.Foreground = brush;
+        StatusIcon.Foreground = brush;
+    }
+
+    private void OnCopyStatus(object sender, RoutedEventArgs e)
+    {
+        if (string.IsNullOrWhiteSpace(statusFullText))
+        {
+            return;
+        }
+
+        var package = new DataPackage();
+        package.SetText(statusFullText);
+        Clipboard.SetContent(package);
+    }
+
     // ------------------------------------------------------------------ general
+
+    /// <summary>
+    /// Paints the three provider marks. These are the real per-provider vectors the flyout draws,
+    /// not three copies of one generic glyph: this is the page where provider identity is
+    /// configured. Claude keeps Anthropic's own colour in both themes because it identifies the
+    /// provider; the other two are the theme's monochrome glyph tint.
+    /// </summary>
+    private void RenderProviderMarks()
+    {
+        CodexMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Codex, palette.Glyph);
+        ClaudeMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Claude, palette.ClaudeGlyph);
+        CursorMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Cursor, palette.Glyph);
+        BuiltInAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Codex, palette.Glyph);
+        CursorAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Cursor, palette.Glyph);
+
+        // The generated account rows hold marks too, and a Path cannot be shared between two
+        // parents here (it takes the process down with 0xc000027b), so each row gets its own.
+        foreach (var host in accountMarks)
+        {
+            host.Child = ProviderGeometry.CreateIcon(UsageProvider.Codex, palette.Glyph);
+        }
+    }
 
     /// <summary>
     /// Persists the per-tool toggles. Turning every tool off would leave the flyout with
@@ -240,11 +455,14 @@ public sealed partial class SettingsWindow : Window
             suppressWrites = true;
             CodexEnabledToggle.IsOn = true;
             suppressWrites = false;
-            ToolsInfoBar.IsOpen = true;
+            SetStatus(ToolsFloorMessage, StatusLevel.Warning);
         }
-        else
+        else if (statusFullText == ToolsFloorMessage)
         {
-            ToolsInfoBar.IsOpen = false;
+            // The InfoBar this replaced closed itself once the floor was no longer being hit, so
+            // the sentence does not outlive the state it describes. Only that message is cleared -
+            // an unrelated warning on the line is somebody else's and stays.
+            SetStatus(DefaultStatus);
         }
 
         settings = settings with
@@ -263,9 +481,7 @@ public sealed partial class SettingsWindow : Window
     /// </summary>
     private void CheckForUpdates()
     {
-        UpdateInfoBar.Severity = InfoBarSeverity.Informational;
-        UpdateInfoBar.Message = "Checking for updates...";
-        UpdateInfoBar.IsOpen = true;
+        SetStatus("Checking for updates...");
 
         App.Shell?.CheckForUpdates(result =>
         {
@@ -276,14 +492,15 @@ public sealed partial class SettingsWindow : Window
                 return;
             }
 
-            UpdateInfoBar.Severity = result.Status switch
+            // The same severity split the InfoBar carried: a check that resolved is quiet, and
+            // anything else is a warning.
+            var level = result.Status switch
             {
-                UpdateCheckStatus.UpToDate => InfoBarSeverity.Success,
-                UpdateCheckStatus.Installing => InfoBarSeverity.Success,
-                _ => InfoBarSeverity.Warning
+                UpdateCheckStatus.UpToDate => StatusLevel.Info,
+                UpdateCheckStatus.Installing => StatusLevel.Info,
+                _ => StatusLevel.Warning
             };
-            UpdateInfoBar.Message = result.Message;
-            UpdateInfoBar.IsOpen = true;
+            SetStatus(result.Message, level);
         });
     }
 
@@ -390,30 +607,441 @@ public sealed partial class SettingsWindow : Window
         DiagnosticLog.Write("tint committed {0}%", percent);
     }
 
-    // ----------------------------------------------------------------- accounts
+    // ------------------------------------------------------------------- graphs
+
+    /// <summary>One colour row's live controls, so a save can repaint it without a rebuild.</summary>
+    private sealed record ChartColorRow(
+        string Key,
+        Border Swatch,
+        TextBlock HexText,
+        TextBlock StateText,
+        Button ResetButton,
+        ColorPicker Picker);
 
     /// <summary>
-    /// Rebuilds the account list. Each editable account is a <see cref="SettingsExpander"/>
-    /// whose expanded body IS its editor, so there is no separate selected-item form to keep
-    /// in sync (the WinForms version had a list plus a detached editor plus three buttons whose
-    /// enabled state tracked the selection).
+    /// Rebuilds the per-model colour list from the labels the graphs window has plotted.
+    /// </summary>
+    /// <remarks>
+    /// Called on load and after a reset, NEVER after an ordinary colour commit: the picker is
+    /// hosted in a flyout off the row it belongs to, and rebuilding the row while the user is
+    /// still dragging inside it would tear the flyout down mid-gesture.
+    /// </remarks>
+    private void RenderChartColors()
+    {
+        ChartColorList.Children.Clear();
+        chartColorRows.Clear();
+
+        var catalog = ChartCategoryCatalog.Load();
+        drawnColors = catalog
+            .Where(entry => entry.DrawnHex is not null)
+            .ToDictionary(entry => entry.Label, entry => entry.DrawnHex!, StringComparer.OrdinalIgnoreCase);
+
+        // A model that was colour-picked and has since dropped out of the 30-day window still
+        // gets a row, otherwise its override becomes invisible and unremovable.
+        var known = catalog.Select(entry => entry.Label)
+            .Concat(settings.ChartColorOverrides.Keys)
+            .Where(label => !string.IsNullOrWhiteSpace(label))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(label => label, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        ChartColorEmptyCard.Visibility = Shown(known.Length == 0);
+        ChartColorCard.Visibility = Shown(known.Length > 0);
+        ResetAllChartColorsButton.IsEnabled = settings.ChartColorOverrides.Count > 0;
+
+        foreach (var label in known)
+        {
+            // Rows divide with a hairline instead of floating apart, so the list reads as one
+            // card of models rather than a ladder of identical boxes.
+            if (chartColorRows.Count > 0)
+            {
+                ChartColorList.Children.Add(new Border { Style = RowStyle("RowSeparatorStyle") });
+            }
+
+            chartColorRows.Add(CreateChartColorRow(label));
+        }
+
+        RefreshChartColorSwatches();
+    }
+
+    private ChartColorRow CreateChartColorRow(string label)
+    {
+        // The swatch IS the affordance: it opens the picker, so the row loses the "Pick" button
+        // that used to sit between the colour and its hex. Subtle chrome keeps the colour itself
+        // the only filled thing in the row.
+        var swatch = new Border { Style = RowStyle("ChartSwatchStyle") };
+
+        var picker = new ColorPicker
+        {
+            // No alpha: a translucent bar would blend with whatever it stacks on and stop being
+            // the colour the user picked.
+            IsAlphaEnabled = false,
+            IsHexInputVisible = true,
+            IsColorChannelTextInputVisible = true,
+            IsMoreButtonVisible = false
+        };
+        picker.ColorChanged += (_, args) => OnChartColorPicked(label, args.NewColor);
+
+        var pick = new Button
+        {
+            Width = 30,
+            Height = 30,
+            Padding = new Thickness(0),
+            Style = (Style)Application.Current.Resources["SubtleButtonStyle"],
+            Content = swatch,
+            Flyout = new Flyout { Content = picker },
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(pick, $"Pick a colour for {label}");
+        ToolTipService.SetToolTip(pick, $"Pick a colour for {label}");
+
+        var nameText = new TextBlock
+        {
+            Text = label,
+            MaxLines = 1,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        ToolTipService.SetToolTip(nameText, label);
+
+        var hexText = new TextBlock { Style = RowStyle("ChartHexStyle") };
+        var stateText = new TextBlock { Style = RowStyle("ChartStateStyle") };
+
+        // Icon-only, like the flyout's header actions: the meaning is on the tooltip and the
+        // automation name, and a row full of word-buttons was most of what made this list read
+        // like a debug dump.
+        var reset = new Button
+        {
+            Width = 32,
+            Height = 30,
+            Padding = new Thickness(0),
+            Style = (Style)Application.Current.Resources["SubtleButtonStyle"],
+            Content = new FontIcon { FontSize = 13, Glyph = "\uE7A7" },
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(reset, $"Reset the colour for {label}");
+        ToolTipService.SetToolTip(reset, "Reset to the automatic colour");
+        reset.Click += (_, _) => ResetChartColor(label);
+
+        var row = new Grid { Style = RowStyle("SettingRowStyle"), ColumnSpacing = 10 };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        AddAt(row, pick, 0);
+        AddAt(row, nameText, 1);
+        AddAt(row, hexText, 2);
+        AddAt(row, stateText, 3);
+        AddAt(row, reset, 4);
+
+        ChartColorList.Children.Add(row);
+        return new ChartColorRow(label, swatch, hexText, stateText, reset, picker);
+    }
+
+    /// <summary>
+    /// Repaints every swatch from the palette the CHARTS use, so an unset model previews the exact
+    /// automatic colour it will be drawn in - including its theme-derived accent.
+    /// </summary>
+    /// <remarks>
+    /// The palette is built from <c>RootGrid</c>, not the app theme, for the same reason the
+    /// graphs window does it: a brush resolved against the app theme renders wrong the moment the
+    /// user forces the opposite one.
+    /// </remarks>
+    private void RefreshChartColorSwatches()
+    {
+        if (chartColorRows.Count == 0)
+        {
+            return;
+        }
+
+        var chartPalette = ChartPalette.For(RootGrid, settings.ChartColorOverrides);
+
+        foreach (var row in chartColorRows)
+        {
+            var isSet = settings.ChartColorOverrides.ContainsKey(row.Key);
+            // An OVERRIDE is drawn exactly as picked, so the palette is authoritative for it. An
+            // automatic colour is not: the charts nudge whichever of two collided categories
+            // claimed the shared accent second, and that ordering is not reproducible here. Prefer
+            // the hex the graphs window recorded as drawn, and fall back to the un-nudged base
+            // only for a model this install has never plotted.
+            var color = !isSet
+                && drawnColors.TryGetValue(row.Key, out var drawn)
+                && ChartPalette.TryParseHex(drawn, out var recorded)
+                    ? recorded
+                    : chartPalette.ForCategory(row.Key);
+            var windowsColor = Windows.UI.Color.FromArgb(0xFF, color.Red, color.Green, color.Blue);
+
+            row.Swatch.Background = new SolidColorBrush(windowsColor);
+            row.HexText.Text = ChartPalette.ToHex(color);
+            // Its own column at the tertiary step rather than two spaces and a word glued onto
+            // the end of the hex string.
+            row.StateText.Text = isSet ? "Custom" : "Auto";
+            row.ResetButton.IsEnabled = isSet;
+
+            // Suppressed: assigning Color raises ColorChanged, which would persist the automatic
+            // colour as an explicit override the moment the page was opened. Restored rather than
+            // cleared - this also runs during the initial load, which is already suppressed.
+            var wasSuppressed = suppressWrites;
+            suppressWrites = true;
+            row.Picker.Color = windowsColor;
+            suppressWrites = wasSuppressed;
+        }
+    }
+
+    private void OnChartColorPicked(string label, Windows.UI.Color color)
+    {
+        if (suppressWrites)
+        {
+            return;
+        }
+
+        var hex = $"#{color.R:X2}{color.G:X2}{color.B:X2}";
+        if (settings.ChartColorOverrides.TryGetValue(label, out var current) &&
+            string.Equals(current, hex, StringComparison.OrdinalIgnoreCase))
+        {
+            pendingChartColor = null;
+            chartColorCommitTimer.Stop();
+            return;
+        }
+
+        pendingChartColor = (label, hex);
+        chartColorCommitTimer.Stop();
+        chartColorCommitTimer.Start();
+    }
+
+    private void CommitPendingChartColor()
+    {
+        chartColorCommitTimer.Stop();
+        if (pendingChartColor is not { } pending)
+        {
+            return;
+        }
+
+        pendingChartColor = null;
+        // The SAVE runs even when the window is already closing - OnClosed calls this precisely so
+        // a pick made inside the debounce window survives, and gating the save on isClosed (which
+        // OnClosed sets first) would make that flush a guaranteed no-op. Only the UI touch-up below
+        // is skipped, because those controls are on their way out.
+        SaveChartColors(map => map[pending.Key] = pending.Hex);
+
+        if (isClosed)
+        {
+            return;
+        }
+
+        // Only the swatch and the reset button move; the rows themselves are untouched so the
+        // open picker flyout survives the save.
+        RefreshChartColorSwatches();
+        ResetAllChartColorsButton.IsEnabled = settings.ChartColorOverrides.Count > 0;
+    }
+
+    private void ResetChartColor(string label)
+    {
+        pendingChartColor = null;
+        chartColorCommitTimer.Stop();
+
+        if (!settings.ChartColorOverrides.ContainsKey(label))
+        {
+            return;
+        }
+
+        SaveChartColors(map => map.Remove(label));
+        RenderChartColors();
+    }
+
+    private void ResetAllChartColors()
+    {
+        pendingChartColor = null;
+        chartColorCommitTimer.Stop();
+
+        if (settings.ChartColorOverrides.Count == 0)
+        {
+            return;
+        }
+
+        SaveChartColors(map => map.Clear());
+        RenderChartColors();
+    }
+
+    /// <summary>
+    /// Applies one edit to the persisted map. The dictionary is copied rather than mutated because
+    /// <see cref="UiSettings"/> is a record whose instances are shared through
+    /// <c>AppTheme.Settings</c>; mutating the live one would change it under every reader without
+    /// raising <c>Changed</c>.
+    /// </summary>
+    private void SaveChartColors(Action<Dictionary<string, string>> edit)
+    {
+        var map = new Dictionary<string, string>(settings.ChartColorOverrides, StringComparer.OrdinalIgnoreCase);
+        edit(map);
+
+        settings = settings with { ChartColorOverrides = map };
+        settings.Save();
+    }
+
+    // ------------------------------------------------------------ usage history
+
+    /// <summary>
+    /// Starts the history import, or cancels the one already running - the button is the same
+    /// control in both states, so there is never a stop control to hunt for.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The whole job runs on a thread pool thread (<see cref="UsageLedgerBackfill.RunAsync"/> is a
+    /// Task.Run over synchronous file I/O), so the UI thread only ever handles the progress reports
+    /// and the final result. <see cref="System.Progress{T}"/> captures this window's dispatcher
+    /// context at construction, which is what marshals those back here.
+    /// </para>
+    /// <para>
+    /// Everything that resumes after an await re-checks <see cref="isClosed"/> before touching a
+    /// control: the window can be closed at any point during a multi-minute run, and a XAML property
+    /// set on a closed window takes the process down.
+    /// </para>
+    /// </remarks>
+    private async void ToggleHistoryImport()
+    {
+        if (importCancellation is { } running)
+        {
+            running.Cancel();
+            ImportHistoryButton.IsEnabled = false;
+            ImportHistoryButton.Content = "Cancelling...";
+            return;
+        }
+
+        var cancellation = new CancellationTokenSource();
+        importCancellation = cancellation;
+        ImportHistoryButton.Content = "Cancel";
+        ImportHistoryProgress.Visibility = Visibility.Visible;
+        ImportHistoryProgress.IsIndeterminate = true;
+        ImportHistoryProgress.Value = 0;
+        ImportHistoryCaption.Text = "Looking for session logs...";
+        SetStatus("Importing usage history. You can keep using the app.");
+
+        UsageLedgerBackfillResult result;
+        try
+        {
+            result = await UsageLedgerBackfill.RunAsync(
+                new Progress<UsageLedgerBackfillProgress>(OnHistoryImportProgress),
+                cancellation.Token);
+        }
+        catch (Exception exception)
+        {
+            // RunAsync answers with a Failed result rather than throwing, so this is the belt to
+            // that braces - an async void handler that throws is an unhandled exception.
+            result = new UsageLedgerBackfillResult(
+                UsageLedgerBackfillOutcome.Failed,
+                0,
+                0,
+                null,
+                null,
+                $"Could not import history: {exception.Message}");
+        }
+        finally
+        {
+            importCancellation = null;
+            cancellation.Dispose();
+        }
+
+        if (isClosed)
+        {
+            return;
+        }
+
+        ImportHistoryButton.IsEnabled = true;
+        ImportHistoryButton.Content = "Import";
+        ImportHistoryProgress.Visibility = Visibility.Collapsed;
+        ImportHistoryProgress.IsIndeterminate = true;
+        ImportHistoryCaption.Text = result.Outcome == UsageLedgerBackfillOutcome.Cancelled
+            ? ImportIdleCaption
+            : result.Message;
+
+        // The result also goes to the one status line every surface in this app ends with, because
+        // that is the line the user is already trained to read - and it is copyable.
+        SetStatus(result.Message, result.Outcome switch
+        {
+            UsageLedgerBackfillOutcome.Failed => StatusLevel.Error,
+            UsageLedgerBackfillOutcome.NothingFound => StatusLevel.Warning,
+            _ => StatusLevel.Info
+        });
+
+        if (result.Outcome == UsageLedgerBackfillOutcome.Imported)
+        {
+            DiagnosticLog.Write(
+                "history import: {0} files, {1} days, {2} to {3}",
+                result.FilesScanned,
+                result.DaysImported,
+                result.FirstDay,
+                result.LastDay);
+        }
+    }
+
+    private void OnHistoryImportProgress(UsageLedgerBackfillProgress progress)
+    {
+        // Posted through the dispatcher, so one can still be in flight when the window closes.
+        if (isClosed)
+        {
+            return;
+        }
+
+        ImportHistoryProgress.IsIndeterminate = progress.FileCount <= 0;
+        ImportHistoryProgress.Value = progress.Fraction;
+        ImportHistoryCaption.Text = progress.FileCount > 0
+            ? $"{progress.Label} {progress.FilesDone:N0} of {progress.FileCount:N0} files."
+            : progress.Label;
+    }
+
+    // ----------------------------------------------------------------- accounts
+
+    /// <summary>Mark hosts on the generated account rows, so a theme flip can re-tint them.</summary>
+    private readonly List<Border> accountMarks = [];
+
+    /// <summary>
+    /// Rebuilds the account list. Each editable account is one ROW inside the accounts card with
+    /// its editor disclosed underneath it - the flyout's progressive-disclosure pattern - so there
+    /// is no separate selected-item form to keep in sync (the WinForms version had a list plus a
+    /// detached editor plus three buttons whose enabled state tracked the selection).
     /// </summary>
     private void RenderAccounts()
     {
         AccountList.Children.Clear();
+        accountMarks.Clear();
 
         // The built-in (PATH-resolved) account is declared in XAML; only the extra ones are
         // generated here, because only they are editable.
         foreach (var entry in codexEntries.Where(entry => !entry.IsDefault))
         {
+            AccountList.Children.Add(new Border { Style = RowStyle("RowSeparatorStyle") });
             AccountList.Children.Add(CreateAccountEditor(entry));
         }
 
-        BuiltInAccountCard.Header = codexEntries.FirstOrDefault(entry => entry.IsDefault)?.Name ?? "Codex";
+        BuiltInAccountName.Text = codexEntries.FirstOrDefault(entry => entry.IsDefault)?.Name ?? "Codex";
     }
 
-    private SettingsExpander CreateAccountEditor(CodexCliEntry entry)
+    private StackPanel CreateAccountEditor(CodexCliEntry entry)
     {
+        var mark = new Border
+        {
+            Width = 16,
+            Height = 16,
+            VerticalAlignment = VerticalAlignment.Center,
+            Child = ProviderGeometry.CreateIcon(UsageProvider.Codex, palette.Glyph)
+        };
+        accountMarks.Add(mark);
+
+        var pathCaption = new TextBlock
+        {
+            Style = RowStyle("SecondaryCaptionStyle"),
+            Text = entry.BinaryPath ?? string.Empty,
+            MaxLines = 1,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        ToolTipService.SetToolTip(pathCaption, entry.BinaryPath ?? string.Empty);
+
+        var identity = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+        identity.Children.Add(new TextBlock { Text = entry.Name, MaxLines = 1, TextTrimming = TextTrimming.CharacterEllipsis });
+        identity.Children.Add(pathCaption);
+
         var nameBox = new TextBox
         {
             Header = "Display name",
@@ -443,9 +1071,8 @@ public sealed partial class SettingsWindow : Window
         var pathGrid = new Grid { ColumnSpacing = 8 };
         pathGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         pathGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        pathGrid.Children.Add(pathBox);
-        Grid.SetColumn(browse, 1);
-        pathGrid.Children.Add(browse);
+        AddAt(pathGrid, pathBox, 0);
+        AddAt(pathGrid, browse, 1);
 
         var save = new Button
         {
@@ -461,25 +1088,43 @@ public sealed partial class SettingsWindow : Window
         buttons.Children.Add(save);
         buttons.Children.Add(remove);
 
-        var body = new StackPanel { Spacing = 10 };
-        body.Children.Add(nameBox);
-        body.Children.Add(pathGrid);
-        body.Children.Add(buttons);
-
-        var expander = new SettingsExpander
+        var editor = new StackPanel
         {
-            Header = entry.Name,
-            Description = entry.BinaryPath ?? string.Empty,
-            HeaderIcon = new FontIcon { Glyph = "\uE77B" }
+            Padding = new Thickness(12, 0, 12, 12),
+            Spacing = 10,
+            Visibility = Visibility.Collapsed
         };
-        expander.Items.Add(new SettingsCard
-        {
-            ContentAlignment = ContentAlignment.Vertical,
-            HorizontalContentAlignment = HorizontalAlignment.Stretch,
-            Content = body
-        });
+        editor.Children.Add(nameBox);
+        editor.Children.Add(pathGrid);
+        editor.Children.Add(buttons);
 
-        return expander;
+        var edit = new Button { Content = "Edit", VerticalAlignment = VerticalAlignment.Center };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(edit, $"Edit {entry.Name}");
+        edit.Click += (_, _) =>
+        {
+            var opening = editor.Visibility != Visibility.Visible;
+            editor.Visibility = Shown(opening);
+            edit.Content = opening ? "Close" : "Edit";
+        };
+
+        var row = new Grid { Style = RowStyle("SettingRowStyle") };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        AddAt(row, mark, 0);
+        AddAt(row, identity, 1);
+        AddAt(row, edit, 2);
+
+        var block = new StackPanel();
+        block.Children.Add(row);
+        block.Children.Add(editor);
+        return block;
+    }
+
+    private void ShowAddAccountPanel(bool visible)
+    {
+        AddAccountPanel.Visibility = Shown(visible);
+        AddAccountToggle.Content = visible ? "Close" : "Add";
     }
 
     /// <summary>
@@ -513,7 +1158,7 @@ public sealed partial class SettingsWindow : Window
         catch (Exception ex)
         {
             DiagnosticLog.Write("file picker failed: {0}", ex);
-            ShowAccountsMessage($"Could not open the file picker: {ex.Message}", InfoBarSeverity.Error);
+            SetStatus($"Could not open the file picker: {ex.Message}", StatusLevel.Error);
             return null;
         }
     }
@@ -535,8 +1180,8 @@ public sealed partial class SettingsWindow : Window
 
         AddNameBox.Text = string.Empty;
         AddPathBox.Text = string.Empty;
-        AddAccountExpander.IsExpanded = false;
-        ShowAccountsMessage($"Added “{name}”.", InfoBarSeverity.Success);
+        ShowAddAccountPanel(false);
+        SetStatus($"Added “{name}”.");
     }
 
     private void SaveCodexCli(CodexCliEntry entry, string name, string path)
@@ -556,14 +1201,14 @@ public sealed partial class SettingsWindow : Window
         var resolvedName = string.IsNullOrWhiteSpace(name) ? entry.Name : name.Trim();
         codexEntries[index] = entry with { Name = resolvedName, BinaryPath = path };
         SaveCodexCliEntries();
-        ShowAccountsMessage($"Saved “{resolvedName}”.", InfoBarSeverity.Success);
+        SetStatus($"Saved “{resolvedName}”.");
     }
 
     private void RemoveCodexCli(CodexCliEntry entry)
     {
         codexEntries.RemoveAll(candidate => candidate.Id == entry.Id);
         SaveCodexCliEntries();
-        ShowAccountsMessage($"Removed “{entry.Name}”.", InfoBarSeverity.Informational);
+        SetStatus($"Removed “{entry.Name}”.");
     }
 
     private bool ValidateCodexPath(string path)
@@ -573,32 +1218,25 @@ public sealed partial class SettingsWindow : Window
             return true;
         }
 
-        ShowAccountsMessage(
+        SetStatus(
             string.IsNullOrWhiteSpace(path)
                 ? "Enter the path to an existing Codex CLI binary or wrapper script."
                 : $"Not found: {path}",
-            InfoBarSeverity.Warning);
+            StatusLevel.Warning);
         return false;
     }
 
     /// <summary>
     /// Writes the account list and tells the refresh service. <c>ReloadCodexEntries</c> keeps
     /// the cached usage of accounts whose binary did not move and drops the state of accounts
-    /// that disappeared, then refreshes - so the flyout's tab strip and numbers follow this
-    /// window immediately.
+    /// that disappeared, then refreshes - so the flyout's cards and numbers follow this window
+    /// immediately.
     /// </summary>
     private void SaveCodexCliEntries()
     {
         CodexCliSettings.SaveAdditional(codexEntries);
         service.ReloadCodexEntries();
         RenderAccounts();
-    }
-
-    private void ShowAccountsMessage(string message, InfoBarSeverity severity)
-    {
-        AccountsInfoBar.Severity = severity;
-        AccountsInfoBar.Message = message;
-        AccountsInfoBar.IsOpen = true;
     }
 
     // ------------------------------------------------------------------- cursor
@@ -608,9 +1246,9 @@ public sealed partial class SettingsWindow : Window
         var normalized = CursorUsageReader.NormalizeCookieHeader(CursorCookieBox.Password);
         if (string.IsNullOrWhiteSpace(normalized))
         {
-            ShowCursorMessage(
+            SetStatus(
                 "Paste a Cookie header from a cursor.com request, or use Clear to remove the saved one.",
-                InfoBarSeverity.Warning);
+                StatusLevel.Warning);
             return;
         }
 
@@ -618,7 +1256,7 @@ public sealed partial class SettingsWindow : Window
         CursorCookieBox.Password = normalized;
         RenderCursorSavedState();
         service.Refresh();
-        ShowCursorMessage("Cookie header saved. Cursor usage will refresh.", InfoBarSeverity.Success);
+        SetStatus("Cookie header saved. Cursor usage will refresh.");
     }
 
     private void ClearCursorCookieHeader()
@@ -627,7 +1265,7 @@ public sealed partial class SettingsWindow : Window
         CursorCookieBox.Password = string.Empty;
         RenderCursorSavedState();
         service.Refresh();
-        ShowCursorMessage("Cookie header cleared.", InfoBarSeverity.Informational);
+        SetStatus("Cookie header cleared.");
     }
 
     /// <summary>
@@ -642,10 +1280,18 @@ public sealed partial class SettingsWindow : Window
             : $"A cookie header is saved ({stored.Length} characters).";
     }
 
-    private void ShowCursorMessage(string message, InfoBarSeverity severity)
+    // -------------------------------------------------------------------- glue
+
+    /// <summary>
+    /// A style out of this window's own resources. Reading a STYLE from a resource dictionary is
+    /// safe where reading a BRUSH is not: a style's setters re-resolve their {ThemeResource}
+    /// per element against ActualTheme, while a brush is captured once against the app theme.
+    /// </summary>
+    private Style RowStyle(string key) => (Style)RootGrid.Resources[key];
+
+    private static void AddAt(Grid grid, FrameworkElement child, int column)
     {
-        CursorInfoBar.Severity = severity;
-        CursorInfoBar.Message = message;
-        CursorInfoBar.IsOpen = true;
+        Grid.SetColumn(child, column);
+        grid.Children.Add(child);
     }
 }

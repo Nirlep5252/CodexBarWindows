@@ -177,6 +177,40 @@ public sealed class UsageRefreshService : IDisposable
     public bool IsPolling => timerRunning;
 
     /// <summary>
+    /// Abandons the refresh that is currently running, but only once NOTHING is showing usage.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The counterpart to <see cref="SetWindowOpen"/> for work already in flight. Closing the
+    /// graphs window stops the next scan from being scheduled, but the one it started keeps
+    /// running - and the 30-day session-log scan is by far the most expensive thing this app ever
+    /// does, so leaving it grinding for a window that no longer exists is exactly the idle cost
+    /// the visibility gate exists to prevent.
+    /// </para>
+    /// <para>
+    /// The open-window check is what makes this safe to call from any window's teardown: with the
+    /// flyout still up this is a no-op, so closing the graphs window can never yank the numbers
+    /// out from under it.
+    /// </para>
+    /// <para>
+    /// It cancels what is CANCELLABLE - the provider HTTP calls and the Codex app-server read all
+    /// take the token, and anything not yet started is dropped. A scan already inside
+    /// <c>CodexUsageInsightsReader.ReadLatest</c> runs to completion (it is synchronous file
+    /// parsing with no token to check); the cancelled token still ensures its result is discarded
+    /// rather than published, through <c>PostIfCurrent</c>.
+    /// </para>
+    /// </remarks>
+    public void CancelRefreshIfUnwatched()
+    {
+        if (disposed || openWindows.Count > 0)
+        {
+            return;
+        }
+
+        refreshCancellation?.Cancel();
+    }
+
+    /// <summary>
     /// A user-initiated refresh (button or F5). Returns false when it was swallowed - either a
     /// refresh is already running or the debounce window has not elapsed - so the caller can
     /// leave the UI alone rather than flashing a loading state that never resolves.

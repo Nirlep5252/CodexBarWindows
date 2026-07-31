@@ -2,271 +2,736 @@
 <Window
     x:Class="CodexBar.WinUI.SettingsWindow"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    xmlns:tk="using:CommunityToolkit.WinUI.Controls">
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
 
     <!--
-      The WinForms SettingsForm painted every card, expander, toggle, slider, combo box and
-      list row by hand (FluentControls.cs). Every one of those is a stock control here:
-      NavigationView for the rail, the Windows Community Toolkit SettingsCard / SettingsExpander
-      for the rows, and ToggleSwitch / ComboBox / Slider / TextBox for the values. Nothing in
-      this file draws anything.
+      The WinForms SettingsForm painted every card, expander, toggle, slider, combo box and list
+      row by hand (FluentControls.cs). Nothing in this file draws anything either - but it no
+      longer borrows the Windows Community Toolkit's SettingsCard/SettingsExpander for the rows.
+
+      Why they went: a SettingsCard is a ~68 DIP tall card with its own fill, stroke and radius,
+      so five toggles became five separate floating cards in a ladder, each one taller than the
+      whole four-line flyout card it is meant to belong to, and a settings surface built out of
+      them shares nothing with the other two windows but the backdrop. The rows here are the
+      FLYOUT's anatomy instead: one CornerRadius=8 card per GROUP, rows stacked inside it and
+      divided by 1px separators, 12,8,12,8 padding per row, one line per fact with the long form
+      on a caption underneath only where it earns it. Same 16,12,16,12 window padding, same
+      RowSpacing=10, same caption-scale muted vocabulary, and the SAME single status line at the
+      bottom that the flyout and the graphs window end with - which is where the four InfoBars
+      went. An InfoBar reflowed the page under the pointer every time it opened, and the update
+      result was a banner here but a status sentence in the flyout for the identical message.
+
+      The NavigationView rail went the same way: PaneDisplayMode=Left spent 196 DIP of chrome on
+      four items and was a fake rail anyway (it flipped sibling ScrollViewers rather than driving
+      a Frame). A SelectorBar carries the same four sections in ~36 DIP of height and reads as a
+      selector rather than a tree. Cursor folded into Accounts, where a session credential
+      belongs, which is what got the count down to four.
     -->
     <Grid x:Name="RootGrid" Background="Transparent">
+
+        <Grid.Resources>
+            <!--
+              THE THEMING RULE. Several rows here are built in code (the colour list, the account
+              list), and a brush read out of Application.Current.Resources in C# resolves against
+              the APP theme - which nothing in this app ever sets - and is CAPTURED ONCE. It then
+              renders wrong under a forced theme and never follows a live system flip. Style
+              SETTERS re-resolve per element against ActualTheme, so every themed colour those
+              elements use comes from a style declared here. The only code-assigned colours are
+              the chart swatches (data, not chrome) and the status/provider-mark brushes, which
+              come from a palette rebuilt on ActualThemeChanged for the same reason.
+            -->
+            <Style x:Key="GroupCardStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource CardBackgroundFillColorDefaultBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource CardStrokeColorDefaultBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <!-- 8, not ControlCornerRadius: the flyout's and the graphs window's cards are
+                     explicitly 8 and all three have to be one card family. -->
+                <Setter Property="CornerRadius" Value="8" />
+            </Style>
+
+            <Style x:Key="RowSeparatorStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource CardStrokeColorDefaultBrush}" />
+                <Setter Property="Height" Value="1" />
+            </Style>
+
+            <Style
+                x:Key="SecondaryCaptionStyle"
+                BasedOn="{StaticResource CaptionTextBlockStyle}"
+                TargetType="TextBlock">
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+            </Style>
+
+            <!-- Tertiary is the muted step the status line reverts to, so the colour has to be on
+                 a style: RenderStatus overrides Foreground for a warning and ClearValue()s it
+                 back, and an inline brush would revert to TextBlock's default primary instead. -->
+            <Style
+                x:Key="TertiaryCaptionStyle"
+                BasedOn="{StaticResource CaptionTextBlockStyle}"
+                TargetType="TextBlock">
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorTertiaryBrush}" />
+            </Style>
+
+            <!-- Group name. BodyStrong is what the flyout uses to name a provider inside a card
+                 header; a group name is the same job. TitleTextBlockStyle, which each page used
+                 to re-declare by hand, exists nowhere in this app now. -->
+            <Style
+                x:Key="GroupHeaderStyle"
+                BasedOn="{StaticResource BodyStrongTextBlockStyle}"
+                TargetType="TextBlock">
+                <Setter Property="Margin" Value="2,0,2,0" />
+            </Style>
+
+            <Style
+                x:Key="GroupDescriptionStyle"
+                BasedOn="{StaticResource SecondaryCaptionStyle}"
+                TargetType="TextBlock">
+                <Setter Property="Margin" Value="2,0,2,0" />
+                <Setter Property="TextWrapping" Value="Wrap" />
+            </Style>
+
+            <!-- One row. 12,8,12,8 is the flyout's card-header padding; a plain toggle row lands
+                 at ~40 DIP against the 68 a SettingsCard reserves whether it has a description
+                 or not. -->
+            <Style x:Key="SettingRowStyle" TargetType="Grid">
+                <Setter Property="Padding" Value="12,8,12,8" />
+                <Setter Property="ColumnSpacing" Value="12" />
+                <Setter Property="MinHeight" Value="40" />
+            </Style>
+
+            <!-- The chart swatches are painted with a data colour in code; only the stroke is
+                 themed. A stroke, not a bare fill: a colour close to the card background would
+                 otherwise read as an empty hole in one theme or the other. -->
+            <Style x:Key="ChartSwatchStyle" TargetType="Border">
+                <Setter Property="BorderBrush" Value="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="CornerRadius" Value="4" />
+                <Setter Property="Width" Value="20" />
+                <Setter Property="Height" Value="20" />
+            </Style>
+
+            <Style
+                x:Key="ChartHexStyle"
+                BasedOn="{StaticResource CaptionTextBlockStyle}"
+                TargetType="TextBlock">
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+                <Setter Property="FontFamily" Value="Consolas, Cascadia Mono, Segoe UI" />
+                <Setter Property="MinWidth" Value="62" />
+                <Setter Property="TextAlignment" Value="Right" />
+                <Setter Property="VerticalAlignment" Value="Center" />
+            </Style>
+
+            <!-- "Auto" vs an override used to be two spaces and a word glued onto the hex string.
+                 It is its own column now, at the tertiary step, so the row rhythm survives it. -->
+            <Style
+                x:Key="ChartStateStyle"
+                BasedOn="{StaticResource TertiaryCaptionStyle}"
+                TargetType="TextBlock">
+                <Setter Property="MinWidth" Value="40" />
+                <Setter Property="TextAlignment" Value="Right" />
+                <Setter Property="VerticalAlignment" Value="Center" />
+            </Style>
+        </Grid.Resources>
+
         <Border x:Name="TintLayer" />
 
-        <NavigationView
-            x:Name="Nav"
-            Background="Transparent"
-            IsBackButtonVisible="Collapsed"
-            IsPaneToggleButtonVisible="False"
-            IsSettingsVisible="False"
-            OpenPaneLength="196"
-            PaneDisplayMode="Left"
-            SelectionChanged="OnNavSelectionChanged">
+        <Grid Padding="16,12,16,12" RowSpacing="10">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
 
-            <NavigationView.MenuItems>
-                <NavigationViewItem Content="General" Tag="general">
-                    <NavigationViewItem.Icon>
-                        <FontIcon Glyph="&#xE770;" />
-                    </NavigationViewItem.Icon>
-                </NavigationViewItem>
-                <NavigationViewItem Content="Appearance" Tag="appearance">
-                    <NavigationViewItem.Icon>
-                        <FontIcon Glyph="&#xE790;" />
-                    </NavigationViewItem.Icon>
-                </NavigationViewItem>
-                <NavigationViewItem Content="Codex accounts" Tag="accounts">
-                    <NavigationViewItem.Icon>
-                        <FontIcon Glyph="&#xE716;" />
-                    </NavigationViewItem.Icon>
-                </NavigationViewItem>
-                <NavigationViewItem Content="Cursor" Tag="cursor">
-                    <NavigationViewItem.Icon>
-                        <FontIcon Glyph="&#xE774;" />
-                    </NavigationViewItem.Icon>
-                </NavigationViewItem>
-            </NavigationView.MenuItems>
+            <!-- ============================================================ header -->
+            <TextBlock
+                Grid.Row="0"
+                MaxLines="1"
+                Style="{StaticResource SubtitleTextBlockStyle}"
+                Text="Settings"
+                TextTrimming="CharacterEllipsis" />
 
-            <Grid>
+            <!-- The rail's replacement. Horizontally scrollable so the four sections survive the
+                 minimum window width without the selector wrapping into a second line. -->
+            <ScrollViewer
+                Grid.Row="1"
+                HorizontalScrollBarVisibility="Auto"
+                HorizontalScrollMode="Auto"
+                VerticalScrollBarVisibility="Disabled"
+                VerticalScrollMode="Disabled">
+                <SelectorBar x:Name="SectionBar" SelectionChanged="OnSectionChanged">
+                    <SelectorBarItem Tag="general" Text="General">
+                        <SelectorBarItem.Icon>
+                            <FontIcon Glyph="&#xE770;" />
+                        </SelectorBarItem.Icon>
+                    </SelectorBarItem>
+                    <SelectorBarItem Tag="appearance" Text="Appearance">
+                        <SelectorBarItem.Icon>
+                            <FontIcon Glyph="&#xE790;" />
+                        </SelectorBarItem.Icon>
+                    </SelectorBarItem>
+                    <SelectorBarItem Tag="graphs" Text="Graphs">
+                        <SelectorBarItem.Icon>
+                            <FontIcon Glyph="&#xE9D2;" />
+                        </SelectorBarItem.Icon>
+                    </SelectorBarItem>
+                    <SelectorBarItem Tag="accounts" Text="Accounts">
+                        <SelectorBarItem.Icon>
+                            <FontIcon Glyph="&#xE77B;" />
+                        </SelectorBarItem.Icon>
+                    </SelectorBarItem>
+                </SelectorBar>
+            </ScrollViewer>
 
-                <!-- ======================================================= General -->
-                <ScrollViewer x:Name="GeneralPage" Padding="28,0,28,28">
-                    <StackPanel MaxWidth="720" Spacing="4">
-                        <TextBlock
-                            Margin="0,18,0,12"
-                            Style="{StaticResource TitleTextBlockStyle}"
-                            Text="General" />
+            <!--
+              The pages. These are still sibling ScrollViewers whose Visibility is flipped, which
+              is what the fake rail was doing - but a Collapsed element is not measured or
+              arranged in WinUI, so the cost is one retained tree per page and every page keeps
+              its scroll offset and its half-filled text boxes when you come back to it. A Frame
+              would throw both away on every switch.
+            -->
+            <Grid Grid.Row="2">
 
-                        <tk:SettingsCard
-                            Description="Launch CodexBar automatically when you sign in"
-                            Header="Start with Windows">
-                            <tk:SettingsCard.HeaderIcon>
-                                <FontIcon Glyph="&#xE7E8;" />
-                            </tk:SettingsCard.HeaderIcon>
-                            <ToggleSwitch x:Name="StartupToggle" AutomationProperties.Name="Start with Windows" />
-                        </tk:SettingsCard>
+                <!-- =================================================== General -->
+                <ScrollViewer x:Name="GeneralPage" Padding="0,0,4,0">
+                    <StackPanel MaxWidth="720" Spacing="16">
 
-                        <tk:SettingsCard x:Name="VersionCard" Header="Version">
-                            <tk:SettingsCard.HeaderIcon>
-                                <FontIcon Glyph="&#xE946;" />
-                            </tk:SettingsCard.HeaderIcon>
-                            <Button x:Name="CheckUpdatesButton" Content="Check for updates" />
-                        </tk:SettingsCard>
+                        <StackPanel Spacing="6">
+                            <TextBlock Style="{StaticResource GroupHeaderStyle}" Text="Application" />
+                            <Border Style="{StaticResource GroupCardStyle}">
+                                <StackPanel>
+                                    <Grid Style="{StaticResource SettingRowStyle}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <FontIcon
+                                            FontSize="16"
+                                            Glyph="&#xE7E8;"
+                                            VerticalAlignment="Center" />
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock Text="Start with Windows" />
+                                            <TextBlock
+                                                Style="{StaticResource SecondaryCaptionStyle}"
+                                                Text="Launch CodexBar automatically when you sign in"
+                                                TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <ToggleSwitch
+                                            x:Name="StartupToggle"
+                                            Grid.Column="2"
+                                            MinWidth="0"
+                                            AutomationProperties.Name="Start with Windows"
+                                            OffContent=""
+                                            OnContent=""
+                                            VerticalAlignment="Center" />
+                                    </Grid>
 
-                        <InfoBar
-                            x:Name="UpdateInfoBar"
-                            Margin="0,4,0,0"
-                            IsClosable="True"
-                            IsOpen="False"
-                            Severity="Informational" />
+                                    <Border Style="{StaticResource RowSeparatorStyle}" />
 
-                        <TextBlock
-                            Margin="2,20,0,6"
-                            Style="{StaticResource BodyStrongTextBlockStyle}"
-                            Text="Tools" />
-                        <TextBlock
-                            Margin="2,0,0,8"
-                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                            Style="{StaticResource CaptionTextBlockStyle}"
-                            Text="A tool you turn off loses its tab in the flyout and is never polled." />
+                                    <Grid Style="{StaticResource SettingRowStyle}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <FontIcon
+                                            FontSize="16"
+                                            Glyph="&#xE946;"
+                                            VerticalAlignment="Center" />
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock Text="Version" />
+                                            <TextBlock
+                                                x:Name="VersionText"
+                                                Style="{StaticResource SecondaryCaptionStyle}"
+                                                TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <Button
+                                            x:Name="CheckUpdatesButton"
+                                            Grid.Column="2"
+                                            Content="Check for updates"
+                                            VerticalAlignment="Center" />
+                                    </Grid>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
 
-                        <tk:SettingsCard
-                            x:Name="CodexEnabledCard"
-                            Description="Show Codex usage and poll the Codex CLI"
-                            Header="Codex">
-                            <tk:SettingsCard.HeaderIcon>
-                                <FontIcon Glyph="&#xE90F;" />
-                            </tk:SettingsCard.HeaderIcon>
-                            <ToggleSwitch x:Name="CodexEnabledToggle" AutomationProperties.Name="Codex enabled" />
-                        </tk:SettingsCard>
+                        <StackPanel Spacing="6">
+                            <TextBlock Style="{StaticResource GroupHeaderStyle}" Text="Tools" />
+                            <TextBlock
+                                Style="{StaticResource GroupDescriptionStyle}"
+                                Text="A tool you turn off loses its card in the flyout and is never polled." />
+                            <Border Style="{StaticResource GroupCardStyle}">
+                                <StackPanel>
+                                    <!-- The provider MARKS, not three copies of the same generic
+                                         glyph: this is the one page in the app where provider
+                                         identity is configured, and the flyout draws the real
+                                         marks two windows away. They are code-built (see
+                                         RenderProviderMarks) because a Path geometry cannot be
+                                         declared in this XAML - the compiler refuses the
+                                         abbreviated syntax (WMC0055). -->
+                                    <Grid Style="{StaticResource SettingRowStyle}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <Border
+                                            x:Name="CodexMark"
+                                            Width="16"
+                                            Height="16"
+                                            VerticalAlignment="Center" />
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock Text="Codex" />
+                                            <TextBlock
+                                                Style="{StaticResource SecondaryCaptionStyle}"
+                                                Text="Show Codex usage and poll the Codex CLI"
+                                                TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <ToggleSwitch
+                                            x:Name="CodexEnabledToggle"
+                                            Grid.Column="2"
+                                            MinWidth="0"
+                                            AutomationProperties.Name="Codex enabled"
+                                            OffContent=""
+                                            OnContent=""
+                                            VerticalAlignment="Center" />
+                                    </Grid>
 
-                        <tk:SettingsCard
-                            x:Name="ClaudeEnabledCard"
-                            Description="Show Claude usage and read Claude Code session data"
-                            Header="Claude">
-                            <tk:SettingsCard.HeaderIcon>
-                                <FontIcon Glyph="&#xE90F;" />
-                            </tk:SettingsCard.HeaderIcon>
-                            <ToggleSwitch x:Name="ClaudeEnabledToggle" AutomationProperties.Name="Claude enabled" />
-                        </tk:SettingsCard>
+                                    <Border Style="{StaticResource RowSeparatorStyle}" />
 
-                        <tk:SettingsCard
-                            x:Name="CursorEnabledCard"
-                            Description="Show Cursor usage"
-                            Header="Cursor">
-                            <tk:SettingsCard.HeaderIcon>
-                                <FontIcon Glyph="&#xE90F;" />
-                            </tk:SettingsCard.HeaderIcon>
-                            <ToggleSwitch x:Name="CursorEnabledToggle" AutomationProperties.Name="Cursor enabled" />
-                        </tk:SettingsCard>
+                                    <Grid Style="{StaticResource SettingRowStyle}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <Border
+                                            x:Name="ClaudeMark"
+                                            Width="16"
+                                            Height="16"
+                                            VerticalAlignment="Center" />
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock Text="Claude" />
+                                            <TextBlock
+                                                Style="{StaticResource SecondaryCaptionStyle}"
+                                                Text="Show Claude usage and read Claude Code session data"
+                                                TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <ToggleSwitch
+                                            x:Name="ClaudeEnabledToggle"
+                                            Grid.Column="2"
+                                            MinWidth="0"
+                                            AutomationProperties.Name="Claude enabled"
+                                            OffContent=""
+                                            OnContent=""
+                                            VerticalAlignment="Center" />
+                                    </Grid>
 
-                        <InfoBar
-                            x:Name="ToolsInfoBar"
-                            Margin="0,8,0,0"
-                            IsClosable="False"
-                            IsOpen="False"
-                            Message="At least one tool has to stay on, so Codex was turned back on."
-                            Severity="Informational" />
+                                    <Border Style="{StaticResource RowSeparatorStyle}" />
+
+                                    <Grid Style="{StaticResource SettingRowStyle}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <Border
+                                            x:Name="CursorMark"
+                                            Width="16"
+                                            Height="16"
+                                            VerticalAlignment="Center" />
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock Text="Cursor" />
+                                            <TextBlock
+                                                Style="{StaticResource SecondaryCaptionStyle}"
+                                                Text="Show Cursor usage"
+                                                TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <ToggleSwitch
+                                            x:Name="CursorEnabledToggle"
+                                            Grid.Column="2"
+                                            MinWidth="0"
+                                            AutomationProperties.Name="Cursor enabled"
+                                            OffContent=""
+                                            OnContent=""
+                                            VerticalAlignment="Center" />
+                                    </Grid>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
                     </StackPanel>
                 </ScrollViewer>
 
-                <!-- ==================================================== Appearance -->
-                <ScrollViewer x:Name="AppearancePage" Padding="28,0,28,28" Visibility="Collapsed">
-                    <StackPanel MaxWidth="720" Spacing="4">
-                        <TextBlock
-                            Margin="0,18,0,12"
-                            Style="{StaticResource TitleTextBlockStyle}"
-                            Text="Appearance" />
+                <!-- ================================================ Appearance -->
+                <ScrollViewer
+                    x:Name="AppearancePage"
+                    Padding="0,0,4,0"
+                    Visibility="Collapsed">
+                    <StackPanel MaxWidth="720" Spacing="16">
 
-                        <tk:SettingsCard Description="Choose how CodexBar looks" Header="Theme">
-                            <tk:SettingsCard.HeaderIcon>
-                                <FontIcon Glyph="&#xE790;" />
-                            </tk:SettingsCard.HeaderIcon>
-                            <ComboBox x:Name="ThemeCombo" MinWidth="180" AutomationProperties.Name="Theme">
-                                <ComboBoxItem Content="System default" />
-                                <ComboBoxItem Content="Light" />
-                                <ComboBoxItem Content="Dark" />
-                            </ComboBox>
-                        </tk:SettingsCard>
-
-                        <!-- Expander, not a card: the tint slider only makes sense next to the
-                             material it tints, and it is the one control here that is disabled
-                             by another control's value. -->
-                        <tk:SettingsExpander
-                            x:Name="MaterialExpander"
-                            Description="Select the visual material used behind the flyout"
-                            Header="Material"
-                            IsExpanded="True">
-                            <tk:SettingsExpander.HeaderIcon>
-                                <FontIcon Glyph="&#xE771;" />
-                            </tk:SettingsExpander.HeaderIcon>
-                            <ComboBox x:Name="MaterialCombo" MinWidth="180" AutomationProperties.Name="Material">
-                                <ComboBoxItem Content="Acrylic (default)" />
-                                <ComboBoxItem Content="Mica" />
-                                <ComboBoxItem Content="Mica Alt" />
-                                <ComboBoxItem Content="Solid" />
-                            </ComboBox>
-
-                            <tk:SettingsExpander.Items>
-                                <tk:SettingsCard x:Name="OpacityRow" Description="Background tint strength" Header="Opacity">
-                                    <StackPanel
-                                        Orientation="Horizontal"
-                                        Spacing="12"
+                        <StackPanel Spacing="6">
+                            <TextBlock Style="{StaticResource GroupHeaderStyle}" Text="Theme" />
+                            <Border Style="{StaticResource GroupCardStyle}">
+                                <Grid Style="{StaticResource SettingRowStyle}">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <FontIcon
+                                        FontSize="16"
+                                        Glyph="&#xE790;"
+                                        VerticalAlignment="Center" />
+                                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                        <TextBlock Text="App theme" />
+                                        <TextBlock
+                                            Style="{StaticResource SecondaryCaptionStyle}"
+                                            Text="Follows Windows unless you force one"
+                                            TextWrapping="Wrap" />
+                                    </StackPanel>
+                                    <ComboBox
+                                        x:Name="ThemeCombo"
+                                        Grid.Column="2"
+                                        MinWidth="160"
+                                        AutomationProperties.Name="Theme"
                                         VerticalAlignment="Center">
-                                        <Slider
-                                            x:Name="OpacitySlider"
-                                            Width="220"
-                                            AutomationProperties.Name="Tint opacity"
-                                            Maximum="100"
-                                            Minimum="0"
-                                            StepFrequency="1"
+                                        <ComboBoxItem Content="System default" />
+                                        <ComboBoxItem Content="Light" />
+                                        <ComboBoxItem Content="Dark" />
+                                    </ComboBox>
+                                </Grid>
+                            </Border>
+                        </StackPanel>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Style="{StaticResource GroupHeaderStyle}" Text="Backdrop" />
+                            <!-- Material and its tint are one group rather than an expander with
+                                 the slider hidden inside it: the slider is the only control in
+                                 this window whose enabled state depends on another control's
+                                 value, so it has to be visible next to the thing that disables
+                                 it. -->
+                            <Border Style="{StaticResource GroupCardStyle}">
+                                <StackPanel>
+                                    <Grid Style="{StaticResource SettingRowStyle}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <FontIcon
+                                            FontSize="16"
+                                            Glyph="&#xE771;"
+                                            VerticalAlignment="Center" />
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock Text="Material" />
+                                            <TextBlock
+                                                Style="{StaticResource SecondaryCaptionStyle}"
+                                                Text="The surface drawn behind every window"
+                                                TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <ComboBox
+                                            x:Name="MaterialCombo"
+                                            Grid.Column="2"
+                                            MinWidth="160"
+                                            AutomationProperties.Name="Material"
+                                            VerticalAlignment="Center">
+                                            <ComboBoxItem Content="Acrylic (default)" />
+                                            <ComboBoxItem Content="Mica" />
+                                            <ComboBoxItem Content="Mica Alt" />
+                                            <ComboBoxItem Content="Solid" />
+                                        </ComboBox>
+                                    </Grid>
+
+                                    <Border Style="{StaticResource RowSeparatorStyle}" />
+
+                                    <!-- A ContentControl only so the WHOLE row can be disabled on
+                                         Solid (there is no material to tint): IsEnabled is a
+                                         Control property, and a Grid is not a Control - disabling
+                                         only the slider would leave the label reading as live. -->
+                                    <ContentControl
+                                        x:Name="OpacityRow"
+                                        HorizontalAlignment="Stretch"
+                                        HorizontalContentAlignment="Stretch"
+                                        IsTabStop="False">
+                                    <Grid Style="{StaticResource SettingRowStyle}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <FontIcon
+                                            FontSize="16"
+                                            Glyph="&#xE7E6;"
                                             VerticalAlignment="Center" />
                                         <TextBlock
-                                            x:Name="OpacityValueText"
-                                            MinWidth="34"
-                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                            TextAlignment="Right"
+                                            Grid.Column="1"
+                                            Text="Tint strength"
                                             VerticalAlignment="Center" />
-                                    </StackPanel>
-                                </tk:SettingsCard>
-                            </tk:SettingsExpander.Items>
-                        </tk:SettingsExpander>
+                                        <StackPanel
+                                            Grid.Column="2"
+                                            Orientation="Horizontal"
+                                            Spacing="10"
+                                            VerticalAlignment="Center">
+                                            <Slider
+                                                x:Name="OpacitySlider"
+                                                Width="180"
+                                                AutomationProperties.Name="Tint opacity"
+                                                Maximum="100"
+                                                Minimum="0"
+                                                StepFrequency="1"
+                                                VerticalAlignment="Center" />
+                                            <TextBlock
+                                                x:Name="OpacityValueText"
+                                                MinWidth="30"
+                                                Style="{StaticResource SecondaryCaptionStyle}"
+                                                TextAlignment="Right"
+                                                VerticalAlignment="Center" />
+                                        </StackPanel>
+                                    </Grid>
+                                    </ContentControl>
 
-                        <!--
-                            The "vibes" appearance is NOT implemented in this shell. The WinForms
-                            app backs it with Source/UI/Fluent/VibeTheme.cs (a custom palette,
-                            gradient meters and celebration animations) wired through six UI files;
-                            none of that has been ported. The toggle is hidden rather than deleted
-                            because the setting is still read (UiSettings.EffectiveMaterial and
-                            ResolveIsDark honour it) and it lives in a registry key SHARED with the
-                            WinForms app — offering it here would advertise a feature that does
-                            nothing while silently restyling the other shell. Restore the card once
-                            VibeTheme is ported.
-                        -->
-                        <tk:SettingsCard
-                            Description="V3 Code theme, animated meters, and little celebrations."
-                            Header="Turn on the vibes"
-                            Visibility="Collapsed">
-                            <tk:SettingsCard.HeaderIcon>
-                                <FontIcon Glyph="&#xE945;" />
-                            </tk:SettingsCard.HeaderIcon>
-                            <ToggleSwitch x:Name="VibesToggle" AutomationProperties.Name="Vibes" />
-                        </tk:SettingsCard>
+                                    <!--
+                                        The "vibes" appearance is NOT implemented in this shell.
+                                        The WinForms app backs it with Source/UI/Fluent/VibeTheme.cs
+                                        (a custom palette, gradient meters and celebration
+                                        animations) wired through six UI files; none of that has
+                                        been ported. The row is hidden rather than deleted because
+                                        the setting is still READ (UiSettings.EffectiveMaterial and
+                                        ResolveIsDark honour it) and it lives in a registry key
+                                        SHARED with the WinForms app - offering it here would
+                                        advertise a feature that does nothing while silently
+                                        restyling the other shell. Restore the row once VibeTheme
+                                        is ported.
+                                    -->
+                                    <Grid Style="{StaticResource SettingRowStyle}" Visibility="Collapsed">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="Turn on the vibes" VerticalAlignment="Center" />
+                                        <ToggleSwitch
+                                            x:Name="VibesToggle"
+                                            Grid.Column="1"
+                                            MinWidth="0"
+                                            AutomationProperties.Name="Vibes"
+                                            OffContent=""
+                                            OnContent=""
+                                            VerticalAlignment="Center" />
+                                    </Grid>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
                     </StackPanel>
                 </ScrollViewer>
 
-                <!-- ================================================ Codex accounts -->
-                <ScrollViewer x:Name="AccountsPage" Padding="28,0,28,28" Visibility="Collapsed">
-                    <StackPanel MaxWidth="720" Spacing="4">
-                        <TextBlock
-                            Margin="0,18,0,4"
-                            Style="{StaticResource TitleTextBlockStyle}"
-                            Text="Codex accounts" />
-                        <TextBlock
-                            Margin="2,0,0,12"
-                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                            Style="{StaticResource CaptionTextBlockStyle}"
-                            Text="Add another authenticated CLI binary or wrapper script for each extra account. Each one gets its own tab in the flyout."
-                            TextWrapping="Wrap" />
+                <!-- ==================================================== Graphs -->
+                <ScrollViewer
+                    x:Name="GraphsPage"
+                    Padding="0,0,4,0"
+                    Visibility="Collapsed">
+                    <StackPanel MaxWidth="720" Spacing="16">
 
-                        <InfoBar
-                            x:Name="AccountsInfoBar"
-                            Margin="0,0,0,8"
-                            IsClosable="True"
-                            IsOpen="False"
-                            Severity="Warning" />
+                        <!-- ============================================ usage history -->
+                        <!--
+                          On the Graphs page because the history IS what the graphs draw: this is
+                          the only control in the app that changes how far back they can go.
 
-                        <!-- The built-in account is always present and is not editable, so it is
-                             declared here rather than generated - which also keeps its secondary
-                             text on a {ThemeResource} instead of a code-side brush lookup. -->
-                        <tk:SettingsCard
-                            x:Name="BuiltInAccountCard"
-                            Description="Resolved from PATH. This is the account the Codex CLI itself is signed in to."
-                            Header="Codex">
-                            <tk:SettingsCard.HeaderIcon>
-                                <FontIcon Glyph="&#xE77B;" />
-                            </tk:SettingsCard.HeaderIcon>
+                          It is a BUTTON and nothing else. The import reads every session log on
+                          disk - gigabytes, minutes of it - and running that at startup, on a
+                          timer, or as a side effect of opening a window would destroy the app's
+                          zero-idle-cost property. Nothing here runs unless it is clicked.
+                        -->
+                        <StackPanel Spacing="6">
+                            <TextBlock Style="{StaticResource GroupHeaderStyle}" Text="Usage history" />
                             <TextBlock
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                Text="Built in" />
-                        </tk:SettingsCard>
+                                Style="{StaticResource GroupDescriptionStyle}"
+                                Text="The graphs record what they see, and they only ever look at the last 30 days. Import reads every Codex and Claude session log still on this PC and recovers the months before that - tokens only, so the cost is always recalculated at today's published rates." />
+                            <Border Style="{StaticResource GroupCardStyle}">
+                                <StackPanel>
+                                    <Grid Style="{StaticResource SettingRowStyle}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <FontIcon
+                                            FontSize="16"
+                                            Glyph="&#xE81C;"
+                                            VerticalAlignment="Center" />
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock Text="Import history" />
+                                            <!-- One line, rewritten in place: idle hint, then the
+                                                 live label, then the result. A second line that
+                                                 appears only while running would reflow the card
+                                                 under the pointer, which is what the InfoBars this
+                                                 window dropped used to do. -->
+                                            <TextBlock
+                                                x:Name="ImportHistoryCaption"
+                                                Style="{StaticResource SecondaryCaptionStyle}"
+                                                Text="Reads every session log once. Expect a few minutes."
+                                                TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <Button
+                                            x:Name="ImportHistoryButton"
+                                            Grid.Column="2"
+                                            Content="Import"
+                                            VerticalAlignment="Center" />
+                                    </Grid>
 
-                        <!-- The extra accounts are built in code (RenderAccounts): one
-                             SettingsExpander each, with its editor inline in the expanded body. -->
-                        <StackPanel x:Name="AccountList" Spacing="4" />
+                                    <!-- Determinate as soon as the file count is known, which it is
+                                         within a second: an indeterminate bar for a two-minute job
+                                         says nothing about whether it is halfway or stuck. -->
+                                    <ProgressBar
+                                        x:Name="ImportHistoryProgress"
+                                        Margin="12,0,12,12"
+                                        AutomationProperties.Name="Import progress"
+                                        IsIndeterminate="True"
+                                        Maximum="1"
+                                        Visibility="Collapsed" />
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
 
-                        <tk:SettingsExpander
-                            x:Name="AddAccountExpander"
-                            Margin="0,12,0,0"
-                            Description="Point CodexBar at a second signed-in codex.exe, codex.cmd or wrapper script"
-                            Header="Add an account">
-                            <tk:SettingsExpander.HeaderIcon>
-                                <FontIcon Glyph="&#xE710;" />
-                            </tk:SettingsExpander.HeaderIcon>
-                            <tk:SettingsExpander.Items>
-                                <tk:SettingsCard HorizontalContentAlignment="Stretch" ContentAlignment="Vertical">
-                                    <StackPanel Spacing="10">
+                        <StackPanel Spacing="6">
+                            <!-- The group header carries the action, so "Reset all" is not a
+                                 button hanging off the bottom of a title by alignment hack. -->
+                            <Grid ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock
+                                    Style="{StaticResource GroupHeaderStyle}"
+                                    Text="Model colours"
+                                    VerticalAlignment="Center" />
+                                <Button
+                                    x:Name="ResetAllChartColorsButton"
+                                    Grid.Column="1"
+                                    Content="Reset all"
+                                    Style="{StaticResource SubtleButtonStyle}"
+                                    VerticalAlignment="Center" />
+                            </Grid>
+                            <!-- ONE explanation, at the top. The old page said the same thing in
+                                 an intro caption and again in a footer caption below the list. -->
+                            <TextBlock
+                                Style="{StaticResource GroupDescriptionStyle}"
+                                Text="Pick the colour each model is drawn in on the usage graphs. Anything you do not set keeps the automatic palette, which follows your Windows accent and the current theme." />
+
+                            <!-- One row per model, built in code (RenderChartColors): the list is
+                                 whatever the graphs window has actually plotted, so it cannot be
+                                 declared here. -->
+                            <Border x:Name="ChartColorCard" Style="{StaticResource GroupCardStyle}">
+                                <StackPanel x:Name="ChartColorList" />
+                            </Border>
+
+                            <!-- A deliberate empty state rather than a card pretending to be a
+                                 row: same card, centred, with the glyph of the window that fills
+                                 it. -->
+                            <Border
+                                x:Name="ChartColorEmptyCard"
+                                Padding="16,24,16,24"
+                                Style="{StaticResource GroupCardStyle}"
+                                Visibility="Collapsed">
+                                <StackPanel HorizontalAlignment="Center" Spacing="6">
+                                    <FontIcon
+                                        FontSize="20"
+                                        Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                        Glyph="&#xE9D2;"
+                                        HorizontalAlignment="Center" />
+                                    <TextBlock
+                                        HorizontalAlignment="Center"
+                                        Style="{StaticResource SecondaryCaptionStyle}"
+                                        Text="No models seen yet" />
+                                    <TextBlock
+                                        HorizontalAlignment="Center"
+                                        Style="{StaticResource TertiaryCaptionStyle}"
+                                        Text="Open the usage graphs once to populate this list."
+                                        TextAlignment="Center"
+                                        TextWrapping="Wrap" />
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </StackPanel>
+                </ScrollViewer>
+
+                <!-- ================================================== Accounts -->
+                <ScrollViewer
+                    x:Name="AccountsPage"
+                    Padding="0,0,4,0"
+                    Visibility="Collapsed">
+                    <StackPanel MaxWidth="720" Spacing="16">
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Style="{StaticResource GroupHeaderStyle}" Text="Codex accounts" />
+                            <TextBlock
+                                Style="{StaticResource GroupDescriptionStyle}"
+                                Text="Add another authenticated CLI binary or wrapper script for each extra account. Each one gets its own card in the flyout." />
+
+                            <Border Style="{StaticResource GroupCardStyle}">
+                                <StackPanel>
+                                    <!-- The built-in account is always present and is not
+                                         editable, so it is declared here rather than generated. -->
+                                    <Grid Style="{StaticResource SettingRowStyle}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <Border
+                                            x:Name="BuiltInAccountMark"
+                                            Width="16"
+                                            Height="16"
+                                            VerticalAlignment="Center" />
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock x:Name="BuiltInAccountName" Text="Codex" />
+                                            <TextBlock
+                                                Style="{StaticResource SecondaryCaptionStyle}"
+                                                Text="Resolved from PATH - the account the Codex CLI itself is signed in to"
+                                                TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <TextBlock
+                                            Grid.Column="2"
+                                            Style="{StaticResource TertiaryCaptionStyle}"
+                                            Text="Built in"
+                                            VerticalAlignment="Center" />
+                                    </Grid>
+
+                                    <!-- The extra accounts are built in code (RenderAccounts):
+                                         each is a row plus an inline editor that the row's Edit
+                                         button discloses, inside this same card. -->
+                                    <StackPanel x:Name="AccountList" />
+
+                                    <Border Style="{StaticResource RowSeparatorStyle}" />
+
+                                    <Grid Style="{StaticResource SettingRowStyle}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <FontIcon
+                                            FontSize="16"
+                                            Glyph="&#xE710;"
+                                            VerticalAlignment="Center" />
+                                        <TextBlock
+                                            Grid.Column="1"
+                                            Text="Add an account"
+                                            VerticalAlignment="Center" />
+                                        <Button
+                                            x:Name="AddAccountToggle"
+                                            Grid.Column="2"
+                                            Content="Add"
+                                            VerticalAlignment="Center" />
+                                    </Grid>
+
+                                    <!-- Progressive disclosure in the row it belongs to, which is
+                                         the flyout's "Use reset" pattern - not a card used as a
+                                         form panel. -->
+                                    <StackPanel
+                                        x:Name="AddAccountPanel"
+                                        Padding="12,0,12,12"
+                                        Spacing="10"
+                                        Visibility="Collapsed">
                                         <TextBox
                                             x:Name="AddNameBox"
                                             AutomationProperties.Name="New account name"
@@ -288,49 +753,49 @@
                                                 Content="Browse"
                                                 VerticalAlignment="Bottom" />
                                         </Grid>
-                                        <Button
-                                            x:Name="AddAccountButton"
-                                            Content="Add account"
-                                            HorizontalAlignment="Left"
-                                            Style="{StaticResource AccentButtonStyle}" />
+                                        <StackPanel Orientation="Horizontal" Spacing="8">
+                                            <Button
+                                                x:Name="AddAccountButton"
+                                                Content="Add account"
+                                                Style="{StaticResource AccentButtonStyle}" />
+                                            <Button x:Name="AddCancelButton" Content="Cancel" />
+                                        </StackPanel>
                                     </StackPanel>
-                                </tk:SettingsCard>
-                            </tk:SettingsExpander.Items>
-                        </tk:SettingsExpander>
-                    </StackPanel>
-                </ScrollViewer>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
 
-                <!-- ======================================================== Cursor -->
-                <ScrollViewer x:Name="CursorPage" Padding="28,0,28,28" Visibility="Collapsed">
-                    <StackPanel MaxWidth="720" Spacing="4">
-                        <TextBlock
-                            Margin="0,18,0,4"
-                            Style="{StaticResource TitleTextBlockStyle}"
-                            Text="Cursor" />
-                        <TextBlock
-                            Margin="2,0,0,12"
-                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                            Style="{StaticResource CaptionTextBlockStyle}"
-                            Text="Paste a Cookie header from any cursor.com request to show Cursor usage. It is stored encrypted for your Windows account (DPAPI)."
-                            TextWrapping="Wrap" />
+                        <StackPanel Spacing="6">
+                            <TextBlock Style="{StaticResource GroupHeaderStyle}" Text="Cursor" />
+                            <TextBlock
+                                Style="{StaticResource GroupDescriptionStyle}"
+                                Text="Paste a Cookie header from any cursor.com request to show Cursor usage. It is stored encrypted for your Windows account (DPAPI)." />
 
-                        <InfoBar
-                            x:Name="CursorInfoBar"
-                            Margin="0,0,0,8"
-                            IsClosable="True"
-                            IsOpen="False"
-                            Severity="Warning" />
+                            <Border Style="{StaticResource GroupCardStyle}">
+                                <StackPanel>
+                                    <Grid Style="{StaticResource SettingRowStyle}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <Border
+                                            x:Name="CursorAccountMark"
+                                            Width="16"
+                                            Height="16"
+                                            VerticalAlignment="Center" />
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock Text="Cookie header" />
+                                            <!-- Says WHETHER a header is stored, never what it
+                                                 is: the value is a live session credential, so
+                                                 only its length is ever shown. -->
+                                            <TextBlock
+                                                x:Name="CursorSavedText"
+                                                Style="{StaticResource SecondaryCaptionStyle}"
+                                                TextWrapping="Wrap" />
+                                        </StackPanel>
+                                    </Grid>
 
-                        <tk:SettingsExpander
-                            x:Name="CursorExpander"
-                            Header="Cookie header"
-                            IsExpanded="True">
-                            <tk:SettingsExpander.HeaderIcon>
-                                <FontIcon Glyph="&#xE72E;" />
-                            </tk:SettingsExpander.HeaderIcon>
-                            <tk:SettingsExpander.Items>
-                                <tk:SettingsCard HorizontalContentAlignment="Stretch" ContentAlignment="Vertical">
-                                    <StackPanel Spacing="10">
+                                    <StackPanel Padding="12,0,12,12" Spacing="10">
                                         <!-- A PasswordBox, not a TextBox: this is a live session
                                              credential, and the WinForms field rendered it in
                                              full on screen. Peek keeps the reveal button so it
@@ -340,10 +805,6 @@
                                             AutomationProperties.Name="Cursor cookie header"
                                             PasswordRevealMode="Peek"
                                             PlaceholderText="Cookie: WorkosCursorSessionToken=..." />
-                                        <TextBlock
-                                            x:Name="CursorSavedText"
-                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                            Style="{StaticResource CaptionTextBlockStyle}" />
                                         <StackPanel Orientation="Horizontal" Spacing="8">
                                             <Button
                                                 x:Name="SaveCursorButton"
@@ -352,13 +813,56 @@
                                             <Button x:Name="ClearCursorButton" Content="Clear" />
                                         </StackPanel>
                                     </StackPanel>
-                                </tk:SettingsCard>
-                            </tk:SettingsExpander.Items>
-                        </tk:SettingsExpander>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
                     </StackPanel>
                 </ScrollViewer>
-
             </Grid>
-        </NavigationView>
+
+            <!-- ======================================================= status line -->
+            <!--
+              The one line every surface in this app ends with, and the four InfoBars' replacement.
+              Each of those was a banner that pushed the whole page down as it opened, and the
+              update-check result in particular was a banner HERE but a status sentence in the
+              flyout for the identical message. Wrapped to three lines, never ellipsised as the
+              primary presentation, full text on the tooltip and on a right-click Copy; the glyph
+              appears only for a warning or an error.
+            -->
+            <Grid
+                Grid.Row="3"
+                ColumnSpacing="6"
+                Padding="2,0,2,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <Grid.ContextFlyout>
+                    <MenuFlyout>
+                        <MenuFlyoutItem
+                            MinWidth="140"
+                            Text="Copy"
+                            Click="OnCopyStatus" />
+                    </MenuFlyout>
+                </Grid.ContextFlyout>
+
+                <FontIcon
+                    x:Name="StatusIcon"
+                    Margin="0,1,0,0"
+                    FontSize="12"
+                    Glyph="&#xE7BA;"
+                    Visibility="Collapsed"
+                    VerticalAlignment="Top" />
+                <TextBlock
+                    x:Name="StatusText"
+                    Grid.Column="1"
+                    MaxLines="3"
+                    IsTextSelectionEnabled="True"
+                    Style="{StaticResource TertiaryCaptionStyle}"
+                    Text="Every change applies immediately."
+                    TextTrimming="CharacterEllipsis"
+                    TextWrapping="Wrap" />
+            </Grid>
+        </Grid>
     </Grid>
 </Window>

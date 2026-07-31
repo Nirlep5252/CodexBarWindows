@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Win32;
 
 namespace CodexBarWindows;
@@ -34,6 +35,14 @@ public sealed record UiSettings
     private const string CodexEnabledValueName = "ProviderCodexEnabled";
     private const string ClaudeEnabledValueName = "ProviderClaudeEnabled";
     private const string CursorEnabledValueName = "ProviderCursorEnabled";
+    private const string ChartColorsValueName = "ChartColorOverrides";
+
+    /// <summary>
+    /// Web-cased JSON, same shape as <c>CodexCliEntries</c>: one REG_SZ holding the whole map.
+    /// The registry has no dictionary type, and a value-per-model would leak an unbounded number
+    /// of stray values that nothing ever cleans up.
+    /// </summary>
+    private static readonly JsonSerializerOptions ChartColorJsonOptions = new(JsonSerializerDefaults.Web);
 
     public AppThemeMode Theme { get; init; } = AppThemeMode.System;
 
@@ -67,6 +76,24 @@ public sealed record UiSettings
     public bool ClaudeEnabled { get; init; } = true;
 
     public bool CursorEnabled { get; init; } = true;
+
+    /// <summary>
+    /// Per-model chart colour overrides: RAW category label (the <c>ProviderSpendCategory.Label</c>
+    /// / <c>ProviderModelUsage.Model</c> string, lower-cased) → <c>"#RRGGBB"</c>. Anything absent
+    /// keeps the automatic palette, so an empty map is the shipped behaviour.
+    /// </summary>
+    /// <remarks>
+    /// Persisted as ONE REG_SZ value holding JSON - see <see cref="ChartColorsValueName"/>. Keys are
+    /// the raw labels on purpose: the friendly labels the charts DISPLAY are produced by a lossy
+    /// one-way transform, so a map keyed on those could never be matched back at render time.
+    /// <para>
+    /// This is a dictionary on a record, so the compiler-generated value equality degrades to
+    /// reference equality for this member. Nothing compares whole <see cref="UiSettings"/>
+    /// instances (every consumer compares individual scalars), so that is inert today.
+    /// </para>
+    /// </remarks>
+    public IReadOnlyDictionary<string, string> ChartColorOverrides { get; init; } =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
     public bool IsProviderEnabled(UsageProvider provider) => provider switch
     {
@@ -125,13 +152,85 @@ public sealed record UiSettings
                 VibesEnabled = vibes,
                 CodexEnabled = ReadEnabled(key, CodexEnabledValueName),
                 ClaudeEnabled = ReadEnabled(key, ClaudeEnabledValueName),
-                CursorEnabled = ReadEnabled(key, CursorEnabledValueName)
+                CursorEnabled = ReadEnabled(key, CursorEnabledValueName),
+                ChartColorOverrides = ReadChartColors(key)
             };
         }
         catch
         {
             return new UiSettings();
         }
+    }
+
+    /// <summary>
+    /// Reads the colour map, dropping anything that does not parse. A corrupt or half-written
+    /// value must never take the rest of the settings down with it - the charts simply fall back
+    /// to the automatic palette, which is what an unset override means anyway.
+    /// </summary>
+    private static IReadOnlyDictionary<string, string> ReadChartColors(RegistryKey key)
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        if (key.GetValue(ChartColorsValueName) is not string json || string.IsNullOrWhiteSpace(json))
+        {
+            return map;
+        }
+
+        try
+        {
+            var saved = JsonSerializer.Deserialize<Dictionary<string, string>>(json, ChartColorJsonOptions);
+            if (saved is null)
+            {
+                return map;
+            }
+
+            foreach (var pair in saved)
+            {
+                if (NormalizeHexColor(pair.Value) is { } hex && !string.IsNullOrWhiteSpace(pair.Key))
+                {
+                    map[pair.Key.Trim()] = hex;
+                }
+            }
+        }
+        catch
+        {
+            // Malformed JSON: ignore the whole map rather than guess at a partial one.
+        }
+
+        return map;
+    }
+
+    /// <summary>
+    /// Canonicalises a stored colour to <c>"#RRGGBB"</c>, or null if it is not one. Everything
+    /// downstream can then parse with a fixed-width substring instead of defending itself.
+    /// </summary>
+    public static string? NormalizeHexColor(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var text = value.Trim();
+        if (text.StartsWith('#'))
+        {
+            text = text[1..];
+        }
+
+        if (text.Length != 6)
+        {
+            return null;
+        }
+
+        foreach (var character in text)
+        {
+            if (!Uri.IsHexDigit(character))
+            {
+                return null;
+            }
+        }
+
+        return "#" + text.ToUpperInvariant();
     }
 
     public void Save()
@@ -146,6 +245,23 @@ public sealed record UiSettings
             key.SetValue(CodexEnabledValueName, CodexEnabled ? 1 : 0, RegistryValueKind.DWord);
             key.SetValue(ClaudeEnabledValueName, ClaudeEnabled ? 1 : 0, RegistryValueKind.DWord);
             key.SetValue(CursorEnabledValueName, CursorEnabled ? 1 : 0, RegistryValueKind.DWord);
+
+            // WRITTEN UNCONDITIONALLY, and read in LoadCore above: the frozen WinForms app shares
+            // this key and compiles against this same type, so a value that is read but not
+            // written (or the reverse) would be silently erased by whichever app saves last.
+            if (ChartColorOverrides.Count == 0)
+            {
+                key.DeleteValue(ChartColorsValueName, throwOnMissingValue: false);
+            }
+            else
+            {
+                key.SetValue(
+                    ChartColorsValueName,
+                    JsonSerializer.Serialize(
+                        ChartColorOverrides.ToDictionary(pair => pair.Key, pair => pair.Value),
+                        ChartColorJsonOptions),
+                    RegistryValueKind.String);
+            }
         }
 
         // Listeners (including FluentTheme) re-read from here; this type does not push into the UI.

@@ -47,7 +47,13 @@ internal static class UsageScanCache
     /// Bump when the row shape OR the scanner's accounting semantics change — a snapshot written
     /// by different accounting logic is not trustworthy even if it still deserializes.
     /// </summary>
-    private const int SchemaVersion = 1;
+    /// <remarks>
+    /// v2: rows carry a DateTimeOffset truncated to the hour instead of a DateOnly. A v1 payload
+    /// would still deserialize — the missing member simply defaults — and every row would silently
+    /// land on 0001-01-01, so the version is what makes the change safe rather than merely tidy.
+    /// The version is in the FILE NAME, so a downgrade reads its own file rather than this one.
+    /// </remarks>
+    private const int SchemaVersion = 2;
 
     /// <summary>
     /// Single shared instance: System.Text.Json caches reflection metadata per options object,
@@ -127,6 +133,7 @@ internal static class UsageScanCache
             // instances of this app can legitimately be running).
             File.Move(temp, path, overwrite: true);
             temp = null;
+            DeleteSupersededVersions(directory, provider, path);
         }
         catch
         {
@@ -145,6 +152,39 @@ internal static class UsageScanCache
                     // Nothing useful to do if cleanup itself fails.
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Drops snapshots left behind by an older schema version. The version lives in the file name,
+    /// so nothing ever reads those again — without this, every bump leaks a multi-megabyte file
+    /// forever. Done after the replace, so a failure here can only leave garbage, never lose the
+    /// snapshot that was just written.
+    /// </summary>
+    private static void DeleteSupersededVersions(string directory, string provider, string currentPath)
+    {
+        try
+        {
+            foreach (var path in Directory.EnumerateFiles(directory, $"{provider}-v*.json"))
+            {
+                if (string.Equals(path, currentPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    File.Delete(path);
+                }
+                catch
+                {
+                    // Another instance may hold it open; it will be collected on a later save.
+                }
+            }
+        }
+        catch
+        {
+            // Non-critical: this is housekeeping, not part of the write.
         }
     }
 
