@@ -40,17 +40,21 @@ namespace CodexBar.WinUI;
 /// </remarks>
 internal static class ShellIdentity
 {
+    // CUT OVER as of 0.8.0: this shell has taken the shipping app's identity. It now claims the
+    // same single-instance mutex, autostart entry, install folder and release asset the WinForms
+    // app used, so an existing install upgrades in place rather than gaining a second tray app.
+
     /// <summary>Suffix for <see cref="CodexBarWindows.SingleInstanceGuard"/>'s mutex/event names.</summary>
-    internal const string SingleInstanceMutexScope = "WinUI";
+    internal const string? SingleInstanceMutexScope = null;
 
     /// <summary>Value name under HKCU\Software\Microsoft\Windows\CurrentVersion\Run.</summary>
-    internal const string StartupRegistryValueName = "CodexBar.WinUI";
+    internal const string StartupRegistryValueName = "CodexBarWindows";
 
     /// <summary>Folder under %LOCALAPPDATA%\Programs that the MSI installs into.</summary>
-    internal const string InstallFolderName = "CodexBar.WinUI";
+    internal const string InstallFolderName = "CodexBarWindows";
 
     /// <summary>Substring the GitHub release MSI asset must contain.</summary>
-    internal const string ReleaseAssetNameHint = "CodexBar.WinUI";
+    internal const string ReleaseAssetNameHint = "CodexBarWindows";
 
     /// <summary>The updater configured for this shell.</summary>
     internal static CodexBarWindows.GitHubReleaseUpdater CreateUpdater() =>

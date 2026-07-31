@@ -64,7 +64,9 @@ if ($LASTEXITCODE -ne 0) {
     throw "MSI build failed with exit code $LASTEXITCODE"
 }
 
-$msiPath = Join-Path $repoRoot "Installer\bin\$Configuration\CodexBar.WinUI-$Version-$Runtime.msi"
+# Named CodexBarWindows-* since the 0.8.0 cutover: an installed WinForms app filters release
+# assets on that substring, so this is what lets it migrate its user to the WinUI shell.
+$msiPath = Join-Path $repoRoot "Installer\bin\$Configuration\CodexBarWindows-$Version-$Runtime.msi"
 if (-not (Test-Path -LiteralPath $msiPath)) {
     throw "Expected MSI was not found: $msiPath"
 }

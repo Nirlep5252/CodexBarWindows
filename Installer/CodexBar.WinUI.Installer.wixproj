@@ -2,13 +2,20 @@
   <PropertyGroup>
     <!--
       The MSI file name is load-bearing: GitHubReleaseUpdater filters release assets on the
-      substring in ShellIdentity.ReleaseAssetNameHint ("CodexBar.WinUI"), and the WinForms app
-      filters on "CodexBarWindows". This name matches the first and, crucially, does NOT contain
-      the second - so a release carrying both MSIs never hands one app the other's installer.
+      substring in ShellIdentity.ReleaseAssetNameHint.
+
+      CUT OVER as of 0.8.0: that hint is now "CodexBarWindows", so this package is named to match
+      the WinForms app's asset. That is the point — an ALREADY-INSTALLED WinForms app filters on
+      the same substring, so it finds this MSI and migrates its user to the WinUI shell on the next
+      update check. A name that did not contain "CodexBarWindows" would leave every existing
+      install stranded on the old app forever.
+
+      Note this now collides with CodexBarWindows.Installer.wixproj's output name. Only one of the
+      two may be built into a given release; CI builds this one.
     -->
-    <OutputName>CodexBar.WinUI-$(ProductVersion)-win-x64</OutputName>
+    <OutputName>CodexBarWindows-$(ProductVersion)-win-x64</OutputName>
     <OutputType>Package</OutputType>
-    <ProductVersion Condition="'$(ProductVersion)' == ''">0.7.0</ProductVersion>
+    <ProductVersion Condition="'$(ProductVersion)' == ''">0.8.0</ProductVersion>
     <PublishDir Condition="'$(PublishDir)' == ''">..\bin\publish-winui\win-x64</PublishDir>
     <DefineConstants>ProductVersion=$(ProductVersion);PublishDir=$(PublishDir)</DefineConstants>
     <!--

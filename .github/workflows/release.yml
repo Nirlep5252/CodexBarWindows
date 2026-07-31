@@ -21,11 +21,15 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
+      # Cut over at 0.8.0: the shipped app is the WinUI 3 shell. The MSI keeps the WinForms
+      # package's name, UpgradeCode and install folder, so an existing install is upgraded in
+      # place and its self-updater (which filters assets on "CodexBarWindows") finds this asset.
+      # Scripts/build-installer.ps1 still builds the WinForms MSI for local use.
       - name: Build MSI
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
-          .\Scripts\build-installer.ps1 -Version $version
+          .\Scripts\build-installer-winui.ps1 -Version $version
 
       - name: Create GitHub release
         shell: pwsh
