@@ -8,6 +8,13 @@ namespace CodexBarWindows;
 /// UI, but there is exactly one ~/.codex corpus and one ~/.claude corpus behind them, so keying the
 /// ledger per UI entry would fan the same rows into N files and double count on read.
 /// </remarks>
+/// <remarks>
+/// A PROVIDER IS NOT AUTOMATICALLY A SCOPE. Grok deliberately has no member here: nothing merges
+/// Grok rows, so a Grok scope would be a permanently empty ledger that every read path still had to
+/// treat as authoritative. It is scan-only instead, which the graphs window models as a null scope.
+/// Adding a member without also adding a TryMerge caller and an IUsageLedgerBackfillSource
+/// reintroduces exactly that: a code path with no data and no test behind it.
+/// </remarks>
 public enum UsageLedgerScope
 {
     Codex,

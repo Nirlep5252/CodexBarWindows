@@ -26,22 +26,22 @@ namespace CodexBarWindows;
 /// </remarks>
 internal static class LedgerPricing
 {
-    public static UsageLedgerPricing For(UsageLedgerScope scope)
+    public static UsageLedgerPricing For(UsageLedgerScope scope) => scope switch
     {
-        return scope == UsageLedgerScope.Codex
-            ? new UsageLedgerPricing(
-                CostUsd: CodexCost,
-                ThresholdTokens: CodexModelPricing.ThresholdTokensFor,
-                // The scan groups its breakdown on the NORMALIZED id; without this the ledger grouped
-                // on the raw logged id, so "openai/gpt-5.6" and "gpt-5.6-sol" were two rows, two
-                // colour overrides and two legend entries for one model, depending on which source
-                // answered the query.
-                ModelLabel: CodexLabel)
-            : new UsageLedgerPricing(
-                CostUsd: ClaudeCost,
-                ThresholdTokens: ClaudeModelPricing.ThresholdTokensFor,
-                ModelLabel: ClaudeLabel);
-    }
+        UsageLedgerScope.Codex => new UsageLedgerPricing(
+            CostUsd: CodexCost,
+            ThresholdTokens: CodexModelPricing.ThresholdTokensFor,
+            // The scan groups its breakdown on the NORMALIZED id; without this the ledger grouped
+            // on the raw logged id, so "openai/gpt-5.6" and "gpt-5.6-sol" were two rows, two
+            // colour overrides and two legend entries for one model, depending on which source
+            // answered the query.
+            ModelLabel: CodexLabel),
+        UsageLedgerScope.Claude => new UsageLedgerPricing(
+            CostUsd: ClaudeCost,
+            ThresholdTokens: ClaudeModelPricing.ThresholdTokensFor,
+            ModelLabel: ClaudeLabel),
+        _ => throw new ArgumentOutOfRangeException(nameof(scope), scope, "Unknown ledger scope.")
+    };
 
     // Both labels reproduce their reader's breakdown label exactly, including the empty-model
     // fallback and the " fast" suffix, because the graphs window keys per-model colours off it.
@@ -140,4 +140,9 @@ internal static class LedgerPricing
         => tokens.IsEmpty
             ? 0m
             : ClaudeModelPricing.EstimateTier(pricing, tokens.Input, tokens.CachedInput, tokens.CacheCreation, tokens.Output, above);
+
+    // NO GROK COST FUNCTION HERE. Grok has no ledger scope (see UsageLedgerScope), so a Grok
+    // pricing arm could only ever be called with records that cannot exist. The rates it used to
+    // carry were a second, already-drifted copy of the scan's table - the scan's
+    // GrokUsageInsightsReader.GrokPricing is now the only one.
 }

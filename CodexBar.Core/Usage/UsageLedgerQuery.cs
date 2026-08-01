@@ -114,6 +114,58 @@ public static partial class UsageLedger
     /// Everything ever recorded for a scope, as one bucket. Returns an empty series when the ledger
     /// holds nothing, so the caller does not have to special-case a cold install.
     /// </summary>
+    /// <summary>
+    /// The bucket PARTITION for a range, with every bucket zeroed and no shard read at all.
+    /// </summary>
+    /// <remarks>
+    /// For a provider that has no ledger corpus (Grok: scan-only). The graphs window fills the
+    /// scan's daily rows into ledger-shaped buckets, so it needs the bounds even when there is no
+    /// ledger to ask - and the bounds are a pure function of the range, granularity and zone.
+    ///
+    /// The alternative, which this replaces, was to hand <see cref="Query"/> a scope that was
+    /// expected to stay empty forever and use its buckets. That worked only for as long as nobody
+    /// wrote a row to it, and put a real scope in the enum to represent the absence of one.
+    /// </remarks>
+    public static UsageLedgerSeries EmptyRange(
+        DateTimeOffset fromLocal,
+        DateTimeOffset toLocalExclusive,
+        UsageLedgerGranularity granularity,
+        TimeZoneInfo? zone = null)
+    {
+        try
+        {
+            zone ??= TimeZoneInfo.Local;
+            if (toLocalExclusive <= fromLocal)
+            {
+                return UsageLedgerSeries.Empty(granularity);
+            }
+
+            var buckets = BuildBuckets(fromLocal, toLocalExclusive, granularity, zone);
+            if (buckets.Count == 0)
+            {
+                return UsageLedgerSeries.Empty(granularity);
+            }
+
+            // Built through the same accumulator the real query uses, so an empty bucket here is
+            // byte-for-byte the empty bucket a cold ledger would have produced.
+            var materialised = buckets
+                .Select(bucket => new BucketAccumulator(bucket.StartLocal, bucket.EndLocalExclusive).Build())
+                .ToArray();
+
+            return new UsageLedgerSeries(
+                granularity,
+                materialised,
+                [],
+                0, 0, 0, 0,
+                0m, 0m, 0,
+                false, false, false, false);
+        }
+        catch
+        {
+            return UsageLedgerSeries.Empty(granularity);
+        }
+    }
+
     public static UsageLedgerSeries QueryTotal(
         UsageLedgerScope scope,
         TimeZoneInfo? zone = null,
@@ -242,7 +294,7 @@ public static partial class UsageLedger
         string[] files;
         try
         {
-            files = Directory.GetFiles(directory, $"{(scope == UsageLedgerScope.Codex ? "codex" : "claude")}-*-v{SchemaVersion}.json");
+            files = Directory.GetFiles(directory, $"{ScopeName(scope)}-*-v{SchemaVersion}.json");
         }
         catch
         {

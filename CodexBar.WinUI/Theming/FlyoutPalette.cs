@@ -45,6 +45,12 @@ internal sealed class FlyoutPalette
         // Anthropic's own mark colour: it identifies the provider, so it does not vary by theme.
         ClaudeGlyph = Brush(Color.FromArgb(0xFF, 0xD9, 0x77, 0x57));
 
+        // xAI / Grok mark: near-white on dark chrome, near-black on light — slightly cooler than
+        // the generic monochrome glyph so the X reads as its own identity next to Claude's coral.
+        GrokGlyph = Brush(isDark
+            ? Color.FromArgb(0xFF, 0xF2, 0xF2, 0xF2)
+            : Color.FromArgb(0xFF, 0x14, 0x14, 0x14));
+
         OnAccentText = Brush(IsLight(SystemAccent(isDark))
             ? Color.FromArgb(0xF2, 0x00, 0x00, 0x00)
             : Color.FromArgb(0xFF, 0xFF, 0xFF, 0xFF));
@@ -65,6 +71,8 @@ internal sealed class FlyoutPalette
     public Brush Glyph { get; }
 
     public Brush ClaudeGlyph { get; }
+
+    public Brush GrokGlyph { get; }
 
     public Brush OnAccentText { get; }
 

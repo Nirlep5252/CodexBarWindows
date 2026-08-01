@@ -2,7 +2,7 @@
 
 A small Windows tray app for checking AI coding assistant usage limits without opening a terminal.
 
-CodexBarWindows stays in the system tray. Left-click the tray icon to open a compact popup near the taskbar with tabs for Codex, Claude, and Cursor usage limits, including percentage used, remaining allowance, reset time, and Codex history charts.
+CodexBarWindows stays in the system tray. Left-click the tray icon to open a compact popup near the taskbar with tabs for Codex, Claude, Grok, and Cursor usage limits, including percentage used, remaining allowance, reset time, and Codex history charts.
 
 ![CodexBarWindows Codex history preview](docs/codexbarwindows-history-preview.png)
 
@@ -30,6 +30,7 @@ CodexBarWindows stays in the system tray. Left-click the tray icon to open a com
 - Codex CLI installed and authenticated for Codex limits.
 - Optional additional Codex CLI binaries or wrapper scripts for other authenticated accounts.
 - Claude Code installed and authenticated for Claude limits.
+- Grok CLI installed and authenticated (`grok login`) for Grok limits. Grok is off by default — turn it on in `Settings` → `Grok`.
 - A Cursor Cookie header from a signed-in cursor.com browser session for Cursor limits.
 
 The installer publishes a self-contained Windows build, so the installed app does not require a separate .NET runtime.
@@ -211,6 +212,10 @@ The built-in Codex tab uses `CODEX_BINARY` or `PATH`, matching the existing beha
 No Codex account token is stored by this app. Authentication remains managed by the Codex CLI.
 
 For Claude, the app reads the local Claude Code OAuth credential file at `%USERPROFILE%\.claude\.credentials.json` and calls Anthropic's OAuth usage endpoint. Tokens are read from Claude Code's existing local auth state and refreshed in memory only; this app does not write credentials back to disk.
+
+For Grok, the app reads the local Grok CLI session file at `%USERPROFILE%\.grok\auth.json` (or `%GROK_HOME%\auth.json`) and calls the cli-chat-proxy billing endpoint used by Grok's `/usage` command. Tokens are refreshed in memory only; this app does not write credentials back to disk. Grok history charts are local estimates from `%USERPROFILE%\.grok\sessions` turn ledgers (`updates.jsonl`), preferring server-stamped `costUsdTicks` when present and falling back to published rates otherwise.
+
+Unlike Codex and Claude, Grok history is **limited to the last 30 days** and is not written to the usage ledger, so `Import history` does not cover it and Grok has no hourly breakdown or past-month view. Grok is scan-only until a ledger writer exists for it.
 
 For Cursor, the app calls cursor.com usage endpoints using a manually configured Cookie header. Paste the header in `Settings` → `Cursor`. The header is stored encrypted for the current Windows user. Stage 1 does not automatically import browser cookies, and Cursor does not currently have a local token/cost history chart.
 

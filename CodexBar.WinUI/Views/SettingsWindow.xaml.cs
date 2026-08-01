@@ -284,6 +284,7 @@ public sealed partial class SettingsWindow : Window
         StartupToggle.IsOn = StartupSettings.IsEnabledFor(ShellIdentity.StartupRegistryValueName);
         CodexEnabledToggle.IsOn = settings.CodexEnabled;
         ClaudeEnabledToggle.IsOn = settings.ClaudeEnabled;
+        GrokEnabledToggle.IsOn = settings.GrokEnabled;
         CursorEnabledToggle.IsOn = settings.CursorEnabled;
 
         ThemeCombo.SelectedIndex = (int)settings.Theme;
@@ -318,6 +319,7 @@ public sealed partial class SettingsWindow : Window
 
         CodexEnabledToggle.Toggled += (_, _) => OnProviderEnabledChanged();
         ClaudeEnabledToggle.Toggled += (_, _) => OnProviderEnabledChanged();
+        GrokEnabledToggle.Toggled += (_, _) => OnProviderEnabledChanged();
         CursorEnabledToggle.Toggled += (_, _) => OnProviderEnabledChanged();
 
         ThemeCombo.SelectionChanged += (_, _) => OnThemeSelectionChanged();
@@ -432,6 +434,7 @@ public sealed partial class SettingsWindow : Window
     {
         CodexMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Codex, palette.Glyph);
         ClaudeMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Claude, palette.ClaudeGlyph);
+        GrokMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Grok, palette.GrokGlyph);
         CursorMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Cursor, palette.Glyph);
         BuiltInAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Codex, palette.Glyph);
         CursorAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Cursor, palette.Glyph);
@@ -455,7 +458,10 @@ public sealed partial class SettingsWindow : Window
             return;
         }
 
-        if (!CodexEnabledToggle.IsOn && !ClaudeEnabledToggle.IsOn && !CursorEnabledToggle.IsOn)
+        if (!CodexEnabledToggle.IsOn &&
+            !ClaudeEnabledToggle.IsOn &&
+            !GrokEnabledToggle.IsOn &&
+            !CursorEnabledToggle.IsOn)
         {
             suppressWrites = true;
             CodexEnabledToggle.IsOn = true;
@@ -474,6 +480,7 @@ public sealed partial class SettingsWindow : Window
         {
             CodexEnabled = CodexEnabledToggle.IsOn,
             ClaudeEnabled = ClaudeEnabledToggle.IsOn,
+            GrokEnabled = GrokEnabledToggle.IsOn,
             CursorEnabled = CursorEnabledToggle.IsOn
         };
         settings.Save();

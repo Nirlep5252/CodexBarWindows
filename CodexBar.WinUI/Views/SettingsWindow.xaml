@@ -336,6 +336,36 @@
                                             <ColumnDefinition Width="Auto" />
                                         </Grid.ColumnDefinitions>
                                         <Border
+                                            x:Name="GrokMark"
+                                            Width="16"
+                                            Height="16"
+                                            VerticalAlignment="Center" />
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock Text="Grok" />
+                                            <TextBlock
+                                                Style="{StaticResource SecondaryCaptionStyle}"
+                                                Text="Show Grok usage and read Grok CLI session data"
+                                                TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <ToggleSwitch
+                                            x:Name="GrokEnabledToggle"
+                                            Grid.Column="2"
+                                            MinWidth="0"
+                                            AutomationProperties.Name="Grok enabled"
+                                            OffContent=""
+                                            OnContent=""
+                                            VerticalAlignment="Center" />
+                                    </Grid>
+
+                                    <Border Style="{StaticResource RowSeparatorStyle}" />
+
+                                    <Grid Style="{StaticResource SettingRowStyle}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <Border
                                             x:Name="CursorMark"
                                             Width="16"
                                             Height="16"

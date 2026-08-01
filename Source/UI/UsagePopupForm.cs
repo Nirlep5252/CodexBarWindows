@@ -191,7 +191,11 @@ public sealed class UsagePopupForm : Form
         FormClosing += OnFormClosing;
         UiSettings.Changed += OnUiSettingsChanged;
 
-        ConfigureProviders([new ProviderDescriptor(CodexProviderKey("default"), "Codex", UsageProvider.Codex), ClaudeProvider, CursorProvider]);
+        ConfigureProviders([
+            new ProviderDescriptor(CodexProviderKey("default"), "Codex", UsageProvider.Codex),
+            ClaudeProvider,
+            GrokProvider,
+            CursorProvider]);
         ApplyScaledLayout();
         ApplyTheme();
         RenderSelectedProvider();
@@ -493,6 +497,7 @@ public sealed class UsagePopupForm : Form
         // A tool being enabled or disabled changes which tabs exist.
         if (previousSettings.CodexEnabled != uiSettings.CodexEnabled ||
             previousSettings.ClaudeEnabled != uiSettings.ClaudeEnabled ||
+            previousSettings.GrokEnabled != uiSettings.GrokEnabled ||
             previousSettings.CursorEnabled != uiSettings.CursorEnabled)
         {
             ConfigureCodexEntries(configuredCodexEntries);
@@ -670,6 +675,7 @@ public sealed class UsagePopupForm : Form
         var descriptors = codexEntries
             .Select(entry => new ProviderDescriptor(CodexProviderKey(entry.Id), entry.Name, UsageProvider.Codex))
             .Append(ClaudeProvider)
+            .Append(GrokProvider)
             .Append(CursorProvider)
             .Where(descriptor => uiSettings.IsProviderEnabled(descriptor.Provider))
             .ToList();
@@ -749,9 +755,11 @@ public sealed class UsagePopupForm : Form
             }
             statusLabel.Text = provider.IsClaude
                 ? "Reading from Claude Code OAuth..."
-                : provider.IsCursor
-                    ? "Reading from cursor.com..."
-                    : "Reading from Codex CLI...";
+                : provider.IsGrok
+                    ? "Reading from Grok CLI billing..."
+                    : provider.IsCursor
+                        ? "Reading from cursor.com..."
+                        : "Reading from Codex CLI...";
         }
     }
 
@@ -883,7 +891,9 @@ public sealed class UsagePopupForm : Form
         {
             planLabel.Text = provider.IsCursor
                 ? "Waiting for Cursor usage data"
-                : $"Waiting for local {provider.Name} usage data";
+                : provider.IsGrok
+                    ? "Waiting for Grok usage data"
+                    : $"Waiting for local {provider.Name} usage data";
             var titles = DefaultUsageTitles(provider);
             for (var index = 0; index < GetUsageRowCount(provider); index++)
             {
@@ -895,9 +905,11 @@ public sealed class UsagePopupForm : Form
 
         planLabel.Text = provider.IsCursor
             ? CursorPlanText(snapshot)
-            : string.IsNullOrWhiteSpace(snapshot.PlanType)
-                ? provider.IsClaude ? "Claude Code usage data" : "Codex CLI usage data"
-                : $"{ProviderPlanFormatter.DisplayName(provider.Provider, snapshot.PlanType)} plan";
+            : provider.IsGrok
+                ? GrokPlanText(snapshot)
+                : string.IsNullOrWhiteSpace(snapshot.PlanType)
+                    ? provider.IsClaude ? "Claude Code usage data" : "Codex CLI usage data"
+                    : $"{ProviderPlanFormatter.DisplayName(provider.Provider, snapshot.PlanType)} plan";
 
         var windows = snapshot.Windows;
         for (var index = 0; index < windows.Count; index++)
@@ -908,7 +920,11 @@ public sealed class UsagePopupForm : Form
         // Subtle freshness line. A retained (stale) snapshot says so explicitly, so an error
         // paired with old numbers cannot read as if the numbers were just fetched.
         var fetched = $"Updated {FormatObservedAt(snapshot.ObservedAt)}";
-        var baseStatus = provider.IsCursor ? CursorStatusText(snapshot) : string.Empty;
+        var baseStatus = provider.IsCursor
+            ? CursorStatusText(snapshot)
+            : provider.IsGrok
+                ? GrokStatusText(snapshot)
+                : string.Empty;
         statusLabel.Text = !string.IsNullOrWhiteSpace(result.Error)
             ? result.IsStale
                 ? $"{result.Error} · showing limits from {FormatObservedAt(snapshot.ObservedAt)}"
@@ -1030,14 +1046,16 @@ public sealed class UsagePopupForm : Form
     {
         return GetProviderUsage(provider.Key).Snapshot is { } snapshot
             ? snapshot.Windows.Count
-            : provider.IsCursor ? 3 : 2;
+            : provider.IsCursor ? 3 : provider.IsGrok ? 1 : 2;
     }
 
     private static IReadOnlyList<string> DefaultUsageTitles(ProviderDescriptor provider)
     {
         return provider.IsCursor
             ? ["Total", "Auto", "API"]
-            : ["5 hour limit", "Weekly limit"];
+            : provider.IsGrok
+                ? ["Weekly limit"]
+                : ["5 hour limit", "Weekly limit"];
     }
 
     private void EnsureUsageSectionCount(int count)
@@ -1133,12 +1151,15 @@ public sealed class UsagePopupForm : Form
     }
 
     public const string ClaudeProviderKey = "claude";
+    public const string GrokProviderKey = "grok";
     public const string CursorProviderKey = "cursor";
     private static readonly ProviderDescriptor ClaudeProvider = new(ClaudeProviderKey, "Claude", UsageProvider.Claude);
+    private static readonly ProviderDescriptor GrokProvider = new(GrokProviderKey, "Grok", UsageProvider.Grok);
     private static readonly ProviderDescriptor CursorProvider = new(CursorProviderKey, "Cursor", UsageProvider.Cursor);
     private sealed record ProviderDescriptor(string Key, string Name, UsageProvider Provider)
     {
         public bool IsClaude => Provider == UsageProvider.Claude;
+        public bool IsGrok => Provider == UsageProvider.Grok;
         public bool IsCursor => Provider == UsageProvider.Cursor;
     }
 
@@ -1231,6 +1252,14 @@ public sealed class UsagePopupForm : Form
             : $"{plan} · {snapshot.AccountEmail}";
     }
 
+    private static string GrokPlanText(ProviderUsageSnapshot snapshot)
+    {
+        // Never show account email — privacy and clutter. Tier only when the API reports one.
+        return string.IsNullOrWhiteSpace(snapshot.PlanType)
+            ? "Grok usage data"
+            : $"{ProviderPlanFormatter.DisplayName(UsageProvider.Grok, snapshot.PlanType)} plan";
+    }
+
     private static string CursorStatusText(ProviderUsageSnapshot snapshot)
     {
         if (snapshot.Cost is not { } cost)
@@ -1243,6 +1272,20 @@ public sealed class UsagePopupForm : Form
             ? $" / {FormatCurrency(limit, cost.CurrencyCode)}"
             : string.Empty;
         return $"On-demand {used}{budget} · updated {FormatObservedAt(snapshot.ObservedAt)}";
+    }
+
+    private static string GrokStatusText(ProviderUsageSnapshot snapshot)
+    {
+        if (snapshot.Cost is not { } cost)
+        {
+            return string.Empty;
+        }
+
+        var used = FormatCurrency(cost.Used, cost.CurrencyCode);
+        var budget = cost.Limit is { } limit && limit > 0
+            ? $" / {FormatCurrency(limit, cost.CurrencyCode)}"
+            : string.Empty;
+        return $"On-demand {used}{budget}";
     }
 
     private static string FormatCurrency(decimal value, string currencyCode)
@@ -2554,6 +2597,10 @@ public sealed class UsagePopupForm : Form
             {
                 DrawClaudeLogo(e.Graphics, iconBounds);
             }
+            else if (Provider == UsageProvider.Grok)
+            {
+                DrawGrokLogo(e.Graphics, iconBounds, tokens.IsDark ? Color.White : tokens.TextPrimary);
+            }
             else if (Provider == UsageProvider.Cursor)
             {
                 DrawCursorLogo(e.Graphics, iconBounds, tokens.IsDark ? Color.White : tokens.TextPrimary);
@@ -2688,6 +2735,25 @@ public sealed class UsagePopupForm : Form
             {
                 graphics.FillEllipse(brush, bounds);
             }
+        }
+
+        private static void DrawGrokLogo(Graphics graphics, Rectangle bounds, Color color)
+        {
+            // Match the WinUI mark: a thinner geometric X, not a heavy bar.
+            var inset = Math.Max(2.5f, bounds.Width * 0.22f);
+            var thickness = Math.Max(1.6f, bounds.Width * 0.11f);
+            var left = bounds.Left + inset;
+            var top = bounds.Top + inset;
+            var right = bounds.Right - inset;
+            var bottom = bounds.Bottom - inset;
+            using var pen = new Pen(color, thickness)
+            {
+                StartCap = System.Drawing.Drawing2D.LineCap.Round,
+                EndCap = System.Drawing.Drawing2D.LineCap.Round,
+                LineJoin = System.Drawing.Drawing2D.LineJoin.Round
+            };
+            graphics.DrawLine(pen, left, top, right, bottom);
+            graphics.DrawLine(pen, right, top, left, bottom);
         }
 
         private static System.Drawing.Drawing2D.GraphicsPath CreateSvgPath(string data)

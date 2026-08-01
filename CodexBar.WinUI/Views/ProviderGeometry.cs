@@ -34,6 +34,14 @@ internal static class ProviderGeometry
     private const string CursorData =
         "F0 M 84.0704 28.9353 L 51.9066 10.4454 C 50.8738 9.8515 49.5994 9.8515 48.5666 10.4454 L 16.4043 28.9353 C 15.536 29.4345 15 30.3576 15 31.3575 V 68.6425 C 15 69.6424 15.536 70.5655 16.4043 71.0647 L 48.5681 89.5546 C 49.6009 90.1485 50.8753 90.1485 51.9081 89.5546 L 84.0719 71.0647 C 84.9402 70.5655 85.4762 69.6424 85.4762 68.6425 V 31.3575 C 85.4762 30.3576 84.9402 29.4345 84.0719 28.9353 H 84.0704 Z M 82.0501 32.8519 L 51.0006 86.4003 C 50.7907 86.7611 50.2366 86.6138 50.2366 86.1958 V 51.1329 C 50.2366 50.4322 49.8606 49.7842 49.2506 49.4324 L 18.7553 31.9017 C 18.3929 31.6927 18.5409 31.141 18.9606 31.141 H 81.0595 C 81.9414 31.141 82.4925 32.0927 82.0516 32.8534 H 82.0501 V 32.8519 Z";
 
+    /// <summary>
+    /// Thin geometric X in the same visual weight class as the Codex/Cursor marks (not a heavy
+    /// filled block). View box is roughly 0–100; <see cref="Normalize"/> scales it to
+    /// <see cref="IconSize"/>.
+    /// </summary>
+    private const string GrokData =
+        "F0 M 18 8 L 28 8 L 50 36 L 72 8 L 82 8 L 82 18 L 54 50 L 82 82 L 82 92 L 72 92 L 50 64 L 28 92 L 18 92 L 18 82 L 46 50 L 18 18 Z";
+
     /// <summary>Edge length of the square the mark is normalised into, in DIPs.</summary>
     private const double IconSize = 14;
 
@@ -53,6 +61,7 @@ internal static class ProviderGeometry
         {
             UsageProvider.Claude => ClaudeData,
             UsageProvider.Cursor => CursorData,
+            UsageProvider.Grok => GrokData,
             _ => CodexData
         });
 

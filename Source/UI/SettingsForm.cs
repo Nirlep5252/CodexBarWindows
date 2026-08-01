@@ -64,6 +64,8 @@ public sealed class SettingsForm : Form
     private FluentToggle codexEnabledToggle = null!;
     private SettingsCard claudeEnabledCard = null!;
     private FluentToggle claudeEnabledToggle = null!;
+    private SettingsCard grokEnabledCard = null!;
+    private FluentToggle grokEnabledToggle = null!;
     private SettingsCard cursorEnabledCard = null!;
     private FluentToggle cursorEnabledToggle = null!;
     private bool suppressProviderToggleEvents;
@@ -264,13 +266,25 @@ public sealed class SettingsForm : Form
         };
         claudeEnabledCard.ActionControl = claudeEnabledToggle;
 
+        grokEnabledToggle = new FluentToggle(tokens) { Checked = uiSettings.GrokEnabled, Size = new Size(40, 20) };
+        grokEnabledToggle.CheckedChanged += (_, _) => OnProviderEnabledChanged();
+        grokEnabledCard = new SettingsCard(tokens)
+        {
+            Description = "Show Grok usage and read Grok CLI session data",
+            Glyph = ToolsGlyph,
+            Location = new Point(24, 358),
+            Size = new Size(532, 64),
+            Title = "Grok"
+        };
+        grokEnabledCard.ActionControl = grokEnabledToggle;
+
         cursorEnabledToggle = new FluentToggle(tokens) { Checked = uiSettings.CursorEnabled, Size = new Size(40, 20) };
         cursorEnabledToggle.CheckedChanged += (_, _) => OnProviderEnabledChanged();
         cursorEnabledCard = new SettingsCard(tokens)
         {
             Description = "Show Cursor usage",
             Glyph = ToolsGlyph,
-            Location = new Point(24, 358),
+            Location = new Point(24, 430),
             Size = new Size(532, 64),
             Title = "Cursor"
         };
@@ -282,6 +296,7 @@ public sealed class SettingsForm : Form
             versionCard,
             codexEnabledCard,
             claudeEnabledCard,
+            grokEnabledCard,
             cursorEnabledCard]);
     }
 
@@ -296,7 +311,10 @@ public sealed class SettingsForm : Form
             return;
         }
 
-        if (!codexEnabledToggle.Checked && !claudeEnabledToggle.Checked && !cursorEnabledToggle.Checked)
+        if (!codexEnabledToggle.Checked &&
+            !claudeEnabledToggle.Checked &&
+            !grokEnabledToggle.Checked &&
+            !cursorEnabledToggle.Checked)
         {
             suppressProviderToggleEvents = true;
             codexEnabledToggle.Checked = true;
@@ -307,6 +325,7 @@ public sealed class SettingsForm : Form
         {
             CodexEnabled = codexEnabledToggle.Checked,
             ClaudeEnabled = claudeEnabledToggle.Checked,
+            GrokEnabled = grokEnabledToggle.Checked,
             CursorEnabled = cursorEnabledToggle.Checked
         };
         uiSettings.Save();
@@ -649,6 +668,10 @@ public sealed class SettingsForm : Form
 
         startupCard.ApplyTheme(tokens);
         versionCard.ApplyTheme(tokens);
+        codexEnabledCard.ApplyTheme(tokens);
+        claudeEnabledCard.ApplyTheme(tokens);
+        grokEnabledCard.ApplyTheme(tokens);
+        cursorEnabledCard.ApplyTheme(tokens);
         themeCard.ApplyTheme(tokens);
         materialExpander.ApplyTheme(tokens);
         vibesCard.ApplyTheme(tokens);
