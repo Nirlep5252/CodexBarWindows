@@ -137,6 +137,13 @@ public static class UsageLedgerBackfill
             ClaudeUsageInsightsReader.CreateBackfillSource()
         ];
 
+        // Hoisted out of the try on purpose: cancellation unwinds through it, and the result then
+        // has to be able to say what was already COMMITTED. See the catch below.
+        var done = 0;
+        var days = new HashSet<int>();
+        var merged = 0;
+        var failed = 0;
+
         try
         {
             var plans = new List<(IUsageLedgerBackfillSource Source, IReadOnlyList<UsageLedgerBackfillFile> Files)>();
@@ -160,11 +167,7 @@ public static class UsageLedgerBackfill
 
             progress?.Report(new UsageLedgerBackfillProgress(0, total, $"Reading {total:N0} session logs..."));
 
-            var done = 0;
             var scannedAt = DateTimeOffset.Now;
-            var days = new HashSet<int>();
-            var merged = 0;
-            var failed = 0;
 
             foreach (var (source, files) in plans)
             {
@@ -184,18 +187,25 @@ public static class UsageLedgerBackfill
                     // A complete pass over the whole corpus genuinely covers every day from the
                     // first row on disk to now, including the days it found empty — that is what
                     // lets replace-by-scope correct a day the 30-day scan got wrong.
+                    //
+                    // `earliest` is data, so it is not trusted to bound anything: CoverDays clamps
+                    // the range to the ledger's plausible span. A single corrupt timestamp must not
+                    // be able to turn one merge into thousands of shard rebuilds.
                     builder.CoverDays(UsageLedger.FromUtcHour(earliest), scannedAt);
                 }
 
                 var batch = builder.Build(scannedAt);
-                foreach (var record in batch.Records)
-                {
-                    days.Add(UsageLedger.UtcDayOfHour(record.Key.UtcHour));
-                }
 
+                // Days are counted only once the write SUCCEEDED. "Imported 40 days" for a batch
+                // that never reached disk is the same class of lie as "nothing was changed" for one
+                // that did.
                 if (UsageLedger.TryMerge(source.Scope, batch))
                 {
                     merged++;
+                    foreach (var record in batch.Records)
+                    {
+                        days.Add(UsageLedger.UtcDayOfHour(record.Key.UtcHour));
+                    }
                 }
                 else
                 {
@@ -243,13 +253,29 @@ public static class UsageLedgerBackfill
         }
         catch (OperationCanceledException)
         {
+            // HONEST, not reassuring. The merge is per corpus (see the remarks), so a cancel that
+            // arrives while the second corpus is being read finds the first one already fully
+            // replaced on disk — and telling the user their data is untouched when it is not is
+            // worse than telling them the import stopped halfway.
+            //
+            // Not rolled back, deliberately: what committed is a COMPLETE, correct view of that
+            // corpus, so undoing it would delete good history to restore an older answer. The
+            // guarantee this path owns is consistency, and that still holds — no corpus is ever
+            // half-written, because nothing is written until its whole walk is done.
+            var cancelledFirst = days.Count == 0 ? (DateOnly?)null : UsageLedger.FromUtcDay(days.Min());
+            var cancelledLast = days.Count == 0 ? (DateOnly?)null : UsageLedger.FromUtcDay(days.Max());
+
             return new UsageLedgerBackfillResult(
                 UsageLedgerBackfillOutcome.Cancelled,
-                0,
-                0,
-                null,
-                null,
-                "Import cancelled. Nothing was changed.");
+                done,
+                days.Count,
+                cancelledFirst,
+                cancelledLast,
+                merged == 0
+                    ? "Import cancelled. Nothing was changed."
+                    : string.Create(
+                        CultureInfo.CurrentCulture,
+                        $"Import cancelled. {days.Count:N0} days of history ({cancelledFirst:d} to {cancelledLast:d}) had already been imported from {done:N0} session logs and were kept; the rest was not read."));
         }
         catch (Exception exception)
         {
@@ -286,48 +312,57 @@ public static class UsageLedgerBackfill
             CancellationToken = cancellationToken
         };
 
-        Parallel.ForEach(
-            files,
-            options,
-            // Per-worker builder: the aggregate is a plain Dictionary and taking a lock per ROW
-            // (millions of them) would serialise the parse it is meant to overlap with.
-            () => new UsageLedgerBatchBuilder(source.AccountingVersion),
-            (file, _, local) =>
-            {
-                try
+        try
+        {
+            Parallel.ForEach(
+                files,
+                options,
+                // Per-worker builder: the aggregate is a plain Dictionary and taking a lock per ROW
+                // (millions of them) would serialise the parse it is meant to overlap with.
+                () => new UsageLedgerBatchBuilder(source.AccountingVersion),
+                (file, _, local) =>
                 {
-                    source.Scan(file, local);
-                }
-                catch
-                {
-                    // One unreadable file must not abandon the import — but it does mean this
-                    // batch is a lower bound, so it merges per-key MAX instead of replacing.
-                    local.MarkIncomplete();
-                }
+                    try
+                    {
+                        source.Scan(file, local);
+                    }
+                    catch
+                    {
+                        // One unreadable file must not abandon the import — but it does mean this
+                        // batch is a lower bound, so it merges per-key MAX instead of replacing.
+                        local.MarkIncomplete();
+                    }
 
-                var at = Interlocked.Increment(ref completed);
-                if (at % ProgressStride == 0 || at == total)
-                {
-                    // The label follows the file that just finished. Files are sorted oldest-first
-                    // so it walks forward through the months; with several workers in flight it can
-                    // repeat a month, which is honest and costs nothing to allow.
-                    progress?.Report(new UsageLedgerBackfillProgress(
-                        at,
-                        total,
-                        string.Create(CultureInfo.CurrentCulture, $"Importing {source.DisplayName} sessions from {file.Stamp:MMMM yyyy}...")));
-                }
+                    var at = Interlocked.Increment(ref completed);
+                    if (at % ProgressStride == 0 || at == total)
+                    {
+                        // The label follows the file that just finished. Files are sorted oldest-first
+                        // so it walks forward through the months; with several workers in flight it can
+                        // repeat a month, which is honest and costs nothing to allow.
+                        progress?.Report(new UsageLedgerBackfillProgress(
+                            at,
+                            total,
+                            string.Create(CultureInfo.CurrentCulture, $"Importing {source.DisplayName} sessions from {file.Stamp:MMMM yyyy}...")));
+                    }
 
-                return local;
-            },
-            local =>
-            {
-                lock (aggregate)
+                    return local;
+                },
+                local =>
                 {
-                    aggregate.AddFrom(local);
-                }
-            });
+                    lock (aggregate)
+                    {
+                        aggregate.AddFrom(local);
+                    }
+                });
+        }
+        finally
+        {
+            // In the finally, because cancellation unwinds THROUGH Parallel.ForEach: the files this
+            // pass did read are the ones the cancelled result reports, and losing the count here is
+            // what made "zero files" part of the old cancellation lie.
+            done = Volatile.Read(ref completed);
+        }
 
-        done = Volatile.Read(ref completed);
         return aggregate;
     }
 }

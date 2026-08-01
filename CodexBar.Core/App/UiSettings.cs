@@ -61,6 +61,29 @@ public sealed record UiSettings
     public BackdropMaterial EffectiveMaterial => VibesEnabled ? BackdropMaterial.Acrylic : Material;
 
     /// <summary>
+    /// The same settings with <see cref="VibesEnabled"/> forced off, for a shell that does not
+    /// IMPLEMENT vibes.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="VibesValueName"/> lives in a registry key shared with the frozen WinForms app,
+    /// so a user who ever enabled vibes there keeps <c>UiVibes=1</c> after upgrading in place.
+    /// A shell without <c>VibeTheme</c> renders none of the appearance that flag promises, yet
+    /// every DERIVED member here still honours it: <see cref="EffectiveMaterial"/> pins the
+    /// backdrop to Acrylic (so the user's Mica/Solid choice silently stops applying) and
+    /// <see cref="ResolveIsDark"/> forces dark over the theme choice. Calling this at the point
+    /// the shell loads its settings makes the flag inert for that shell in ONE place, instead of
+    /// leaving every consumer to remember the gate.
+    /// </para>
+    /// <para>
+    /// Deliberately NOT applied inside <see cref="Load"/>: the WinForms shell does implement
+    /// vibes and reads through the same method, and a flag it can still honour must not be
+    /// erased on its behalf.
+    /// </para>
+    /// </remarks>
+    public UiSettings WithoutVibes() => VibesEnabled ? this with { VibesEnabled = false } : this;
+
+    /// <summary>
     /// Strength of the theme-colored tint painted over the backdrop material.
     /// 0 = pure material (maximum translucency), 100 = fully solid background.
     /// Ignored when <see cref="Material"/> is <see cref="BackdropMaterial.Solid"/>.

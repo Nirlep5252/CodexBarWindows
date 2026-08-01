@@ -23,10 +23,11 @@ namespace CodexBarWindows;
 /// rather than being expressed in terms of the Codex helpers.
 /// </para>
 /// <para>
-/// Precedence is catalog-FIRST, built-in second (<c>models.dev ?? built-in</c>), verbatim from the
-/// reader: the fetched catalog is the live source of truth, and this table is the offline floor that
-/// keeps a model priceable when the fetch has never succeeded. Reversing it would freeze rates at
-/// whatever shipped in the binary.
+/// Precedence is catalog-FIRST, built-in second: the fetched catalog is the live source of truth, and
+/// this table is the offline floor that keeps a model priceable when the fetch has never succeeded.
+/// Reversing it would freeze rates at whatever shipped in the binary. It is applied per FIELD rather
+/// than per RECORD, though - see <see cref="For"/> - because a whole-record <c>catalog ?? built-in</c>
+/// let a catalog entry that knows only base rates ERASE a long-context tier this table knows about.
 /// </para>
 /// </remarks>
 internal static class ClaudeModelPricing
@@ -35,11 +36,59 @@ internal static class ClaudeModelPricing
     /// Rates for a Claude model, or <c>null</c> when neither source can price it.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Null is a deliberate answer, not a failure to try: it surfaces as <c>HasIncompleteCost</c>.
     /// Falling back to a neighbouring model's rates would make an unknown model look accounted for.
+    /// </para>
+    /// <para>
+    /// The two sources are merged FIELD BY FIELD, not chosen between. models.dev's anthropic entries
+    /// for claude-sonnet-4-5 / -4-6 carry base rates and no <c>context_over_200k</c> block at all, so
+    /// the old whole-record <c>catalog ?? built-in</c> handed back ThresholdTokens = null and those
+    /// models priced FLAT - the 200k premium this table knows about was live only for the one sonnet
+    /// id the catalog happens not to carry. Nothing looked inconsistent, because both the scan and the
+    /// ledger asked this same method; the numbers were simply wrong against Anthropic's list price.
+    /// </para>
     /// </remarks>
     public static ModelsDevPricingInfo? For(string model)
-        => ModelsDevPricing.Lookup("anthropic", model) ?? BuiltInFor(model);
+    {
+        var catalog = ModelsDevPricing.Lookup("anthropic", model);
+        var builtIn = BuiltInFor(model);
+        if (catalog is null || builtIn is null)
+        {
+            return catalog ?? builtIn;
+        }
+
+        return MergeOverBuiltIn(catalog, builtIn);
+    }
+
+    /// <summary>
+    /// Per-field precedence: every value the catalog HAS wins, every value it is SILENT on falls
+    /// through to the built-in table.
+    /// </summary>
+    /// <remarks>
+    /// The base input/output columns are non-nullable on a catalog record - <c>TryReadPricing</c>
+    /// refuses to build one without both - so the catalog always wins those outright and the built-in
+    /// table can only ever fill a hole, never contradict a published rate.
+    /// <para/>
+    /// "Silent" vs "deliberately none" is only distinguishable for the RATE fields: models.dev writes
+    /// an explicit <c>0</c> for a free column and that reads back as 0m, which wins here exactly as
+    /// any other number would. The THRESHOLD has no such encoding - a model with no long-context tier
+    /// and a model whose entry simply omits <c>context_over_200k</c> are byte-identical in the feed -
+    /// so absence is resolved as silence and the built-in tier survives. That is the direction the
+    /// defect demands: the alternative re-erases a tier Anthropic does charge for. A catalog that
+    /// wants to retire a tier must publish different base rates, which it would anyway.
+    /// </remarks>
+    private static ModelsDevPricingInfo MergeOverBuiltIn(ModelsDevPricingInfo catalog, ModelsDevPricingInfo builtIn)
+        => new(
+            catalog.InputPerMillion,
+            catalog.OutputPerMillion,
+            catalog.CacheReadPerMillion ?? builtIn.CacheReadPerMillion,
+            catalog.CacheCreationPerMillion ?? builtIn.CacheCreationPerMillion,
+            catalog.ThresholdTokens ?? builtIn.ThresholdTokens,
+            catalog.InputPerMillionAboveThreshold ?? builtIn.InputPerMillionAboveThreshold,
+            catalog.OutputPerMillionAboveThreshold ?? builtIn.OutputPerMillionAboveThreshold,
+            catalog.CacheReadPerMillionAboveThreshold ?? builtIn.CacheReadPerMillionAboveThreshold,
+            catalog.CacheCreationPerMillionAboveThreshold ?? builtIn.CacheCreationPerMillionAboveThreshold);
 
     /// <summary>The long-context cutoff for a model, or null when it has none / is unknown.</summary>
     /// <remarks>

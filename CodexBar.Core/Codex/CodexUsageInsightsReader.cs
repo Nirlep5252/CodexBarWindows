@@ -19,6 +19,15 @@ public sealed class CodexUsageInsightsReader
     /// </summary>
     private readonly bool persistCache;
 
+    /// <summary>
+    /// Whether this reader feeds the durable ledger. Follows <see cref="persistCache"/> everywhere
+    /// except the test seam below, which needs the ledger interaction without the shared cache file.
+    /// </summary>
+    private readonly bool writeLedger;
+
+    /// <summary>Tests need the merge to have happened by the time <c>ReadLatest</c> returns.</summary>
+    private readonly bool mergeLedgerSynchronously;
+
     public CodexUsageInsightsReader()
         : this(ResolveCodexHome(), persistCache: true)
     {
@@ -29,10 +38,39 @@ public sealed class CodexUsageInsightsReader
     {
     }
 
-    private CodexUsageInsightsReader(string codexHome, bool persistCache)
+    private CodexUsageInsightsReader(
+        string codexHome,
+        bool persistCache,
+        bool? writeLedger = null,
+        bool mergeLedgerSynchronously = false)
     {
         this.codexHome = codexHome;
         this.persistCache = persistCache;
+        this.writeLedger = writeLedger ?? persistCache;
+        this.mergeLedgerSynchronously = mergeLedgerSynchronously;
+    }
+
+    /// <summary>
+    /// Test seam: a reader over a fixture corpus that DOES feed the ledger.
+    /// </summary>
+    /// <remarks>
+    /// The interaction worth testing is the one that loses data — the 30-day scan's replace-by-scope
+    /// against days a manual import recovered — and it is unreachable while the ledger write is
+    /// gated on the same flag as the shared scan-cache file. So the two gates are separated here and
+    /// only here: the scan cache stays OFF (it is one file keyed by absolute path, and a fixture
+    /// corpus would poison it), while the ledger root must ALREADY be redirected, which is asserted
+    /// rather than assumed. Both of the user's durable stores are therefore out of reach by
+    /// construction, not by care.
+    /// </remarks>
+    internal static CodexUsageInsightsReader CreateLedgerWritingReaderForTests(string codexHome)
+    {
+        if (!UsageLedger.IsRootOverridden)
+        {
+            throw new InvalidOperationException(
+                "A ledger-writing test reader requires UsageLedger.OverrideRootForTests; refusing to write the user's real history.");
+        }
+
+        return new CodexUsageInsightsReader(codexHome, persistCache: false, writeLedger: true, mergeLedgerSynchronously: true);
     }
 
     public ProviderUsageInsightsLookupResult ReadLatest()
@@ -75,7 +113,7 @@ public sealed class CodexUsageInsightsReader
 
             // Same gate as the scan cache: a reader pointed at a custom home scans a different
             // corpus, and the ledger is durable user data rather than an accelerator.
-            var ledger = persistCache ? new CodexLedgerSink() : null;
+            var ledger = writeLedger ? new CodexLedgerSink() : null;
             if (codexFiles.Length >= MaxFilesToScan || piFiles.Length >= MaxFilesToScan)
             {
                 // Enumeration was cut off, so this batch is a lower bound on the days it touched.
@@ -92,7 +130,7 @@ public sealed class CodexUsageInsightsReader
             var scannedPaths = codexFiles.Concat(piFiles).ToHashSet(StringComparer.OrdinalIgnoreCase);
             PruneFileRowsCache(scannedPaths);
             SavePersistedCache(firstReportDay, piPaths);
-            MergeIntoLedger(ledger?.Builder, firstReportDay, today, now);
+            MergeIntoLedger(ledger?.Builder, firstReportDay, now, mergeLedgerSynchronously);
 
             var dailyRows = Enumerable.Range(0, DaysToReport)
                 .Select(offset => firstReportDay.AddDays(offset))
@@ -149,42 +187,37 @@ public sealed class CodexUsageInsightsReader
     {
         foreach (var root in SessionRoots())
         {
-            if (!Directory.Exists(root))
+            foreach (var file in EnumerateRelevantJsonlFiles(root, firstScanDay))
             {
-                continue;
-            }
-
-            IEnumerable<string> files;
-            try
-            {
-                files = Directory.EnumerateFiles(root, "*.jsonl", SearchOption.AllDirectories);
-            }
-            catch
-            {
-                continue;
-            }
-
-            foreach (var file in files)
-            {
-                if (IsRelevantFile(file, firstScanDay))
-                {
-                    yield return file;
-                }
+                yield return file;
             }
         }
     }
 
     private static IEnumerable<string> EnumeratePiJsonlFiles(string piSessionsRoot, DateOnly firstScanDay)
-    {
-        if (!Directory.Exists(piSessionsRoot))
-        {
-            yield break;
-        }
+        => EnumerateRelevantJsonlFiles(piSessionsRoot, firstScanDay);
 
-        IEnumerable<string> files;
+    /// <summary>
+    /// Every session file under <paramref name="root"/> that could hold a row inside the scan window.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="DirectoryInfo.EnumerateFiles(string, SearchOption)"/>, not the string overload, and
+    /// that is the whole reason the widened relevance test below is free: on Windows the walk already
+    /// reads each entry's write time out of the find data, so the <see cref="FileInfo"/> it hands back
+    /// answers <c>LastWriteTime</c> without a single extra syscall.
+    /// </remarks>
+    private static IEnumerable<string> EnumerateRelevantJsonlFiles(string root, DateOnly firstScanDay)
+    {
+        IEnumerable<FileInfo> files;
         try
         {
-            files = Directory.EnumerateFiles(piSessionsRoot, "*.jsonl", SearchOption.AllDirectories);
+            var directory = new DirectoryInfo(root);
+            if (!directory.Exists)
+            {
+                yield break;
+            }
+
+            files = directory.EnumerateFiles("*.jsonl", SearchOption.AllDirectories);
         }
         catch
         {
@@ -195,8 +228,49 @@ public sealed class CodexUsageInsightsReader
         {
             if (IsRelevantFile(file, firstScanDay))
             {
-                yield return file;
+                yield return file.FullName;
             }
+        }
+    }
+
+    /// <summary>
+    /// Whether a session file can contribute a row inside the scan window.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// BOTH dates, UNIONED, and that is load-bearing rather than defensive. Codex names a rollout
+    /// after the day the session STARTED and then keeps appending to that same file for as long as
+    /// the session is resumed — so a name-only test drops files that hold today's rows once the
+    /// session is older than the lookback.
+    /// </para>
+    /// <para>
+    /// That was not merely a missing number. This scan declares its 30 reported days COMPLETE, and
+    /// the ledger honours a complete batch by DELETING every existing record for those days before
+    /// writing its own. A file the enumeration skipped therefore took the history the manual import
+    /// had recovered from it down with it, on the next graphs-window open. Coverage may only be
+    /// claimed over sources the walk actually reached, so the walk now reaches everything either
+    /// date puts in the window and the claim in <see cref="MergeIntoLedger"/> holds.
+    /// </para>
+    /// <para>
+    /// It costs nothing: the write time comes from the directory walk (see above), and the extra
+    /// files admitted are exactly the long-lived sessions that were being lost — a handful, against
+    /// the ~1,800 already in the window. The ~6.3 s cold / ~2.8 s warm scan is unchanged.
+    /// </para>
+    /// </remarks>
+    private static bool IsRelevantFile(FileInfo file, DateOnly firstScanDay)
+    {
+        if (DayFromText(file.Name) is { } dayFromName && dayFromName >= firstScanDay)
+        {
+            return true;
+        }
+
+        try
+        {
+            return DateOnly.FromDateTime(file.LastWriteTime) >= firstScanDay;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -204,24 +278,6 @@ public sealed class CodexUsageInsightsReader
     {
         yield return Path.Combine(codexHome, "sessions");
         yield return Path.Combine(codexHome, "archived_sessions");
-    }
-
-    private static bool IsRelevantFile(string path, DateOnly firstScanDay)
-    {
-        var dayFromName = DayFromText(Path.GetFileName(path));
-        if (dayFromName is { })
-        {
-            return dayFromName >= firstScanDay;
-        }
-
-        try
-        {
-            return DateOnly.FromDateTime(File.GetLastWriteTime(path)) >= firstScanDay;
-        }
-        catch
-        {
-            return false;
-        }
     }
 
     private static IReadOnlyList<CodexScanRow> ScanCodexFile(string file, DateOnly firstScanDay)
@@ -643,11 +699,18 @@ public sealed class CodexUsageInsightsReader
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The covered-day declaration is what gives replace-by-scope its authority: rows are bucketed
-    /// on the calendar day the log spelled (UTC for both CLIs), so the reported window maps onto UTC
-    /// day numbers directly. A row that lands outside it — a log written in a frame ahead of local
-    /// time — still carries its own day into the merge, which is why a complete batch also asserts
-    /// authority over the days it emitted records for.
+    /// The covered-day declaration is what gives replace-by-scope its authority, and it is NOT the
+    /// report window: rows are admitted on the calendar day the log spelled while records are keyed
+    /// by the true UTC instant, so the local window straddles a UTC day at each end.
+    /// <see cref="UsageLedgerBatchBuilder.CoverReportWindow"/> owns that arithmetic and claims only
+    /// the UTC days this scan genuinely read in full. Rows that land outside it are still merged —
+    /// per-key MAX, by the merge's authority rule — rather than licensing a deletion.
+    /// </para>
+    /// <para>
+    /// The claim is only as honest as the ENUMERATION behind it — a day may be declared complete
+    /// solely because every file that could contribute to it was walked. That is a property of
+    /// <see cref="IsRelevantFile"/>, which is where it is argued; the two must be read together,
+    /// because narrowing enumeration without narrowing this deletes the user's imported history.
     /// </para>
     /// <para>
     /// Off-thread on purpose. This runs inside the history scan (and therefore only while a window
@@ -655,19 +718,27 @@ public sealed class CodexUsageInsightsReader
     /// screen should not wait behind. The batch is immutable, so nothing is shared with the scan.
     /// </para>
     /// </remarks>
-    private static void MergeIntoLedger(UsageLedgerBatchBuilder? builder, DateOnly firstReportDay, DateOnly today, DateTimeOffset scannedAt)
+    private static void MergeIntoLedger(
+        UsageLedgerBatchBuilder? builder,
+        DateOnly firstReportDay,
+        DateTimeOffset scannedAt,
+        bool synchronous)
     {
         if (builder is null)
         {
             return;
         }
 
-        builder.CoverDays(UtcMidnight(firstReportDay), UtcMidnight(today));
+        builder.CoverReportWindow(firstReportDay, scannedAt);
         var batch = builder.Build(scannedAt);
+        if (synchronous)
+        {
+            UsageLedger.TryMerge(UsageLedgerScope.Codex, batch);
+            return;
+        }
+
         _ = Task.Run(() => UsageLedger.TryMerge(UsageLedgerScope.Codex, batch));
     }
-
-    private static DateTimeOffset UtcMidnight(DateOnly day) => new(day.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
 
     /// <summary>
     /// The whole-corpus source used by <see cref="UsageLedgerBackfill"/>.
@@ -1489,12 +1560,19 @@ public sealed class CodexUsageInsightsReader
     }
 
     /// <summary>Numeric timestamps were already interpreted in LOCAL time; keep that exactly.</summary>
-    private static DateTimeOffset UnixTimestampToLocalHour(long raw)
+    /// <remarks>
+    /// The unit guess (seconds vs milliseconds) is exactly the kind of thing a future log format
+    /// breaks — microseconds or nanoseconds would land centuries out — so the result goes through
+    /// the same plausibility gate the text path uses. A garbage epoch is dropped here rather than
+    /// allowed to name a year shard; see <see cref="UsageTimestampText.EarliestPlausibleDay"/>.
+    /// </remarks>
+    private static DateTimeOffset? UnixTimestampToLocalHour(long raw)
     {
         var timestamp = (raw > 1_000_000_000_000
             ? DateTimeOffset.FromUnixTimeMilliseconds(raw)
             : DateTimeOffset.FromUnixTimeSeconds(raw)).ToLocalTime();
-        return new DateTimeOffset(timestamp.Year, timestamp.Month, timestamp.Day, timestamp.Hour, 0, 0, timestamp.Offset);
+        var hour = new DateTimeOffset(timestamp.Year, timestamp.Month, timestamp.Day, timestamp.Hour, 0, 0, timestamp.Offset);
+        return UsageTimestampText.IsPlausibleDay(DateOnly.FromDateTime(hour.DateTime)) ? hour : null;
     }
 
     private static string? ReadString(JsonElement element, string propertyName)

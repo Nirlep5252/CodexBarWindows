@@ -40,13 +40,115 @@ public sealed class UsageLedgerBatchBuilder
     public void MarkIncomplete() => IsComplete = false;
 
     /// <summary>Declares that the scan read this UTC day in full, even if it found nothing in it.</summary>
-    public void CoverDay(DateTimeOffset instant) => coveredDays.Add(UsageLedger.ToUtcDay(instant));
-
-    public void CoverDays(DateTimeOffset fromInclusive, DateTimeOffset toInclusive)
+    public void CoverDay(DateTimeOffset instant)
     {
-        for (var day = UsageLedger.ToUtcDay(fromInclusive); day <= UsageLedger.ToUtcDay(toInclusive); day++)
+        var day = UsageLedger.ToUtcDay(instant);
+        if (UsageLedger.IsRecordableUtcDay(day))
         {
             coveredDays.Add(day);
+        }
+    }
+
+    /// <summary>
+    /// Declares a whole inclusive range of UTC days read in full.
+    /// </summary>
+    /// <remarks>
+    /// CLAMPED, never trusted. The backfill derives <paramref name="fromInclusive"/> from the
+    /// earliest row it saw anywhere on disk, so a single corrupt timestamp would otherwise ask for
+    /// ~739,000 covered days spread over ~2,000 year shards — each one a read-modify-write under a
+    /// cross-process mutex, which is the difference between a merge and a hang.
+    /// </remarks>
+    public void CoverDays(DateTimeOffset fromInclusive, DateTimeOffset toInclusive)
+    {
+        var first = Math.Max(UsageLedger.ToUtcDay(fromInclusive), UsageLedger.EarliestRecordableUtcDay);
+        var last = Math.Min(UsageLedger.ToUtcDay(toInclusive), UsageLedger.LatestRecordableUtcDay);
+        for (var day = first; day <= last; day++)
+        {
+            coveredDays.Add(day);
+        }
+    }
+
+    /// <summary>
+    /// Declares the UTC days a scan that filtered its rows by WALL-CLOCK DATE genuinely read in
+    /// full, from the first day of its REPORT window and the moment it ran.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Both readers derive their window from LOCAL "today" and then keep a row when the calendar
+    /// date the row's own log SPELLS is at or after <paramref name="firstReportDay"/>. Records,
+    /// however, are keyed by the true UTC instant. One local day straddles two UTC days, so the
+    /// naive translation — "the report days ARE the covered UTC days" — claims a UTC day the scan
+    /// only clipped, and a complete batch is licensed to DELETE a claimed day.
+    /// </para>
+    /// <para>
+    /// A session line is written in one of two frames on this machine: UTC (both CLIs stamp a Z) or
+    /// LOCAL (a stamp carrying no zone, or a numeric epoch, is read in the local frame). A row
+    /// written in frame <c>o</c> at UTC instant <c>t</c> survives the filter iff
+    /// <c>date(t + o) &gt;= firstReportDay</c>, i.e. iff <c>t &gt;= firstReportDay - o</c>. The scan
+    /// can therefore only vouch for instants at or after <c>firstReportDay - min(o)</c>, and a UTC
+    /// day may be claimed only when the WHOLE of it sits inside that:
+    /// </para>
+    /// <list type="bullet">
+    /// <item>A non-negative local offset (min is UTC's own 0) leaves the first report day exactly on
+    /// the boundary — it is claimable, and the loss is on the day BEFORE it, which shows up as
+    /// records rather than as a declaration and is handled by the merge's authority rule.</item>
+    /// <item>A NEGATIVE local offset pushes the guaranteed start into the first report day itself
+    /// (at -08:00 the scan has read it only from 08:00 UTC), so that day is not claimable and this
+    /// shrinks the range by one.</item>
+    /// </list>
+    /// <para>
+    /// There is no upper filter, so the top of the range is bounded only by the clock: every instant
+    /// up to <paramref name="scannedAt"/> was read in every frame. Deliberately NOT bounded by the
+    /// last report day, which is a LOCAL date and would either claim a UTC day that has not started
+    /// or refuse the one holding today's usage, depending on the sign of the offset.
+    /// </para>
+    /// </remarks>
+    public void CoverReportWindow(DateOnly firstReportDay, DateTimeOffset scannedAt)
+        => CoverReportWindow(firstReportDay, scannedAt, TimeZoneInfo.Local);
+
+    /// <param name="zone">The frame a zone-less log line is read in. Injected only so the boundary arithmetic is testable.</param>
+    /// <inheritdoc cref="CoverReportWindow(DateOnly, DateTimeOffset)"/>
+    internal void CoverReportWindow(DateOnly firstReportDay, DateTimeOffset scannedAt, TimeZoneInfo zone)
+    {
+        var windowStart = new DateTimeOffset(firstReportDay.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
+
+        // DST makes the local offset a function of the instant, so both ends of the window are
+        // consulted and the smallest wins — a window that spans a fall-back must be judged by the
+        // frame that admits the LEAST, not by whichever end happened to be sampled.
+        var earliest = TimeSpan.Zero;
+        foreach (var candidate in new[] { SafeOffset(zone, windowStart), SafeOffset(zone, scannedAt) })
+        {
+            if (candidate < earliest)
+            {
+                earliest = candidate;
+            }
+        }
+
+        var guaranteedFrom = windowStart - earliest;
+        var day = UsageLedger.UtcDayOfHour(UsageLedger.ToUtcHour(guaranteedFrom));
+
+        // Rounded UP: a UTC day the guarantee starts partway into was only half read.
+        var first = Math.Max(
+            guaranteedFrom > UsageLedger.FromUtcHour(day * 24) ? day + 1 : day,
+            UsageLedger.EarliestRecordableUtcDay);
+        var last = Math.Min(UsageLedger.ToUtcDay(scannedAt), UsageLedger.LatestRecordableUtcDay);
+
+        for (var utcDay = first; utcDay <= last; utcDay++)
+        {
+            coveredDays.Add(utcDay);
+        }
+    }
+
+    /// <summary>A wall clock inside a DST gap has no offset and the framework throws; a scan is not worth that.</summary>
+    private static TimeSpan SafeOffset(TimeZoneInfo zone, DateTimeOffset instant)
+    {
+        try
+        {
+            return zone.GetUtcOffset(instant);
+        }
+        catch
+        {
+            return zone.BaseUtcOffset;
         }
     }
 
@@ -143,6 +245,14 @@ public sealed class UsageLedgerBatchBuilder
         UsageLedgerTokens longContext,
         int requests = 1)
     {
+        // Dropped at the door. A row whose timestamp cannot be real is not usage the user had, and
+        // letting it in costs far more than the row is worth: its day names a year shard, so one
+        // year-0001 record adds a whole extra file to every merge for the life of the ledger.
+        if (!UsageLedger.IsRecordableInstant(timestampUtc))
+        {
+            return;
+        }
+
         var key = new UsageLedgerKey(UsageLedger.ToUtcHour(timestampUtc), model ?? string.Empty, flags, Math.Max(0, thresholdTokens));
         records[key] = records.TryGetValue(key, out var existing)
             ? existing with

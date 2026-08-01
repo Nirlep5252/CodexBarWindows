@@ -126,7 +126,7 @@ public sealed class ClaudeUsageInsightsReader
                 ledger?.Add(row);
             }
 
-            MergeIntoLedger(ledger?.Builder, firstReportDay, today, now);
+            MergeIntoLedger(ledger?.Builder, firstReportDay, now);
 
             var dailyRows = Enumerable.Range(0, DaysToReport)
                 .Select(offset => firstReportDay.AddDays(offset))
@@ -480,10 +480,12 @@ public sealed class ClaudeUsageInsightsReader
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The covered-day declaration is what gives replace-by-scope its authority: rows are bucketed
-    /// on the calendar day the log spelled (Claude Code writes UTC), so the reported window maps
-    /// onto UTC day numbers directly. A row outside it still carries its own day into the merge,
-    /// which is why a complete batch also asserts authority over the days it emitted records for.
+    /// The covered-day declaration is what gives replace-by-scope its authority, and it is NOT the
+    /// report window: rows are admitted on the calendar day the log spelled while records are keyed
+    /// by the true UTC instant, so the local window straddles a UTC day at each end.
+    /// <see cref="UsageLedgerBatchBuilder.CoverReportWindow"/> owns that arithmetic and claims only
+    /// the UTC days this scan genuinely read in full. Rows that land outside it are still merged —
+    /// per-key MAX, by the merge's authority rule — rather than licensing a deletion.
     /// </para>
     /// <para>
     /// Off-thread on purpose. This runs inside the history scan (and therefore only while a window
@@ -491,19 +493,17 @@ public sealed class ClaudeUsageInsightsReader
     /// screen should not wait behind. The batch is immutable, so nothing is shared with the scan.
     /// </para>
     /// </remarks>
-    private static void MergeIntoLedger(UsageLedgerBatchBuilder? builder, DateOnly firstReportDay, DateOnly today, DateTimeOffset scannedAt)
+    private static void MergeIntoLedger(UsageLedgerBatchBuilder? builder, DateOnly firstReportDay, DateTimeOffset scannedAt)
     {
         if (builder is null)
         {
             return;
         }
 
-        builder.CoverDays(UtcMidnight(firstReportDay), UtcMidnight(today));
+        builder.CoverReportWindow(firstReportDay, scannedAt);
         var batch = builder.Build(scannedAt);
         _ = Task.Run(() => UsageLedger.TryMerge(UsageLedgerScope.Claude, batch));
     }
-
-    private static DateTimeOffset UtcMidnight(DateOnly day) => new(day.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
 
     /// <summary>
     /// The whole-corpus source used by <see cref="UsageLedgerBackfill"/>.

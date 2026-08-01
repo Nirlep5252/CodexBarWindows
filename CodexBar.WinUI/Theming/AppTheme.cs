@@ -22,7 +22,17 @@ internal static class AppTheme
 {
     private static DispatcherQueue? uiQueue;
 
-    public static UiSettings Settings { get; private set; } = UiSettings.Load();
+    /// <summary>
+    /// The persisted settings as this shell sees them. ALWAYS read through
+    /// <see cref="UiSettings.WithoutVibes"/>: vibes is not implemented here (see the hidden row
+    /// in SettingsWindow.xaml), and the registry key is shared with the WinForms app, so a user
+    /// who turned vibes on there arrives with <c>UiVibes=1</c> and would otherwise get
+    /// <c>EffectiveMaterial</c> pinned to Acrylic and a force-dark theme from a feature this
+    /// shell never renders. This property is the shell's ONLY settings instance - every window,
+    /// including SettingsWindow, reads it - so neutralising here covers every consumer at once.
+    /// Drop the call when VibeTheme is ported, together with un-hiding the toggle.
+    /// </summary>
+    public static UiSettings Settings { get; private set; } = UiSettings.Load().WithoutVibes();
 
     /// <summary>Raised on the UI thread after <see cref="Settings"/> is reloaded.</summary>
     public static event EventHandler? Changed;
@@ -44,7 +54,7 @@ internal static class AppTheme
         // UiSettings.Changed can be raised from any thread; every consumer touches XAML.
         uiQueue?.TryEnqueue(() =>
         {
-            Settings = UiSettings.Load();
+            Settings = UiSettings.Load().WithoutVibes();
             DiagnosticLog.Write("theme reload theme={0} material={1} tint={2}", Settings.Theme, Settings.EffectiveMaterial, Settings.TintOpacityPercent);
             Changed?.Invoke(null, EventArgs.Empty);
         });

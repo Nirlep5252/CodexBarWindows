@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.Linq;
+using System.Threading.Tasks;
 using CodexBarWindows;
 using LiveChartsCore;
 using LiveChartsCore.Kernel;
@@ -65,9 +66,15 @@ public sealed partial class GraphsWindow : Window
     /// chart and row-card minimums = 508, rounded up for an open error line. Horizontally, the
     /// metric card's four cells plus the model row's fixed 118/64/76 columns need ~600 before the
     /// meter stops being a stub.
+    /// <para>
+    /// Raised from 520 to pay for the TODAY BAR (~34 DIP plus one 10px RowSpacing) and the
+    /// breakdown card's pinned total footer (~22). Without the raise the user can drag the window
+    /// to a size where the chart's plot area collapses, which is the exact condition the enforced
+    /// minimum exists to prevent.
+    /// </para>
     /// </summary>
     private const int MinimumWidthDips = 600;
-    private const int MinimumHeightDips = 520;
+    private const int MinimumHeightDips = 580;
 
     private readonly IntPtr hwnd;
     private readonly UsageRefreshService service;
@@ -134,6 +141,29 @@ public sealed partial class GraphsWindow : Window
     /// </remarks>
     private bool isClosed;
 
+    /// <summary>
+    /// Cancelled by <see cref="Teardown"/> BEFORE it clears the ledger's read cache. Every
+    /// background ledger read this window starts carries this token.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="isClosed"/> cannot do this job. It is written and read on the UI thread and it
+    /// guards XAML touches; the thing that has to be ordered here is a THREAD-POOL read that
+    /// re-populates a static cache. A plain bool checked before the I/O would only narrow the race
+    /// (the check can pass a microsecond before the close), and the failure it narrows is not a
+    /// stale pixel - it is every parsed shard staying resident for the life of a tray process that
+    /// is supposed to cost nothing when idle, which is precisely what
+    /// <see cref="UsageLedger.ReleaseReadCache"/> exists to prevent.
+    /// </para>
+    /// <para>
+    /// Never disposed, deliberately: nothing registers a callback or touches WaitHandle on it, so it
+    /// owns no unmanaged resource, and a background task is entitled to read
+    /// <c>IsCancellationRequested</c> long after the window is gone. Disposing it would buy nothing
+    /// and would put a use-after-dispose on the one path that must not throw.
+    /// </para>
+    /// </remarks>
+    private readonly System.Threading.CancellationTokenSource lifetime = new();
+
     private string dailyShape = string.Empty;
     private string modelRowShape = string.Empty;
 
@@ -146,18 +176,78 @@ public sealed partial class GraphsWindow : Window
     /// </summary>
     private RectangularSection? selectionSection;
 
+    /// <summary>
+    /// The X-axis UNIT the axis currently installed on the chart was built with.
+    /// </summary>
+    /// <remarks>
+    /// Written ONLY inside <see cref="ApplyDailyAxis"/>, beside the axis it describes. The selection
+    /// band is positioned from half of THIS rather than from half a bucket's duration, because the
+    /// two are not the same number in Year view (a 30-day unit against 28-31 day buckets) - and a
+    /// copy of it written anywhere else would drift out of sync with the axis actually installed and
+    /// misalign the band in exactly one granularity.
+    /// </remarks>
+    private TimeSpan axisUnit = TimeSpan.FromDays(1);
+
+    /// <summary>
+    /// The collision nudge each category label takes, computed ONCE per render for the whole period.
+    /// </summary>
+    /// <remarks>
+    /// It used to be a per-pass counter, and the chart and the rows iterate in DIFFERENT orders
+    /// (stack order vs cost-descending), so two labels that collided got the base colour and the
+    /// nudged one swapped between the legend swatch and the row meter - and a row could change
+    /// colour just by entering a drill-down. The map is keyed by label and built from the WHOLE
+    /// period's label set in a fixed ordinal order, so a label's colour depends on the period and on
+    /// nothing else about what is currently on screen.
+    /// </remarks>
+    private readonly Dictionary<string, int> nudgeSteps = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Brushes by ARGB. <see cref="ModelRowModel"/>'s equality guard compares Brush REFERENCES, so
+    /// allocating a fresh <c>SolidColorBrush</c> every render defeats it and re-raises
+    /// PropertyChanged for a colour that never moved - which is a meter re-animation per refresh.
+    /// </summary>
+    private readonly Dictionary<uint, Microsoft.UI.Xaml.Media.SolidColorBrush> brushCache = [];
+
     // ---- the period the strip is pointing at --------------------------------------------------
 
-    /// <summary>Year is fully wired but has no visible control; see the SelectorBar in the XAML.</summary>
     private UsageLedgerGranularity granularity = UsageLedgerGranularity.Month;
 
     /// <summary>Any date INSIDE the selected period. The bounds are derived, never stored.</summary>
     private DateOnly anchor = DateOnly.FromDateTime(DateTime.Now);
 
+    /// <summary>
+    /// The local day the last render was drawn for, so the window can re-base itself across
+    /// midnight WITHOUT owning a timer. A DispatcherTimer here would be a new always-on cost and an
+    /// object that outlives the window; comparing dates inside <see cref="Render"/> costs nothing
+    /// and cannot outlive anything.
+    /// </summary>
+    private DateOnly renderedDay = DateOnly.FromDateTime(DateTime.Now);
+
     /// <summary>Local start of the drilled-into bucket, or null for the whole period.</summary>
     private DateTime? selectedBucket;
 
     private UsageLedgerCoverage coverage = UsageLedgerCoverage.None;
+
+    /// <summary>
+    /// The scope <see cref="coverage"/> actually describes.
+    /// </summary>
+    /// <remarks>
+    /// Load-bearing, not bookkeeping. <see cref="RefreshCoverage"/> resolves off the UI thread while
+    /// its callers render IMMEDIATELY, so without this the frame drawn right after a provider switch
+    /// paired the new provider's series with the OLD provider's coverage — a back arrow clamped to a
+    /// floor from the other corpus, and an import affordance answering a question about the wrong
+    /// history. Nulling coverage the moment the scope changes makes that frame merely UNKNOWN, which
+    /// is true, instead of confidently wrong.
+    /// </remarks>
+    private UsageLedgerScope? coverageScope;
+
+    /// <summary>
+    /// Bumped by every <see cref="RefreshCoverage"/>. A load that lands after a newer one was
+    /// started is dropped rather than applied, which is what keeps a slow read of the Codex shards
+    /// from overwriting the Claude coverage the user just switched to.
+    /// </summary>
+    private int coverageGeneration;
+
     private PeriodView? period;
 
     /// <summary>
@@ -331,6 +421,11 @@ public sealed partial class GraphsWindow : Window
 
         isClosed = true;
 
+        // BEFORE the unsubscribes and, above all, before ReleaseReadCache below - the whole ordering
+        // argument in RefreshCoverage rests on the cancel happening first. Cancel() is idempotent, so
+        // the second entry point (Closing then Closed) is a no-op like the rest of this method.
+        lifetime.Cancel();
+
         AppWindow.Closing -= OnAppWindowClosing;
         Activated -= OnActivated;
         RootGrid.ActualThemeChanged -= OnRootActualThemeChanged;
@@ -343,6 +438,13 @@ public sealed partial class GraphsWindow : Window
 
         QuiesceCharts();
         ReleaseHistoryGate();
+
+        // This window is the ONLY reader of the ledger in the process, so its close is the moment
+        // the parsed shards provably have no future reader. Holding tens of MB of deserialized
+        // history in a tray icon that is supposed to do nothing when idle is exactly the cost this
+        // app refuses to pay; the next open pays a parse it is already waiting through a scan for.
+        // Last, and outside the try above, for the same reason ReleaseHistoryGate is.
+        UsageLedger.ReleaseReadCache();
     }
 
     /// <summary>
@@ -513,6 +615,32 @@ public sealed partial class GraphsWindow : Window
         suppressGranularityEvents = false;
     }
 
+    /// <summary>
+    /// Puts the SelectorBar back in step with <see cref="granularity"/> after something OTHER than
+    /// the bar changed it (the today bar, a drill-down). Suppressed, for the reason
+    /// <see cref="suppressGranularityEvents"/> exists: assigning SelectedItem raises
+    /// SelectionChanged, which would re-enter the very transition that is mid-flight.
+    /// </summary>
+    private void SyncGranularityBar()
+    {
+        var item = granularity switch
+        {
+            UsageLedgerGranularity.Year => GranularityYear,
+            UsageLedgerGranularity.Week => GranularityWeek,
+            UsageLedgerGranularity.Day => GranularityDay,
+            _ => GranularityMonth
+        };
+
+        if (ReferenceEquals(GranularityBar.SelectedItem, item))
+        {
+            return;
+        }
+
+        suppressGranularityEvents = true;
+        GranularityBar.SelectedItem = item;
+        suppressGranularityEvents = false;
+    }
+
     private void OnGranularityChanged(SelectorBar sender, SelectorBarSelectionChangedEventArgs args)
     {
         if (suppressGranularityEvents || isClosed)
@@ -533,21 +661,60 @@ public sealed partial class GraphsWindow : Window
             return;
         }
 
-        granularity = next;
+        ApplyGranularity(next, anchor);
+    }
 
-        // The ANCHOR is kept, so "July, switched to Week" lands on the week containing the anchor
-        // rather than resetting the user to today. A period that would now sit in the future is
-        // clamped back to the current one.
+    /// <summary>
+    /// Switches granularity, keeping the user where they were.
+    /// </summary>
+    /// <remarks>
+    /// The ANCHOR is kept, so "July, switched to Week" lands on the week containing the anchor
+    /// rather than resetting the user to today. Two clamps then apply, in this order: a period that
+    /// would sit in the FUTURE comes back to today, and a period that would sit entirely BEFORE the
+    /// coverage floor moves forward onto the floor - the second is what stops "Month ▸ Year" on an
+    /// old anchor landing the user on an empty year with a dead back arrow.
+    /// </remarks>
+    private void ApplyGranularity(UsageLedgerGranularity next, DateOnly at)
+    {
+        granularity = next;
+        anchor = at;
+
         var today = DateOnly.FromDateTime(DateTime.Now);
         if (GraphsPeriod.Bounds(granularity, anchor).Start > today)
         {
             anchor = today;
         }
 
+        if (CoverageStart(service.GetHistory(selectedProviderKey).Insights) is { } floor &&
+            GraphsPeriod.Bounds(granularity, anchor).EndInclusive < floor &&
+            floor <= today)
+        {
+            anchor = floor;
+        }
+
         selectedBucket = null;
+        SyncGranularityBar();
         ApplyDailyAxis();
         InvalidatePeriod();
         Render();
+    }
+
+    /// <summary>
+    /// The today bar's click: "show me today in detail".
+    /// </summary>
+    /// <remarks>
+    /// The ONE place in the window where clicking something changes the period - worth the
+    /// exception because it is the shortcut every piece of the feedback asked for, and because the
+    /// bar is a permanent, unambiguous target rather than a chart element whose meaning moves.
+    /// </remarks>
+    private void OnTodayClick(object sender, RoutedEventArgs e)
+    {
+        if (isClosed)
+        {
+            return;
+        }
+
+        ApplyGranularity(UsageLedgerGranularity.Day, DateOnly.FromDateTime(DateTime.Now));
     }
 
     private void OnPreviousPeriod(object sender, RoutedEventArgs e) => MovePeriod(-1);
@@ -621,9 +788,118 @@ public sealed partial class GraphsWindow : Window
 
     /// <summary>
     /// Coverage is a full parse of every shard for the scope, so it is resolved on the events that
-    /// can actually move it (provider change, completed scan) rather than per render.
+    /// can actually move it (provider change, completed scan) rather than per render — and OFF the
+    /// UI thread.
     /// </summary>
-    private void RefreshCoverage() => coverage = UsageLedger.GetCoverage(LedgerScope);
+    /// <remarks>
+    /// <para>
+    /// "A full parse of every shard" is disk I/O plus JSON deserialization that grows with every
+    /// year of imported history, and it used to run on the dispatcher on every history update, with
+    /// <see cref="BuildPeriod"/> re-reading the same files immediately afterwards. With a few years
+    /// imported that is tens of MB of JSON per refresh and per period change, and the window
+    /// visibly stutters.
+    /// </para>
+    /// <para>
+    /// <c>WarmCache</c> is what makes the render path cheap rather than merely LATER: it parses the
+    /// scope's shards into the ledger's read cache on this thread-pool thread, so the
+    /// <c>BuildPeriod</c> that follows finds every year already deserialized and does a dictionary
+    /// lookup plus one stat per shard. The cache is invalidated by any merge, so this cannot serve
+    /// a stale answer.
+    /// </para>
+    /// <para>
+    /// The GENERATION counter is not optional: the user can switch provider (or close the window)
+    /// while a load is in flight, and a late answer for the previous scope is wrong rather than
+    /// merely stale. The dispatcher is captured here, on the UI thread and while the window is
+    /// alive, because reading it from a closed window is itself unsafe — and the callback re-checks
+    /// <see cref="isClosed"/> for the reason the teardown guards exist at all.
+    /// </para>
+    /// <para>
+    /// SYNCHRONOUS PART FIRST. Every caller renders immediately after this returns, so the scope
+    /// change has to take effect on THIS thread — see <see cref="coverageScope"/>. And the failure
+    /// path enqueues <see cref="UsageLedgerCoverage.None"/> rather than returning: a coverage read
+    /// that threw knows nothing, and leaving the previous answer on screen would pin the UI to
+    /// another provider's history with no second chance to correct it.
+    /// </para>
+    /// </remarks>
+    private void RefreshCoverage()
+    {
+        var scope = LedgerScope;
+
+        // Before any render can observe it. A coverage record belongs to exactly one scope, so the
+        // instant the scope moves the old one stops being stale and starts being WRONG.
+        if (coverageScope != scope)
+        {
+            coverageScope = scope;
+            coverage = UsageLedgerCoverage.None;
+        }
+
+        var generation = ++coverageGeneration;
+        var dispatcher = DispatcherQueue;
+
+        // Captured here, on the UI thread and while the window is alive, for the same reason the
+        // dispatcher is.
+        var alive = lifetime.Token;
+
+        _ = Task.Run(() =>
+        {
+            // LIVENESS BEFORE THE I/O, not only before the XAML touch. A task queued just before a
+            // close would otherwise parse every shard for a window nobody can see, and leave the
+            // result resident.
+            if (alive.IsCancellationRequested)
+            {
+                return;
+            }
+
+            UsageLedgerCoverage next;
+            try
+            {
+                UsageLedger.WarmCache(scope);
+                next = UsageLedger.GetCoverage(scope);
+            }
+            catch
+            {
+                // Neither call is supposed to throw (both swallow their own I/O failures), but this
+                // runs unobserved on the thread pool - an escape here would be a process-level
+                // unhandled exception, which is the one outcome a coverage read must not have.
+                next = UsageLedgerCoverage.None;
+            }
+
+            // AND AFTER IT, because the check above only NARROWS the window - the close can land at
+            // any point during the parse, and by then this task has already re-populated the cache
+            // that Teardown just cleared. So a late task cleans up after itself, which is what makes
+            // the ordering total rather than merely unlikely:
+            //
+            //   Teardown is Cancel() THEN ReleaseReadCache(), in that order, on the UI thread.
+            //   If this check observes cancellation, we clear what we just parsed - and no reader
+            //   remains to want it, since this window is the ledger's only reader.
+            //   If it does not, the Cancel had not happened yet, so it happens AFTER our parse and
+            //   its ReleaseReadCache - which follows it - therefore also happens after our parse
+            //   and wipes it.
+            //
+            // Either way the cache is empty once both have run, whatever the interleaving. (The
+            // dispatcher callback below re-reads the ledger through Render, but that runs on the UI
+            // thread, serialised against Teardown, and its isClosed guard settles that case.)
+            if (alive.IsCancellationRequested)
+            {
+                UsageLedger.ReleaseReadCache();
+                return;
+            }
+
+            dispatcher.TryEnqueue(() =>
+            {
+                // Closed, or superseded by a later provider selection: either way this answer is
+                // about a window or a scope that no longer exists.
+                if (isClosed || generation != coverageGeneration)
+                {
+                    return;
+                }
+
+                coverage = next;
+                InvalidatePeriod();
+                Render();
+            });
+        });
+    }
 
     private UsageLedgerScope LedgerScope =>
         ProviderKeys.ProviderOf(selectedProviderKey) == UsageProvider.Claude
@@ -648,6 +924,8 @@ public sealed partial class GraphsWindow : Window
             return;
         }
 
+        RebaseAcrossMidnight();
+
         var result = service.GetHistory(selectedProviderKey);
         var refreshing = service.IsRefreshing;
 
@@ -668,6 +946,7 @@ public sealed partial class GraphsWindow : Window
                 isStale: false);
             RenderError(result.Error, ErrorKind.NoData);
             RenderTimeline(insights: null, hasData: false);
+            RenderToday(insights: null, refreshing);
             SetAllMetrics(refreshing ? "…" : "--");
             dailySeries.Clear();
             dailySlots.Clear();
@@ -705,7 +984,14 @@ public sealed partial class GraphsWindow : Window
             result.IsStale ? ErrorKind.Stale : ErrorKind.Incomplete);
 
         RenderTimeline(insights, hasData: true);
+        RenderToday(insights, refreshing);
         RenderMetrics(period);
+
+        // The heading follows the period rather than only the granularity, because a Day period the
+        // ledger cannot answer for is plotted from the scan and therefore is NOT hourly.
+        ChartHeadingText.Text = period.HourlyDetailMissing
+            ? "Estimated spend (hourly detail not recorded yet)"
+            : $"Estimated spend by {GraphsPeriod.BucketNoun(granularity)}";
 
         // The chart is the expensive, animated part, and most renders bring numbers that are
         // already on screen (the refreshing flag alone accounts for two renders per refresh, both
@@ -719,6 +1005,13 @@ public sealed partial class GraphsWindow : Window
         plottedInsights = insights;
         plottedKey = key;
         plottedScopeKey = scopeKey;
+
+        if (replot || rescope)
+        {
+            // BEFORE either consumer, and from the whole period rather than from whatever is about
+            // to be drawn, so the chart and the rows agree on every label's colour.
+            RebuildNudgeSteps(period);
+        }
 
         if (replot)
         {
@@ -751,6 +1044,131 @@ public sealed partial class GraphsWindow : Window
     }
 
     /// <summary>
+    /// Moves the window onto the new day when it has been left open across local midnight.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="anchor"/> is initialised once and was never re-based, while "today" is recomputed
+    /// per render - so a window left open overnight silently relabelled its Day view "Yesterday" and
+    /// grew a jump-to-now button, with no data change to explain either.
+    /// </para>
+    /// <para>
+    /// The anchor is only dragged along when it WAS today and the user is in Day view; anywhere else
+    /// the anchor is a place the user chose to be and moving it would be the window navigating
+    /// itself. Everything else is invalidation.
+    /// </para>
+    /// </remarks>
+    private void RebaseAcrossMidnight()
+    {
+        var today = DateOnly.FromDateTime(DateTime.Now);
+        if (today == renderedDay)
+        {
+            return;
+        }
+
+        if (granularity == UsageLedgerGranularity.Day && anchor == renderedDay)
+        {
+            anchor = today;
+            selectedBucket = null;
+        }
+
+        renderedDay = today;
+        InvalidatePeriod();
+    }
+
+    // ---------------------------------------------------------------- today
+
+    /// <summary>
+    /// The permanent "what have I spent today" line, INDEPENDENT of granularity, anchor and
+    /// selection.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The redesign replaced two fixed summary cards with a period-scoped metric row and left today
+    /// reachable only by switching to Day view and being anchored on today - three interactions and
+    /// a mode change for the single most-wanted number in a usage tray app. This bar is the fixed
+    /// reference point that makes the rest of the window safe to wander around in, so it is NEVER
+    /// greyed, hidden or annotated when the browsed period does not contain today; its stability is
+    /// the whole point.
+    /// </para>
+    /// <para>
+    /// ZERO IDLE COST is unaffected: this is a read of the cache <see cref="RefreshCoverage"/>
+    /// already warmed, on the render path, behind the same window-open history gate as everything
+    /// else. No second Task.Run, no timer, and nothing here contributes to the plot or shape keys -
+    /// a today refresh must never rebuild the chart.
+    /// </para>
+    /// </remarks>
+    private void RenderToday(ProviderUsageInsights? insights, bool refreshing)
+    {
+        if (insights is null)
+        {
+            TodayValueText.Text = refreshing ? "…" : "--";
+            TodayDetailText.Text = refreshing ? "Scanning local sessions…" : string.Empty;
+            TodayCompareText.Text = string.Empty;
+            ToolTipService.SetToolTip(TodayCard, "Show today in detail");
+            return;
+        }
+
+        var today = DateOnly.FromDateTime(DateTime.Now);
+        var (cost, tokens, models) = ReadDay(today, insights);
+        var (previousCost, _, _) = ReadDay(today.AddDays(-1), insights);
+
+        TodayValueText.Text = FormatUsd(cost);
+
+        var detail = tokens > 0 || cost > 0
+            ? $"{FormatTokens(tokens)}  ·  {models} {Plural("model", models)}"
+            // $0.00 and not "—": zero IS the answer to "what did I spend today", and the user asked
+            // for the answer rather than for the absence of one.
+            : "No usage recorded today";
+        TodayDetailText.Text = detail;
+
+        var compare = previousCost > 0
+            ? $"vs yesterday {FormatSignedPercent(cost, previousCost)}"
+            : cost > 0
+                ? "vs yesterday  ·  new"
+                : string.Empty;
+        TodayCompareText.Text = compare;
+
+        ToolTipService.SetToolTip(
+            TodayCard,
+            string.Join(
+                Environment.NewLine,
+                $"Today  ·  {FormatUsd(cost)}",
+                detail,
+                string.IsNullOrEmpty(compare) ? $"Yesterday  ·  {FormatUsd(previousCost)}" : compare,
+                $"Local estimates  ·  updated {FormatObservedAt(insights.ObservedAt)}"));
+    }
+
+    /// <summary>
+    /// One local day's spend, tokens and model count, under the SAME one-source rule
+    /// <see cref="BuildPeriod"/> uses: the ledger when it can price the day, otherwise the scan's
+    /// row for it - never a sum of the two. Today is always inside the 30-day scan window, so the
+    /// scan can answer even on a cold install.
+    /// </summary>
+    private (decimal Cost, long Tokens, int Models) ReadDay(DateOnly day, ProviderUsageInsights insights)
+    {
+        var scope = LedgerScope;
+        var series = QueryRange(scope, day, day, UsageLedgerGranularity.Day, LedgerPricing.For(scope));
+        var buckets = (IReadOnlyList<UsageLedgerBucket>)series.Buckets;
+
+        if (!series.HasPriceableData && BuildFallbackBuckets(buckets, insights) is { } fallback)
+        {
+            buckets = fallback;
+        }
+
+        var bucket = buckets.Count > 0 ? buckets[0] : null;
+        if (bucket is null)
+        {
+            return (0m, 0, 0);
+        }
+
+        return (
+            bucket.EstimatedCostUsd,
+            bucket.TotalTokens,
+            bucket.Models.Count(model => model.EstimatedCostUsd > 0 || model.TotalTokens > 0));
+    }
+
+    /// <summary>
     /// Identity of the PLOTTED data: provider, period and the insights instance the ledger was read
     /// alongside. A refresh that lands the same numbers on the same period changes nothing.
     /// </summary>
@@ -768,6 +1186,21 @@ public sealed partial class GraphsWindow : Window
     /// Everything the four metrics, the chart and the rows need about one period, resolved once per
     /// data change rather than per render.
     /// </summary>
+    /// <param name="ElapsedFraction">
+    /// Elapsed buckets counting the in-progress one FRACTIONALLY - the divisor for "average per
+    /// bucket" and the base of the projection. See <see cref="GraphsPeriod.Elapsed"/>.
+    /// </param>
+    /// <param name="ElapsedBuckets">The same span in whole buckets, for the "over N days" line.</param>
+    /// <param name="CoverageInsidePeriod">
+    /// True when recording BEGAN inside this period, i.e. the period is partial for a reason no
+    /// amount of waiting will fix. Suppresses the projection: extrapolating a full year from the
+    /// five months that happen to be recorded is a number with no meaning.
+    /// </param>
+    /// <param name="HourlyDetailMissing">
+    /// True when a Day period had to be answered by the scan, which reports days and cannot split
+    /// one into hours. The chart then carries ONE column for the whole day and says so, rather than
+    /// fabricating a distribution or going blank.
+    /// </param>
     private sealed record PeriodView(
         UsageLedgerGranularity Granularity,
         UsageLedgerGranularity Bucket,
@@ -782,9 +1215,13 @@ public sealed partial class GraphsWindow : Window
         bool HasData,
         decimal PreviousCost,
         bool PreviousCovered,
-        int ElapsedUnits,
+        double ElapsedFraction,
+        int ElapsedBuckets,
+        bool CurrentBucketInProgress,
         int TotalUnits,
-        bool IsCurrent);
+        bool IsCurrent,
+        bool CoverageInsidePeriod,
+        bool HourlyDetailMissing);
 
     private PeriodView BuildPeriod(ProviderUsageInsights insights)
     {
@@ -813,11 +1250,22 @@ public sealed partial class GraphsWindow : Window
         // as $0.00 for as long as the model stayed unknown. Priceable data is what makes the
         // ledger's money an answer; free usage (a model whose published rate is 0.00) counts as
         // priceable, so genuinely-zero spend keeps the ledger and is not mistaken for this.
-        if ((!hasData || !series.HasPriceableData) && bucket != UsageLedgerGranularity.Hour)
+        //
+        // HOUR BUCKETS TAKE THE FALLBACK TOO, which is the one case this deliberately excluded. The
+        // exclusion made Day view - the only place "today" existed - render "No usage recorded yet"
+        // on a cold ledger while Month view showed real numbers from the same scan, i.e. exactly the
+        // state a new user is in when they first ask what they spent today. The scan cannot split a
+        // day into hours, so the whole day becomes ONE column and the heading says so; nothing is
+        // fabricated, and BuildFallbackBuckets still REPLACES rather than adds, so no double count.
+        var hourlyDetailMissing = false;
+        if (!hasData || !series.HasPriceableData)
         {
-            var fallback = BuildFallbackBuckets(buckets, insights);
+            var fallback = bucket == UsageLedgerGranularity.Hour
+                ? BuildWholeDayFallback(buckets, insights)
+                : BuildFallbackBuckets(buckets, insights);
             if (fallback is not null)
             {
+                hourlyDetailMissing = bucket == UsageLedgerGranularity.Hour;
                 buckets = fallback;
                 models = AggregateModels(buckets, insights, start, end);
                 cost = buckets.Sum(item => item.EstimatedCostUsd);
@@ -836,28 +1284,31 @@ public sealed partial class GraphsWindow : Window
         var isCurrent = start <= today && today <= end;
         var floor = CoverageStart(insights);
 
-        // Averaging over the calendar period would read as a 60% drop for the first month recorded:
-        // a month whose recording began on the 20th has 12 days of data, not 31. Elapsed buckets are
-        // therefore clamped to the coverage floor as well as to now.
-        var elapsed = buckets.Count(item =>
-            item.StartLocal <= now &&
-            (floor is not { } value || item.EndLocalExclusive > value.ToDateTime(TimeOnly.MinValue)));
-        elapsed = Math.Max(1, elapsed);
+        var elapsed = GraphsPeriod.Elapsed(
+            buckets.Select(item => (item.StartLocal, item.EndLocalExclusive)).ToArray(),
+            now,
+            floor is { } floorDay ? new DateTimeOffset(floorDay.ToDateTime(TimeOnly.MinValue), TimeZoneInfo.Local.GetUtcOffset(floorDay.ToDateTime(TimeOnly.MinValue))) : null);
 
         var previousAnchor = GraphsPeriod.Shift(granularity, anchor, -1);
         var (previousStart, previousEnd) = GraphsPeriod.Bounds(granularity, previousAnchor);
         var previousSeries = QueryRange(scope, previousStart, previousEnd, bucket, pricing);
         var previousBuckets = (IReadOnlyList<UsageLedgerBucket>)previousSeries.Buckets;
-        if (!previousBuckets.Any(item => item.EstimatedCostUsd > 0) && bucket != UsageLedgerGranularity.Hour)
+        if (!previousBuckets.Any(item => item.EstimatedCostUsd > 0))
         {
-            previousBuckets = BuildFallbackBuckets(previousBuckets, insights) ?? previousBuckets;
+            // The SAME gate as the current period's, deliberately: change one site and the Day
+            // view's "vs previous" cell disagrees with its own chart about where the numbers came
+            // from.
+            previousBuckets = (bucket == UsageLedgerGranularity.Hour
+                ? BuildWholeDayFallback(previousBuckets, insights)
+                : BuildFallbackBuckets(previousBuckets, insights)) ?? previousBuckets;
         }
 
         // LIKE FOR LIKE: three days of July against all of June would show a permanent, meaningless
         // -90%, so a period still running is compared against the same number of elapsed buckets of
-        // the one before it.
+        // the one before it. WHOLE buckets here - "the same point in June" is a day boundary, and a
+        // fractional take is not a thing you can slice a bucket list with.
         var previousCost = isCurrent
-            ? previousBuckets.Take(elapsed).Sum(item => item.EstimatedCostUsd)
+            ? previousBuckets.Take(elapsed.Buckets).Sum(item => item.EstimatedCostUsd)
             : previousBuckets.Sum(item => item.EstimatedCostUsd);
 
         return new PeriodView(
@@ -874,9 +1325,39 @@ public sealed partial class GraphsWindow : Window
             hasData,
             previousCost,
             PreviousCovered: floor is not { } coverageFloor || previousEnd >= coverageFloor,
-            elapsed,
+            elapsed.Fraction,
+            elapsed.Buckets,
+            elapsed.CurrentInProgress,
             buckets.Count,
-            isCurrent);
+            isCurrent,
+            CoverageInsidePeriod: floor is { } inside && inside > start,
+            hourlyDetailMissing);
+    }
+
+    /// <summary>
+    /// The whole period as ONE bucket filled from the scan - the Day view's fallback when the ledger
+    /// has no hours to give.
+    /// </summary>
+    /// <remarks>
+    /// Built by handing <see cref="BuildFallbackBuckets"/> a single slot spanning the ledger's own
+    /// bucket bounds, so the matching rule, the category grouping and above all the "REPLACES, never
+    /// adds" contract are the scan fallback's and not a second implementation of them.
+    /// </remarks>
+    private static IReadOnlyList<UsageLedgerBucket>? BuildWholeDayFallback(
+        IReadOnlyList<UsageLedgerBucket> bounds,
+        ProviderUsageInsights insights)
+    {
+        if (bounds.Count == 0)
+        {
+            return null;
+        }
+
+        var span = new UsageLedgerBucket(
+            bounds[0].StartLocal,
+            bounds[^1].EndLocalExclusive,
+            0, 0, 0, 0, 0m, 0m, 0, [], [], false);
+
+        return BuildFallbackBuckets([span], insights);
     }
 
     private static UsageLedgerSeries QueryRange(
@@ -1038,25 +1519,32 @@ public sealed partial class GraphsWindow : Window
         ImportHistoryLink.Visibility = importable ? Visibility.Visible : Visibility.Collapsed;
 
         var floor = CoverageStart(insights);
-        var canGoBack = hasData && (floor is not { } value || GraphsPeriod.Bounds(granularity, GraphsPeriod.Shift(granularity, anchor, -1)).EndInclusive >= value);
+        var noun = GraphsPeriod.Noun(granularity);
+        var canGoBack = hasData && GraphsPeriod.CanGoBack(granularity, anchor, floor);
         var isCurrent = start <= today && today <= end;
 
         PrevPeriodButton.IsEnabled = canGoBack;
         ToolTipService.SetToolTip(
             PrevPeriodButton,
             canGoBack
-                ? $"Previous {GraphsPeriod.Noun(granularity)}"
+                ? $"Previous {noun}"
                 : importable
-                    ? "Import history in Settings to see earlier months"
+                    // The noun follows the granularity: the arrow the user just found disabled is
+                    // the YEAR arrow when they are in Year view, and offering them "earlier months"
+                    // answers a question they did not ask.
+                    ? $"Import history in Settings to see earlier {Plural(noun, 2)}"
                     : "No earlier data");
 
         NextPeriodButton.IsEnabled = !isCurrent;
         ToolTipService.SetToolTip(
             NextPeriodButton,
-            isCurrent ? "Already at the current period" : $"Next {GraphsPeriod.Noun(granularity)}");
+            isCurrent ? "Already at the current period" : $"Next {noun}");
 
         JumpToNowButton.Visibility = isCurrent ? Visibility.Collapsed : Visibility.Visible;
 
+        // The heading is set from the PERIOD in Render - it depends on which source answered, not
+        // only on the granularity - but a render with no insights never builds one, so the
+        // granularity's own wording is the floor.
         ChartHeadingText.Text = $"Estimated spend by {GraphsPeriod.BucketNoun(granularity)}";
     }
 
@@ -1081,12 +1569,19 @@ public sealed partial class GraphsWindow : Window
         DeltaLabelText.Text = $"vs previous {GraphsPeriod.Noun(view.Granularity)}";
         RenderDelta(view);
 
-        AverageLabelText.Text = $"Average / {GraphsPeriod.BucketNoun(view.Granularity)}";
+        var bucketNoun = GraphsPeriod.BucketNoun(view.Granularity);
+        AverageLabelText.Text = $"Average / {bucketNoun}";
         SetMetric(
             AverageValueText,
             AverageDetailText,
-            FormatUsd(view.Cost / view.ElapsedUnits),
-            $"over {view.ElapsedUnits} {Plural(GraphsPeriod.BucketNoun(view.Granularity), view.ElapsedUnits)}");
+            // FRACTIONAL elapsed: at 09:00 today is a fifth of a day, and counting it whole diluted
+            // the average by the four fifths that have not happened yet. The DETAIL still counts
+            // whole buckets, because "over 5.4 days" is not something a person says - it names the
+            // in-progress one instead.
+            FormatUsd(view.Cost / (decimal)view.ElapsedFraction),
+            view.CurrentBucketInProgress
+                ? $"over {view.ElapsedBuckets} {Plural(bucketNoun, view.ElapsedBuckets)}  ·  this {bucketNoun} in progress"
+                : $"over {view.ElapsedBuckets} {Plural(bucketNoun, view.ElapsedBuckets)}");
 
         RenderOutlook(view);
     }
@@ -1131,13 +1626,17 @@ public sealed partial class GraphsWindow : Window
             return;
         }
 
-        if (view.IsCurrent && view.ElapsedUnits < view.TotalUnits)
+        // The third clause is what keeps Year honest: with the coverage floor INSIDE the period the
+        // elapsed span is short because recording started late, not because the period is young, so
+        // scaling it up to a full year invents eight months of history. The cell falls through to
+        // the peak instead, which a partial period genuinely has.
+        if (view.IsCurrent && view.ElapsedFraction < view.TotalUnits && !view.CoverageInsidePeriod)
         {
             OutlookLabelText.Text = "Projected";
             SetMetric(
                 OutlookValueText,
                 OutlookDetailText,
-                FormatUsd(view.Cost / view.ElapsedUnits * view.TotalUnits),
+                FormatUsd(view.Cost / (decimal)view.ElapsedFraction * view.TotalUnits),
                 GraphsPeriod.ProjectionTarget(view.Granularity, anchor));
             return;
         }
@@ -1150,7 +1649,10 @@ public sealed partial class GraphsWindow : Window
             OutlookValueText,
             OutlookDetailText,
             FormatUsd(peak.EstimatedCostUsd),
-            GraphsPeriod.BucketLabel(view.Granularity, peak.StartLocal.DateTime));
+            GraphsPeriod.BucketLabel(
+                view.Granularity,
+                peak.StartLocal.DateTime,
+                peak.EndLocalExclusive - peak.StartLocal));
     }
 
     private static string Plural(string noun, int count) => count == 1 ? noun : noun + "s";
@@ -1190,8 +1692,25 @@ public sealed partial class GraphsWindow : Window
     /// and rebuilt on every theme change, so unlike a brush read out of the app resources these
     /// are correct under a forced theme and follow a live system flip.
     /// </summary>
-    private static Microsoft.UI.Xaml.Media.SolidColorBrush BrushFrom(SKColor color) =>
-        new(Windows.UI.Color.FromArgb(color.Alpha, color.Red, color.Green, color.Blue));
+    /// <remarks>
+    /// CACHED by ARGB, because <see cref="ModelRowModel"/>'s change guard compares Brush references:
+    /// a fresh instance for an unchanged colour raises PropertyChanged and re-animates the meter on
+    /// every render. The cache is keyed on the colour rather than on the label, so it survives a
+    /// palette rebuild and never returns the wrong theme's brush.
+    /// </remarks>
+    private Microsoft.UI.Xaml.Media.SolidColorBrush BrushFrom(SKColor color)
+    {
+        var key = (uint)color;
+        if (brushCache.TryGetValue(key, out var brush))
+        {
+            return brush;
+        }
+
+        brush = new Microsoft.UI.Xaml.Media.SolidColorBrush(
+            Windows.UI.Color.FromArgb(color.Alpha, color.Red, color.Green, color.Blue));
+        brushCache[key] = brush;
+        return brush;
+    }
 
     /// <summary>What the message accompanying an error result actually means for the numbers.</summary>
     private enum ErrorKind
@@ -1399,7 +1918,13 @@ public sealed partial class GraphsWindow : Window
                 Rx = 2,
                 Ry = 2,
                 Padding = 2,
-                MaxBarWidth = 26,
+                // 44, not 26. The selection band is a full axis unit wide, and at seven columns
+                // (Week) a unit is ~110 DIP - so a 26 DIP bar left the band four times wider than
+                // the thing it was highlighting even once it was correctly centred. Raising the cap
+                // lets a column fill its slot at low column counts, which makes bar and band agree
+                // at every granularity. Set HERE, at rebuild time: it is a property on a retained
+                // series, and re-assigning it per render would be another live mutation.
+                MaxBarWidth = 44,
                 // The tooltip already prints the series name in its own column; repeating it here
                 // showed every row twice.
                 YToolTipLabelFormatter = point => FormatUsd((decimal)point.Coordinate.PrimaryValue)
@@ -1475,13 +2000,53 @@ public sealed partial class GraphsWindow : Window
         // drawn in any more. The chart runs before the model rows, so clearing here reseeds both.
         drawnColors.Clear();
 
-        var used = new Dictionary<uint, int>();
         foreach (var slot in dailySlots)
         {
-            var color = slot.ColorKey is null ? palette.Accent : CategoryColor(slot.ColorKey, used);
+            var color = slot.ColorKey is null ? palette.Accent : CategoryColor(slot.ColorKey);
             ApplyFill(slot.Series, color);
 
             RecordDrawnColor(slot.ColorKey, color);
+        }
+    }
+
+    /// <summary>
+    /// Assigns every label in the PERIOD its collision nudge, once, in a fixed order.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The union is deliberately wider than what is on screen: every category of every bucket and
+    /// every model of every bucket, not just the seven plotted series and the eight visible rows.
+    /// That is what makes a label's colour survive a drill-down - the map does not change when the
+    /// scope narrows - and what makes the chart's legend and the row meters agree, since both read
+    /// the same map instead of each counting collisions in its own iteration order.
+    /// </para>
+    /// <para>
+    /// An OVERRIDDEN label still claims its slot (so an automatic colour that lands on the same hex
+    /// is separated from it) but takes no nudge itself, exactly as before: a picked colour is drawn
+    /// as picked or the settings page is lying.
+    /// </para>
+    /// </remarks>
+    private void RebuildNudgeSteps(PeriodView view)
+    {
+        nudgeSteps.Clear();
+
+        var used = new Dictionary<uint, int>();
+        var labels = view.Buckets
+            .SelectMany(BucketSpendCategories)
+            .Select(category => category.Label)
+            .Concat(view.Buckets.SelectMany(bucket => bucket.Models).Select(model => model.Model))
+            .Concat(view.Models.Select(model => model.Model))
+            .Where(label => !string.IsNullOrEmpty(label))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            // Ordinal, so the map is the same on every machine and in every session.
+            .OrderBy(label => label, StringComparer.Ordinal);
+
+        foreach (var label in labels)
+        {
+            var key = (uint)palette.ForCategory(label);
+            var step = used.TryGetValue(key, out var seen) ? seen : 0;
+            used[key] = step + 1;
+            nudgeSteps[label] = palette.IsOverridden(label) ? 0 : step;
         }
     }
 
@@ -1512,17 +2077,17 @@ public sealed partial class GraphsWindow : Window
     /// several labels onto the same accent, which is invisible in a legend but reads as one
     /// merged block when the segments touch inside a stacked bar.
     /// </summary>
-    private SKColor CategoryColor(string label, Dictionary<uint, int> used)
+    private SKColor CategoryColor(string label)
     {
         var color = palette.ForCategory(label);
-        var key = (uint)color;
-        var step = used.TryGetValue(key, out var seen) ? seen : 0;
-        used[key] = step + 1;
 
-        // A colour the user picked is drawn EXACTLY as picked - it still claims its slot, so an
-        // automatic colour that lands on the same value is separated from it, but nudging the
-        // pick itself would mean the chart never shows the hex the settings page promises.
-        return palette.IsOverridden(label) ? color : ChartPalette.Nudge(color, step, palette.IsDark);
+        // A colour the user picked is drawn EXACTLY as picked - it still claims its slot in
+        // RebuildNudgeSteps, so an automatic colour that lands on the same value is separated from
+        // it, but nudging the pick itself would mean the chart never shows the hex the settings page
+        // promises.
+        return palette.IsOverridden(label)
+            ? color
+            : ChartPalette.Nudge(color, nudgeSteps.GetValueOrDefault(label), palette.IsDark);
     }
 
     /// <summary>
@@ -1558,8 +2123,8 @@ public sealed partial class GraphsWindow : Window
     /// disagree about what "this period" means.
     /// </para>
     /// <para>
-    /// ACCEPTED GAP: this is pointer-only, because chart points are not focusable. The same data is
-    /// reachable from the keyboard by switching the granularity to Day and paging with the arrows.
+    /// Chart points are not focusable, so the KEYBOARD reaches the same selection through
+    /// <see cref="OnChartKeyDown"/> on the chart card rather than through the chart itself.
     /// </para>
     /// </remarks>
     private void OnDailyChartDataPointerDown(IChartView chart, IEnumerable<ChartPoint> points)
@@ -1584,6 +2149,134 @@ public sealed partial class GraphsWindow : Window
 
         selectedBucket = selectedBucket == match.StartLocal.DateTime ? null : match.StartLocal.DateTime;
         Render();
+    }
+
+    /// <summary>
+    /// Keyboard selection: Left/Right move one bucket, Home/End jump to the ends, Enter drills in.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Pure index arithmetic over <c>period.Buckets</c> - the chart is told nothing and needs to
+    /// support nothing. With no selection, Left/Right start from the LAST bucket that has data
+    /// rather than from the edge of the period, because the useful end of a month is the end you
+    /// are living in.
+    /// </para>
+    /// <para>
+    /// Named, and on the chart CARD: the handler fires from inside the content
+    /// <see cref="QuiesceCharts"/> sets to null, so it checks <see cref="isClosed"/> first like
+    /// every other entry point here.
+    /// </para>
+    /// </remarks>
+    private void OnChartKeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (isClosed || period is null || period.Buckets.Count == 0)
+        {
+            return;
+        }
+
+        var buckets = period.Buckets;
+        var current = selectedBucket is { } start
+            ? IndexOfBucket(buckets, start)
+            : -1;
+
+        int next;
+        switch (e.Key)
+        {
+            case Windows.System.VirtualKey.Left:
+                next = current < 0 ? LastBucketWithData(buckets) : Math.Max(0, current - 1);
+                break;
+
+            case Windows.System.VirtualKey.Right:
+                next = current < 0 ? LastBucketWithData(buckets) : Math.Min(buckets.Count - 1, current + 1);
+                break;
+
+            case Windows.System.VirtualKey.Home:
+                next = 0;
+                break;
+
+            case Windows.System.VirtualKey.End:
+                next = buckets.Count - 1;
+                break;
+
+            case Windows.System.VirtualKey.Enter:
+                if (selectedBucket is { } drill)
+                {
+                    e.Handled = true;
+                    DrillInto(drill);
+                }
+
+                return;
+
+            default:
+                return;
+        }
+
+        e.Handled = true;
+        selectedBucket = buckets[next].StartLocal.DateTime;
+        Render();
+    }
+
+    private static int IndexOfBucket(IReadOnlyList<UsageLedgerBucket> buckets, DateTime start)
+    {
+        for (var index = 0; index < buckets.Count; index++)
+        {
+            if (buckets[index].StartLocal.DateTime == start)
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    private static int LastBucketWithData(IReadOnlyList<UsageLedgerBucket> buckets)
+    {
+        for (var index = buckets.Count - 1; index >= 0; index--)
+        {
+            if (buckets[index].TotalTokens > 0 || buckets[index].EstimatedCostUsd > 0)
+            {
+                return index;
+            }
+        }
+
+        return buckets.Count - 1;
+    }
+
+    /// <summary>
+    /// Double-click (or Enter on a keyboard selection): the clicked COLUMN becomes the period.
+    /// </summary>
+    /// <remarks>
+    /// Year ▸ the clicked month, Month/Week ▸ the clicked day, and Day does not step further. This
+    /// is the "move through time without thinking" affordance - single click keeps its old meaning
+    /// (retarget the breakdown only), so nothing is taken away. Granularity and anchor move
+    /// together, which is a legitimate series rebuild, and the selection is cleared in the same step
+    /// so the finer view opens UN-drilled rather than inheriting a bucket that no longer exists.
+    /// </remarks>
+    private void DrillInto(DateTime bucketStart)
+    {
+        if (isClosed || !GraphsPeriod.CanStepFiner(granularity))
+        {
+            return;
+        }
+
+        ApplyGranularity(GraphsPeriod.Finer(granularity), DateOnly.FromDateTime(bucketStart));
+    }
+
+    /// <summary>
+    /// The pointer half of the drill-down. The bucket comes from <see cref="selectedBucket"/>
+    /// because the first click of a double-click has already selected it through
+    /// <c>DataPointerDown</c> - which is also why a double-click on an already-selected column
+    /// (whose first click cleared it) does nothing rather than drilling somewhere unexpected.
+    /// </summary>
+    private void OnChartDoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
+    {
+        if (isClosed || selectedBucket is not { } start)
+        {
+            return;
+        }
+
+        e.Handled = true;
+        DrillInto(start);
     }
 
     private void OnClearSelection(object sender, RoutedEventArgs e)
@@ -1643,9 +2336,20 @@ public sealed partial class GraphsWindow : Window
             return;
         }
 
-        // The DateTimeAxis works in TICKS, which is also what a DateTimePoint's secondary value is.
-        selectionSection.Xi = bucket.StartLocal.DateTime.Ticks;
-        selectionSection.Xj = bucket.EndLocalExclusive.DateTime.Ticks;
+        // CENTRED ON THE BUCKET'S START, not spanning its bounds.
+        //
+        // The band used to be drawn in BUCKET-EDGE coordinates (Xi = start, Xj = end) while the bar
+        // is drawn CENTRED on the same start: LiveCharts' column series measures the axis unit in
+        // pixels, halves it, and puts the rect's left edge at secondary - unitWidth/2. So a bucket
+        // starting at T has its bar over [T - u/2, T + u/2] and had its band over [T, T + u] - half
+        // a column to the right, which is why the highlight sat under the NEIGHBOURING bar.
+        //
+        // Half the AXIS unit, never half the bucket: in Year view the unit is 30 days and the
+        // buckets are 28-31, so the two disagree by up to 5% of a column.
+        var half = axisUnit.Ticks / 2;
+        var center = bucket.StartLocal.DateTime.Ticks;
+        selectionSection.Xi = center - half;
+        selectionSection.Xj = center + half;
 
         var accent = palette.Accent;
         selectionSection.Fill = new SolidColorPaint(
@@ -1684,7 +2388,10 @@ public sealed partial class GraphsWindow : Window
             .ToArray();
 
         var scopeLabel = selectedBucket is { } selected
-            ? GraphsPeriod.BucketLabel(view.Granularity, selected)
+            ? GraphsPeriod.BucketLabel(
+                view.Granularity,
+                selected,
+                scopeBucket is null ? null : scopeBucket.EndLocalExclusive - scopeBucket.StartLocal)
             : GraphsPeriod.Label(view.Granularity, anchor, DateOnly.FromDateTime(DateTime.Now));
 
         ModelScopeChip.Visibility = selectedBucket is null ? Visibility.Collapsed : Visibility.Visible;
@@ -1697,6 +2404,9 @@ public sealed partial class GraphsWindow : Window
         {
             modelRows.Clear();
             modelRowShape = string.Empty;
+            // Never a $0.00 total over an empty-state panel: the footer is a summary of rows, and
+            // with no rows it is a claim about nothing.
+            ModelTotalPanel.Visibility = Visibility.Collapsed;
             if (selectedBucket is not null)
             {
                 ShowModelEmpty(
@@ -1754,17 +2464,18 @@ public sealed partial class GraphsWindow : Window
         // magnitude. Share-of-total lives on the row tooltip instead.
         var top = Math.Max(visible[0].EstimatedCostUsd, dropped.Sum(model => model.EstimatedCostUsd));
         var total = models.Sum(model => model.EstimatedCostUsd);
+        var trackBrush = BrushFrom(palette.Track);
 
-        var used = new Dictionary<uint, int>();
         for (var index = 0; index < visible.Length && index < modelRows.Count; index++)
         {
             var model = visible[index];
             var row = modelRows[index];
-            var color = CategoryColor(model.Model, used);
+            var color = CategoryColor(model.Model);
 
             row.Name = FriendlyModelLabel(model.Model);
-            row.MeterValue = top > 0 ? (double)(model.EstimatedCostUsd / top) * 100 : 0;
+            row.MeterValue = MeterValue(model.EstimatedCostUsd, top);
             row.ColorBrush = BrushFrom(color);
+            row.TrackBrush = trackBrush;
             row.CostText = model.EstimatedCostUsd > 0 || !model.HasIncompleteCost ? FormatUsd(model.EstimatedCostUsd) : "—";
             row.TokensText = FormatTokensCompact(model.TotalTokens);
             row.DetailText = ModelRowDetail(model, total, scopeLabel);
@@ -1786,7 +2497,8 @@ public sealed partial class GraphsWindow : Window
             var droppedCost = dropped.Sum(model => model.EstimatedCostUsd);
 
             overflow.Name = $"+{dropped.Length} more";
-            overflow.MeterValue = top > 0 ? (double)(droppedCost / top) * 100 : 0;
+            overflow.MeterValue = MeterValue(droppedCost, top);
+            overflow.TrackBrush = trackBrush;
 
             // Neutral, and NOT a category colour: the row stands for a list, so giving it a model's
             // hue would claim it is one.
@@ -1803,6 +2515,67 @@ public sealed partial class GraphsWindow : Window
                     .Select(model => $"{FriendlyModelLabel(model.Model)}  ·  {FormatUsd(model.EstimatedCostUsd)}")
                     .Concat(dropped.Length > 20 ? new[] { "…" } : Array.Empty<string>()));
         }
+
+        RenderModelTotal(view, models, scopeBucket, scopeLabel);
+    }
+
+    /// <summary>
+    /// Scales a row's meter to the TOP SPENDER, with a floor under anything non-zero.
+    /// </summary>
+    /// <remarks>
+    /// Scaling to the top spender rather than to the total is deliberate (the chart above carries
+    /// absolute magnitude; six models against a total makes every row a sliver). The FLOOR is the
+    /// fix: a model at 0.4% of the top spender drew a sub-pixel indicator, i.e. nothing at all, next
+    /// to a printed cost - a row that says "$0.02" and shows no meter reads as a rendering bug.
+    /// </remarks>
+    private static double MeterValue(decimal cost, decimal top)
+    {
+        if (cost <= 0 || top <= 0)
+        {
+            return 0;
+        }
+
+        return Math.Max(4, (double)(cost / top) * 100);
+    }
+
+    /// <summary>
+    /// The pinned total under the rows: cost and tokens for whatever the panel is scoped to.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// In the ROWS' own column grid (118 / * / 64 / 76) and outside the ScrollViewer, for the reason
+    /// <see cref="StackTotalTooltip"/> was written: a total whose figures do not sit in the same
+    /// columns as the figures above it has to be read twice, and a total that scrolls away is not a
+    /// total. The chart's tooltip already grew this row; the panel simply never got it.
+    /// </para>
+    /// <para>
+    /// Summed over ALL models in scope, never over the eight visible ones - the "+N more" row exists
+    /// precisely because those two differ.
+    /// </para>
+    /// </remarks>
+    private void RenderModelTotal(
+        PeriodView view,
+        IReadOnlyList<ProviderModelUsage> models,
+        UsageLedgerBucket? scopeBucket,
+        string scopeLabel)
+    {
+        ModelTotalPanel.Visibility = Visibility.Visible;
+
+        var cost = models.Sum(model => model.EstimatedCostUsd);
+        var incomplete = models.Any(model => model.HasIncompleteCost);
+
+        // Tokens for a drilled-into bucket live on the BUCKET (the scan fallback cannot attribute
+        // tokens per model at all), and for the whole period on the period. Summing the rows would
+        // report zero for a scan-sourced period that has real tokens.
+        var tokens = scopeBucket?.TotalTokens ?? view.Tokens;
+
+        ModelTotalCostText.Text = cost > 0 || !incomplete ? FormatUsd(cost) : "—";
+        ModelTotalTokensText.Text = FormatTokensCompact(tokens);
+        ToolTipService.SetToolTip(
+            ModelTotalPanel,
+            incomplete
+                ? $"{FormatUsd(cost)}  ·  {FormatTokens(tokens)} in {scopeLabel}{Environment.NewLine}Some models could not be priced."
+                : $"{FormatUsd(cost)}  ·  {FormatTokens(tokens)} in {scopeLabel}");
     }
 
     private static string ModelRowDetail(ProviderModelUsage model, decimal total, string scopeLabel)
@@ -1823,6 +2596,7 @@ public sealed partial class GraphsWindow : Window
     {
         modelRows.Clear();
         modelRowShape = string.Empty;
+        ModelTotalPanel.Visibility = Visibility.Collapsed;
         ModelEmptyPanel.Visibility = Visibility.Visible;
         ModelEmptyTitle.Text = title;
         ModelEmptyDetail.Text = detail;
@@ -1900,9 +2674,26 @@ public sealed partial class GraphsWindow : Window
         var labels = new SolidColorPaint(palette.SecondaryText);
         var separators = new SolidColorPaint(palette.Separator) { StrokeThickness = 1 };
 
+        // The unit each granularity's axis is built with, remembered for the selection band. Kept in
+        // ONE place with the axis it describes - see the axisUnit field.
+        axisUnit = granularity switch
+        {
+            UsageLedgerGranularity.Year => TimeSpan.FromDays(30),
+            UsageLedgerGranularity.Day => TimeSpan.FromHours(1),
+            _ => TimeSpan.FromDays(1)
+        };
+
         var axis = granularity switch
         {
-            UsageLedgerGranularity.Year => new DateTimeAxis(TimeSpan.FromDays(30), date => date.ToString("MMM", CultureInfo.CurrentCulture)),
+            // A 30-day unit against calendar months of 28-31 days is a ~5% mismatch, which is
+            // invisible in the column spacing and is corrected for in the selection band. The STEP
+            // is the lever that matters here: without forcing it, twelve "MMM" labels are decimated
+            // to four at the 600 DIP minimum width and the year reads as a quarter chart.
+            UsageLedgerGranularity.Year => new DateTimeAxis(TimeSpan.FromDays(30), date => date.ToString("MMM", CultureInfo.CurrentCulture))
+            {
+                MinStep = TimeSpan.FromDays(30).Ticks,
+                ForceStepToMin = true
+            },
             UsageLedgerGranularity.Week => new DateTimeAxis(TimeSpan.FromDays(1), date => date.ToString("ddd d", CultureInfo.CurrentCulture)),
             UsageLedgerGranularity.Day => new DateTimeAxis(TimeSpan.FromHours(1), date => date.ToString("h tt", CultureInfo.CurrentCulture))
             {
@@ -1992,6 +2783,15 @@ public sealed partial class GraphsWindow : Window
         AppTheme.Apply(this, RootGrid, TintLayer);
 
         palette = ChartPalette.For(RootGrid, AppTheme.Settings.ChartColorOverrides);
+
+        // The map is keyed on colours the OLD palette produced, so it has to be rebuilt before
+        // anything reads it - otherwise a colour edit can leave two labels nudged against a
+        // collision that no longer exists.
+        if (period is not null)
+        {
+            RebuildNudgeSteps(period);
+        }
+
         ApplyDailyColors();
         UpdateSelectionBand();
 

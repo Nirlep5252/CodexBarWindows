@@ -109,6 +109,27 @@ public static partial class UsageLedger
 
     private const int MaxModelIdLength = 200;
 
+    // ---- Plausibility bounds ------------------------------------------------------------------
+    // A day number is not just a label here, it is FAN-OUT: every distinct year a batch touches is
+    // one read-modify-write of a shard under a cross-process mutex, and every covered day is a
+    // dictionary entry. One corrupt timestamp (year 0001, or a nanosecond epoch read as seconds)
+    // therefore does not record a wrong row, it turns a merge into thousands of shard rebuilds over
+    // ~739,000 days and the import stops responding. UsageTimestampText rejects these at parse
+    // time; this is the merge's own floor, so a record that reached the ledger by any other route
+    // still cannot drive the fan-out.
+
+    /// <summary>Earliest UTC day number the ledger will record. See <see cref="UsageTimestampText.EarliestPlausibleDay"/>.</summary>
+    internal static int EarliestRecordableUtcDay { get; } =
+        UsageTimestampText.EarliestPlausibleDay.DayNumber - DateOnly.FromDateTime(DateTime.UnixEpoch).DayNumber;
+
+    /// <summary>Latest UTC day number the ledger will record, re-evaluated so a long-running app keeps up with the calendar.</summary>
+    internal static int LatestRecordableUtcDay => ToUtcDay(DateTimeOffset.UtcNow) + UsageTimestampText.FutureSlackDays;
+
+    internal static bool IsRecordableUtcDay(int utcDay)
+        => utcDay >= EarliestRecordableUtcDay && utcDay <= LatestRecordableUtcDay;
+
+    internal static bool IsRecordableInstant(DateTimeOffset instant) => IsRecordableUtcDay(ToUtcDay(instant));
+
     /// <summary>Single shared instance: System.Text.Json caches reflection metadata per options object.</summary>
     private static readonly JsonSerializerOptions SerializerOptions = new()
     {
@@ -121,7 +142,137 @@ public static partial class UsageLedger
     /// Test seam. Null restores %LOCALAPPDATA%. Mirrors the readers' persistCache gate: a test that
     /// scans a synthetic corpus must never touch the user's real history.
     /// </summary>
-    internal static void OverrideRootForTests(string? root) => rootOverride = root;
+    internal static void OverrideRootForTests(string? root)
+    {
+        rootOverride = root;
+
+        // The cache is keyed (scope, year), not by path, so moving the root would otherwise serve
+        // one root's shards under another's key.
+        InvalidateShardCache();
+    }
+
+    /// <summary>True while a test has redirected the root away from the user's real history.</summary>
+    internal static bool IsRootOverridden => rootOverride is not null;
+
+    // ---- Read cache ---------------------------------------------------------------------------
+    // Every read path (Query, QueryTotal, GetCoverage) deserializes whole year shards, and the
+    // graphs window drives all three on the UI thread for every history update and every period
+    // change. With several years of imported history that is tens of MB of JSON re-parsed per
+    // interaction. Parsed shards are therefore retained and validated against the file's IDENTITY
+    // (length + last write time) rather than a timer, so another process's merge is picked up as
+    // soon as it lands and our own merge drops the entry outright.
+    //
+    // Only READ paths use it. MergeYear loads with useCache:false because it mutates the shard it
+    // loads, and a cached instance is shared with every concurrent reader.
+    //
+    // BOUNDED, AND RELEASED. This process is a tray icon that is supposed to cost nothing when no
+    // window is open, so an unbounded cache filled by one graphs-window open and then held for the
+    // life of the process is not an accelerator, it is a leak with a nice name. Two limits keep it
+    // honest: a ceiling on what may be retained at once (LRU, by BYTES as well as by entry count,
+    // because "shards" is not a memory unit), and <see cref="ReleaseReadCache"/> at window teardown,
+    // which is the only moment the cache provably has no future reader.
+
+    private sealed record CachedShard(long Length, long LastWriteUtcTicks, long Tick, UsageLedgerShard Shard);
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(UsageLedgerScope Scope, int Year), CachedShard> ShardCache = new();
+
+    /// <summary>Monotonic use counter behind the LRU. Ticks, not timestamps: ordering is all that matters.</summary>
+    private static long shardCacheTick;
+
+    /// <summary>
+    /// Shards retained at once. Sized for the WORKING SET a live window actually has: a period never
+    /// spans more than two years, and a coverage read walks them all but does so off the UI thread —
+    /// so retaining the newest few is what removes the stutter, and retaining the rest only removes
+    /// background work nobody is waiting on.
+    /// </summary>
+    private const int MaxCachedShards = 6;
+
+    /// <summary>
+    /// On-disk bytes of the retained shards. The real bound, because one pathological year may be up
+    /// to <see cref="MaxShardBytes"/> on its own and an entry count would say nothing about memory.
+    /// </summary>
+    private const long MaxCachedShardBytes = 12L * 1024 * 1024;
+
+    /// <summary>Deserializations actually performed. Test seam: what proves the cache is a cache.</summary>
+    internal static long ShardParseCount;
+
+    internal static void InvalidateShardCache() => ShardCache.Clear();
+
+    /// <summary>
+    /// Drops every parsed shard. Called when the last window that reads the ledger closes.
+    /// </summary>
+    /// <remarks>
+    /// Not merely tidy: with no window open nothing in this process will read a shard again until
+    /// the user opens one, and re-parsing at that point is work the user is already waiting through
+    /// a scan for. Holding it instead is pure idle cost, which is the property the whole app is
+    /// built around. Safe at any moment — the cache is only ever an optimisation, and a merge in
+    /// flight does not use it at all (MergeYear loads with useCache:false).
+    /// </remarks>
+    public static void ReleaseReadCache() => ShardCache.Clear();
+
+    /// <summary>
+    /// Parses a scope's shards into the read cache, so a later query finds them warm.
+    /// </summary>
+    /// <remarks>
+    /// Exists purely so a UI caller can pay the disk I/O and the deserialization on a background
+    /// thread and leave the render path with dictionary lookups and a stat. Never called from a
+    /// timer or a startup path — zero idle cost is untouched.
+    /// <para/>
+    /// NEWEST FIRST, and that ordering is the whole reason this is not just a loop: the retention
+    /// ceiling means warming every year would evict the years a render is about to want in favour of
+    /// the oldest ones. Walking down from the newest leaves the working set resident and lets the
+    /// tail fall out.
+    /// </remarks>
+    public static void WarmCache(UsageLedgerScope scope)
+    {
+        try
+        {
+            foreach (var year in ShardYears(scope).OrderByDescending(year => year).Take(MaxCachedShards))
+            {
+                TryLoadShard(scope, year, out _);
+            }
+        }
+        catch
+        {
+            // Warming is an optimisation; a failure just means the read path parses it itself.
+        }
+    }
+
+    /// <summary>
+    /// Evicts least-recently-used entries until the cache is back inside both ceilings.
+    /// </summary>
+    /// <remarks>
+    /// Approximate on purpose. The dictionary is concurrent and this runs on read paths, so a racing
+    /// insert can leave the cache one entry over for an instant; correctness never depends on the
+    /// bound, only memory does, and the next read trims it again.
+    /// </remarks>
+    private static void TrimShardCache()
+    {
+        while (true)
+        {
+            var entries = ShardCache.ToArray();
+            if (entries.Length <= 1 ||
+                (entries.Length <= MaxCachedShards && entries.Sum(entry => entry.Value.Length) <= MaxCachedShardBytes))
+            {
+                return;
+            }
+
+            var oldest = entries[0];
+            foreach (var entry in entries)
+            {
+                if (entry.Value.Tick < oldest.Value.Tick)
+                {
+                    oldest = entry;
+                }
+            }
+
+            if (!ShardCache.TryRemove(oldest.Key, out _))
+            {
+                // Someone else evicted it first; the next pass re-reads the whole set anyway.
+                return;
+            }
+        }
+    }
 
     internal static string RootDirectory => rootOverride
         ?? Path.Combine(
@@ -136,8 +287,20 @@ public static partial class UsageLedger
 
     // ---- Instant helpers ----------------------------------------------------------------------
 
+    /// <summary>
+    /// Whole hours since the Unix epoch, SATURATING rather than wrapping.
+    /// </summary>
+    /// <remarks>
+    /// DateTimeOffset spans year 1 to year 9999; an int of hours does not. A plain cast turns
+    /// DateTimeOffset.MinValue into a positive hour somewhere in the future, which is the worst
+    /// possible failure — a corrupt row that looks legitimate. Clamping keeps the function total and
+    /// keeps every out-of-range instant on the far side of <see cref="IsRecordableUtcDay"/>.
+    /// </remarks>
     public static int ToUtcHour(DateTimeOffset instant)
-        => (int)((instant.UtcDateTime.Ticks - DateTime.UnixEpoch.Ticks) / TimeSpan.TicksPerHour);
+        => (int)Math.Clamp(
+            (instant.UtcDateTime.Ticks - DateTime.UnixEpoch.Ticks) / TimeSpan.TicksPerHour,
+            int.MinValue,
+            int.MaxValue);
 
     public static DateTimeOffset FromUtcHour(int utcHour)
         => new(DateTime.UnixEpoch.AddHours(utcHour), TimeSpan.Zero);
@@ -158,10 +321,15 @@ public static partial class UsageLedger
     /// </summary>
     /// <remarks>
     /// Idempotent by REPLACE-BY-SCOPE, never additive. A complete batch deletes every existing
-    /// record for the days it covers and writes its own, so re-scanning a day converges instead of
+    /// record for the days it DECLARED and writes its own, so re-scanning a day converges instead of
     /// doubling — and so an accounting fix that legitimately DECREASES a day (the Codex overcount
     /// fix, or Claude dedup removing a fork) is allowed to land. A partial batch merges per-key MAX
     /// instead, which is monotone and safe because session files only ever grow.
+    /// <para/>
+    /// A day the batch did not declare is merged per-key MAX even when the batch is complete: a
+    /// complete batch is complete over its DECLARED WINDOW, not over every instant its records
+    /// happen to touch. See the authority block in <c>MergeYear</c> — that gap is a local/UTC day
+    /// boundary, and treating it as authority deleted imported history.
     /// <para/>
     /// Callers MUST NOT call this from a reader whose persistCache is false: such a reader is
     /// scanning a different corpus and would corrupt the user's real history with test data.
@@ -175,15 +343,25 @@ public static partial class UsageLedger
 
         try
         {
+            // Every day is filtered through the plausibility bound BEFORE it can name a year. This
+            // is the merge's own floor and it is deliberately redundant with the parser's: a batch
+            // can be built by anything, and one absurd day here costs a shard rebuild, not a row.
             var years = new SortedSet<int>();
             foreach (var day in batch.CoveredUtcDays)
             {
-                years.Add(YearOfUtcDay(day));
+                if (IsRecordableUtcDay(day))
+                {
+                    years.Add(YearOfUtcDay(day));
+                }
             }
 
             foreach (var record in batch.Records)
             {
-                years.Add(YearOfUtcDay(UtcDayOfHour(record.Key.UtcHour)));
+                var day = UtcDayOfHour(record.Key.UtcHour);
+                if (IsRecordableUtcDay(day))
+                {
+                    years.Add(YearOfUtcDay(day));
+                }
             }
 
             var ok = true;
@@ -225,7 +403,9 @@ public static partial class UsageLedger
                 return false;
             }
 
-            var shard = TryLoadShard(scope, year, out _) ?? new UsageLedgerShard { V = SchemaVersion };
+            // useCache: false — this instance is about to be MUTATED and written back, and the read
+            // cache hands the same object to every reader. The cache is dropped after the save.
+            var shard = TryLoadShard(scope, year, out _, useCache: false) ?? new UsageLedgerShard { V = SchemaVersion };
             shard.V = SchemaVersion;
             shard.A = batch.AccountingVersion;
             shard.App = AppVersion();
@@ -234,25 +414,30 @@ public static partial class UsageLedger
             var models = new ModelTable(shard.M);
             var scannedTicks = batch.ScannedAt.UtcDateTime.Ticks;
 
+            // ---- Authority ----------------------------------------------------------------------
+            // A batch may only REPLACE days it explicitly DECLARED. It must never extend that
+            // authority to the days its records merely happen to land on, and that one distinction
+            // is the difference between a re-scan and destroying a user's imported months.
+            //
+            // Why the two differ at all: a row is admitted by the scan on the WALL-CLOCK date its
+            // own log spells, but a record is keyed by the TRUE UTC INSTANT — and one local day
+            // straddles two UTC days. A scan whose window opens on local day F therefore emits
+            // records on UTC day F-1 (the tail of that UTC day which fell inside local day F) while
+            // having read only a few hours of it. Promoting those records' day into the authority
+            // set made a complete batch delete the WHOLE of UTC day F-1 and write back the sliver,
+            // so every graphs-window open shaved the oldest boundary day off the backfilled history.
+            //
+            // Records outside the declared days are still merged — they are real usage — but per-key
+            // MAX rather than replace-then-sum. MAX is monotone (it cannot delete) and idempotent (a
+            // re-scan of the same sliver converges instead of doubling), which is precisely the two
+            // properties the implicit promotion was reaching for.
+            var covered = new HashSet<int>(
+                batch.CoveredUtcDays.Where(day => IsRecordableUtcDay(day) && YearOfUtcDay(day) == year));
+
             if (batch.IsComplete)
             {
-                // A complete batch implicitly asserts authority over every day it emitted a record
-                // for, even one the caller forgot to declare. Without this a re-scan would SUM an
-                // undeclared day into itself, which is exactly the double count replace-by-scope
-                // exists to prevent.
-                var covered = new HashSet<int>(batch.CoveredUtcDays);
-                foreach (var record in batch.Records)
-                {
-                    covered.Add(UtcDayOfHour(record.Key.UtcHour));
-                }
-
                 foreach (var day in covered)
                 {
-                    if (YearOfUtcDay(day) != year)
-                    {
-                        continue;
-                    }
-
                     // An explicitly covered day with no rows becomes an empty entry rather than a
                     // missing one: "scanned, found nothing" and "never scanned" are different facts
                     // and coverage has to be able to tell them apart.
@@ -260,7 +445,9 @@ public static partial class UsageLedger
                 }
             }
 
-            foreach (var group in batch.Records.Where(record => !record.IsEmpty).GroupBy(record => UtcDayOfHour(record.Key.UtcHour)))
+            foreach (var group in batch.Records
+                .Where(record => !record.IsEmpty && IsRecordableUtcDay(UtcDayOfHour(record.Key.UtcHour)))
+                .GroupBy(record => UtcDayOfHour(record.Key.UtcHour)))
             {
                 if (YearOfUtcDay(group.Key) != year)
                 {
@@ -268,15 +455,28 @@ public static partial class UsageLedger
                 }
 
                 var dayKey = DayKey(group.Key);
-                if (!shard.D.TryGetValue(dayKey, out var day))
+                var isNewDay = !shard.D.TryGetValue(dayKey, out var stored);
+                var day = stored ?? new UsageLedgerShardDay();
+                if (isNewDay)
                 {
-                    day = new UsageLedgerShardDay();
                     shard.D[dayKey] = day;
                 }
+
+                // The ONLY place replace-by-scope is decided. Declared + complete, or nothing.
+                var replace = batch.IsComplete && covered.Contains(group.Key);
 
                 day.S = scannedTicks;
                 if (!batch.IsComplete)
                 {
+                    day.P = true;
+                }
+                else if (!replace && isNewDay)
+                {
+                    // A day this complete batch only CLIPPED is a lower bound of its own reading, so
+                    // a day it just invented is partial. An existing one is not demoted: after a MAX
+                    // merge its totals can only have risen, and stamping the ledger's boundary day
+                    // partial on every single scan would leave a permanent false warning on history
+                    // a manual import did read in full.
                     day.P = true;
                 }
 
@@ -286,25 +486,31 @@ public static partial class UsageLedger
                     merged[existing.Key] = existing;
                 }
 
+                // The batch's own duplicates are folded FIRST. Within a batch the same key can
+                // legitimately appear twice (two rows, same hour and model) and those must sum; only
+                // the summed value is then compared with what is already stored, so "sum my own
+                // rows" can never leak into "add to history" on a day this batch cannot replace.
+                var incoming = new Dictionary<UsageLedgerKey, UsageLedgerRecord>();
                 foreach (var record in group)
                 {
                     var key = Normalize(record.Key);
-                    if (!merged.TryGetValue(key, out var current))
-                    {
-                        merged[key] = record with { Key = key };
-                        continue;
-                    }
-
-                    // Within a batch the same key can legitimately appear twice (two rows, same
-                    // hour and model), so a complete batch SUMS its own duplicates — the previous
-                    // contents were already deleted above, so this cannot double count history.
-                    merged[key] = batch.IsComplete
-                        ? current with
+                    incoming[key] = incoming.TryGetValue(key, out var seen)
+                        ? seen with
                         {
-                            Standard = current.Standard + record.Standard,
-                            LongContext = current.LongContext + record.LongContext,
-                            Requests = current.Requests + record.Requests
+                            Standard = seen.Standard + record.Standard,
+                            LongContext = seen.LongContext + record.LongContext,
+                            Requests = seen.Requests + record.Requests
                         }
+                        : record with { Key = key };
+                }
+
+                foreach (var (key, record) in incoming)
+                {
+                    // On a replaced day `merged` is empty (the entry was reset above), so this is
+                    // the batch's own value verbatim. Everywhere else the stored value survives
+                    // unless this batch genuinely saw more of that key.
+                    merged[key] = replace || !merged.TryGetValue(key, out var current)
+                        ? record
                         : current with
                         {
                             Standard = UsageLedgerTokens.Max(current.Standard, record.Standard),
@@ -432,7 +638,11 @@ public static partial class UsageLedger
     /// build cannot read. <paramref name="unreadable"/> distinguishes "no such year" from "there is
     /// a file here I refuse to trust", which is what drives the re-import affordance.
     /// </summary>
-    private static UsageLedgerShard? TryLoadShard(UsageLedgerScope scope, int year, out bool unreadable)
+    /// <param name="useCache">
+    /// False for the merge, which mutates what it loads. Everything else reads only, so it shares
+    /// one parsed instance per (scope, year) until the file on disk changes underneath it.
+    /// </param>
+    private static UsageLedgerShard? TryLoadShard(UsageLedgerScope scope, int year, out bool unreadable, bool useCache = true)
     {
         unreadable = false;
         try
@@ -441,7 +651,24 @@ public static partial class UsageLedger
             var info = new FileInfo(path);
             if (!info.Exists)
             {
+                ShardCache.TryRemove((scope, year), out _);
                 return null;
+            }
+
+            // Identity, not existence: a shard rewritten by another instance of the app has the
+            // same path and must not be served from this process's cache.
+            var length = info.Length;
+            var lastWriteUtcTicks = info.LastWriteTimeUtc.Ticks;
+            if (useCache &&
+                ShardCache.TryGetValue((scope, year), out var cached) &&
+                cached.Length == length &&
+                cached.LastWriteUtcTicks == lastWriteUtcTicks)
+            {
+                // Re-stamped on every HIT, not only on insert: without this the LRU degenerates into
+                // "evict whatever was loaded first", which is exactly the year a live window is
+                // sitting on while it walks the older ones for coverage.
+                ShardCache[(scope, year)] = cached with { Tick = Interlocked.Increment(ref shardCacheTick) };
+                return cached.Shard;
             }
 
             if (info.Length > MaxShardBytes)
@@ -449,14 +676,21 @@ public static partial class UsageLedger
                 // Refusing to parse is the point of the ceiling: a 500 MB file must not be turned
                 // into 500 MB of managed objects on the UI's scan path.
                 unreadable = true;
+                ShardCache.TryRemove((scope, year), out _);
                 return null;
             }
 
-            using var stream = File.OpenRead(path);
-            var shard = JsonSerializer.Deserialize<UsageLedgerShard>(stream, SerializerOptions);
+            Interlocked.Increment(ref ShardParseCount);
+            UsageLedgerShard? shard;
+            using (var stream = File.OpenRead(path))
+            {
+                shard = JsonSerializer.Deserialize<UsageLedgerShard>(stream, SerializerOptions);
+            }
+
             if (shard is null || shard.V != SchemaVersion)
             {
                 unreadable = shard is not null;
+                ShardCache.TryRemove((scope, year), out _);
                 return null;
             }
 
@@ -482,6 +716,18 @@ public static partial class UsageLedger
                 }
             }
 
+            if (useCache)
+            {
+                // Stored AFTER sanitisation, so a cache hit skips that pass too and every reader
+                // sees the same normalised object.
+                ShardCache[(scope, year)] = new CachedShard(
+                    length,
+                    lastWriteUtcTicks,
+                    Interlocked.Increment(ref shardCacheTick),
+                    shard);
+                TrimShardCache();
+            }
+
             return shard;
         }
         catch
@@ -489,6 +735,7 @@ public static partial class UsageLedger
             // Truncated, hand-edited, mid-write, locked — all the same answer: no history for this
             // year. Nothing on a read path is allowed to throw.
             unreadable = true;
+            ShardCache.TryRemove((scope, year), out _);
             return null;
         }
     }
@@ -496,6 +743,13 @@ public static partial class UsageLedger
     private static bool TrySaveShard(UsageLedgerScope scope, int year, UsageLedgerShard shard)
     {
         string? temp = null;
+
+        // A MERGE MUST INVALIDATE, and it must do so up front rather than on the way out: the write
+        // below can fail at any point, and a reader that raced it must re-stat the file either way.
+        // Dropping the entry (rather than replacing it with `shard`) also keeps the mutable instance
+        // the merge owns out of the read cache entirely.
+        ShardCache.TryRemove((scope, year), out _);
+
         try
         {
             // Drop days that ended up with nothing to say so a long-idle year does not accumulate
@@ -528,6 +782,11 @@ public static partial class UsageLedger
             // Single atomic replace: never delete-then-move, which leaves a window with no file.
             File.Move(temp, path, overwrite: true);
             temp = null;
+
+            // Again, and not redundantly: a reader could have re-cached the PREVIOUS file between
+            // the removal above and this move. Dropping it here leaves no window in which a stale
+            // parse can outlive the write that replaced it.
+            ShardCache.TryRemove((scope, year), out _);
             return true;
         }
         catch

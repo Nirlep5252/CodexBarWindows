@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text.Json;
+using CodexBar.WinUI;
 using CodexBarWindows;
 
 if (args.Contains("--scan-real-codex", StringComparer.OrdinalIgnoreCase))
@@ -148,11 +149,13 @@ var tests = new (string Name, Action Run)[]
     ("Usage ledger tolerates corrupt and future shards", UsageLedgerToleratesCorruptShards),
     ("Usage ledger buckets a range by granularity", UsageLedgerBucketsRangeByGranularity),
     ("Usage ledger buckets by the query time zone", UsageLedgerBucketsByQueryTimeZone),
+    ("Usage ledger builds a day's hours on the local timeline across DST", UsageLedgerBuildsDayHoursOnTheLocalTimeline),
     ("Usage ledger splits Claude components per tier", UsageLedgerSplitsClaudeComponentsPerTier),
     ("Usage ledger prices at read time and never stores cost", UsageLedgerPricesAtReadTime),
     ("Usage ledger prices Codex fast turns at per-model priority rates", UsageLedgerPricesFastTurnsAtPriorityRates),
     ("Usage ledger reports an unpriceable model as incomplete, not free", UsageLedgerReportsUnpriceableModelAsIncomplete),
     ("Usage ledger prices built-in-only Claude models exactly like the scan", UsageLedgerPricesBuiltInOnlyClaudeModelsLikeTheScan),
+    ("Claude pricing keeps the built-in long-context tier where models.dev is silent", ClaudePricingKeepsBuiltInTierWhereCatalogIsSilent),
     ("Usage ledger labels models exactly like the scan", UsageLedgerLabelsModelsLikeTheScan),
     ("Usage ledger bounds a pathological day", UsageLedgerBoundsPathologicalDay),
     ("Usage ledger reports coverage and total ever", UsageLedgerReportsCoverageAndTotalEver),
@@ -160,6 +163,28 @@ var tests = new (string Name, Action Run)[]
     ("Usage ledger backfill imports months outside the scan window", UsageLedgerBackfillImportsOutsideScanWindow),
     ("Usage ledger backfill is re-runnable without doubling", UsageLedgerBackfillIsRerunnable),
     ("Usage ledger backfill writes nothing when cancelled", UsageLedgerBackfillWritesNothingWhenCancelled),
+    ("Usage ledger backfill reports the corpus it committed before a cancel", UsageLedgerBackfillReportsWhatItCommittedWhenCancelled),
+    ("Usage ledger drops implausible timestamps instead of fanning out shards", UsageLedgerDropsImplausibleTimestamps),
+    ("Usage ledger caches parsed shards and invalidates on merge", UsageLedgerCachesParsedShardsAndInvalidatesOnMerge),
+    ("Codex scan keeps history imported from an old-named session", CodexScanKeepsHistoryImportedFromOldNamedSession),
+    ("Usage ledger keeps imported history on days a scan only clipped", UsageLedgerKeepsImportedHistoryOnClippedDays),
+    ("Usage ledger claims only the UTC days a report window fully covers", UsageLedgerClaimsOnlyFullyCoveredUtcDays),
+    ("A stale vibes flag is inert for a shell without vibes", StaleVibesFlagIsInertWithoutVibes),
+    ("Chart palette colours stay perceptually apart in both themes", ChartPaletteTests.ColorsStayApart),
+    ("Chart palette colours stay apart for dichromatic vision", ChartPaletteTests.ColorsStayApartForDichromats),
+    ("Chart palette clears its contrast floors on both cards", ChartPaletteTests.ClearsContrastFloors),
+    ("Chart palette fast tiers stay related but separable", ChartPaletteTests.FastTiersStayRelatedButSeparable),
+    ("Chart palette brands a model by its provider", ChartPaletteTests.BrandsAModelByItsProvider),
+    ("Chart palette keeps a build variant off its base model", ChartPaletteTests.KeepsVariantsOffTheirBaseModel),
+    ("Chart palette assigns a colour independently of the other models", ChartPaletteTests.AssignsColorsIndependently),
+    ("Chart palette returns a user override exactly as picked", ChartPaletteTests.ReturnsOverridesExactly),
+    ("Chart palette gives every live model its own colour", ChartPaletteTests.GivesEveryLiveModelItsOwnColor),
+    ("Graphs period bounds every granularity including Year", GraphsPeriodBoundsEveryGranularity),
+    ("Graphs period counts the current bucket fractionally", GraphsPeriodCountsCurrentBucketFractionally),
+    ("Graphs period clamps elapsed buckets to the coverage floor", GraphsPeriodClampsElapsedToCoverageFloor),
+    ("Graphs period arrows follow the granularity's own bound", GraphsPeriodArrowsFollowGranularity),
+    ("Graphs period drills one level finer per double-click", GraphsPeriodDrillsOneLevelFiner),
+    ("Graphs period names a whole-day column without an hour", GraphsPeriodNamesWholeDayColumnWithoutHour),
 };
 
 static void CodexRpcPrefersCodexMultiBucketSnapshot()
@@ -1593,6 +1618,137 @@ static void UsageLedgerBucketsByQueryTimeZone()
     AssertEqual(1100L, istHours.Buckets[0].TotalTokens, "19:00Z lands in the 00:00-01:00 local bucket");
 }
 
+/// <summary>
+/// A zone with US-style DST rules, built by hand.
+/// </summary>
+/// <remarks>
+/// EXPLICIT because the machine's own zone is not a test input: half the world (IST, UTC on most CI
+/// images) has no transitions at all, so a DST test that read <c>TimeZoneInfo.Local</c> would pass
+/// everywhere by testing nothing, and fail nowhere until a user in Chicago hit it.
+/// </remarks>
+static TimeZoneInfo DstTestZone()
+{
+    // Second Sunday in March and first Sunday in November, both at 02:00 local - so the
+    // short day is 9 March 2025 and the long day is 2 November 2025 - both safely in the PAST, since
+    // the ledger refuses to record a future day at all.
+    var toDst = TimeZoneInfo.TransitionTime.CreateFloatingDateRule(new DateTime(1, 1, 1, 2, 0, 0), 3, 2, DayOfWeek.Sunday);
+    var toStandard = TimeZoneInfo.TransitionTime.CreateFloatingDateRule(new DateTime(1, 1, 1, 2, 0, 0), 11, 1, DayOfWeek.Sunday);
+    var rule = TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule(
+        DateTime.MinValue.Date,
+        DateTime.MaxValue.Date,
+        TimeSpan.FromHours(1),
+        toDst,
+        toStandard);
+
+    return TimeZoneInfo.CreateCustomTimeZone(
+        "test-dst",
+        TimeSpan.FromHours(-8),
+        "test-dst",
+        "test-dst-standard",
+        "test-dst-daylight",
+        [rule]);
+}
+
+/// <summary>Local midnight as the instant it actually is in <paramref name="zone"/>.</summary>
+static DateTimeOffset LocalMidnight(TimeZoneInfo zone, int year, int month, int day)
+{
+    var local = new DateTime(year, month, day, 0, 0, 0);
+    return new DateTimeOffset(local, zone.GetUtcOffset(local));
+}
+
+static void UsageLedgerBuildsDayHoursOnTheLocalTimeline()
+{
+    using var fixture = new UsageLedgerFixture();
+    var zone = DstTestZone();
+
+    static (int Buckets, double Elapsed, int WholeBuckets) Probe(DateTimeOffset from, DateTimeOffset to, TimeZoneInfo zone, out UsageLedgerSeries series)
+    {
+        series = UsageLedger.Query(UsageLedgerScope.Codex, from, to, UsageLedgerGranularity.Hour, zone);
+
+        // The count the CHART draws and the count the METRICS divide by have to be the same number,
+        // which is the whole point of building the buckets from the real timeline: Elapsed is fed
+        // the very buckets that were plotted.
+        var elapsed = GraphsPeriod.Elapsed(
+            series.Buckets.Select(bucket => (bucket.StartLocal, bucket.EndLocalExclusive)).ToArray(),
+            to,
+            null);
+        return (series.Buckets.Count, elapsed.Fraction, elapsed.Buckets);
+    }
+
+    static void AssertHourlyPartition(UsageLedgerSeries series, DateTimeOffset from, DateTimeOffset to)
+    {
+        for (var index = 0; index < series.Buckets.Count; index++)
+        {
+            var bucket = series.Buckets[index];
+            Assert(
+                bucket.EndLocalExclusive - bucket.StartLocal == TimeSpan.FromHours(1),
+                $"every hour column must be exactly one real hour wide, bucket {index} was {bucket.EndLocalExclusive - bucket.StartLocal}");
+
+            var expected = from.AddHours(index);
+            Assert(
+                bucket.StartLocal.UtcDateTime == expected.UtcDateTime,
+                $"bucket {index} must start at {expected:u}, was {bucket.StartLocal:u}");
+        }
+
+        Assert(
+            series.Buckets[^1].EndLocalExclusive.UtcDateTime == to.UtcDateTime,
+            "the columns must cover the day exactly, with nothing left over");
+    }
+
+    // ---- SPRING FORWARD: 23 real hours, and 02:00 local never happens -------------------------
+    var shortFrom = LocalMidnight(zone, 2025, 3, 9);
+    var shortTo = LocalMidnight(zone, 2025, 3, 10);
+    Assert(shortTo - shortFrom == TimeSpan.FromHours(23), "9 March 2025 is a 23-hour day in this zone");
+
+    // 08:00Z is 00:00 local; 10:00Z is 03:00 local, the hour on the far side of the gap.
+    Assert(
+        UsageLedger.TryMerge(UsageLedgerScope.Codex, LedgerCodexBatch(
+            true,
+            (new DateTimeOffset(2025, 3, 9, 8, 0, 0, TimeSpan.Zero), "gpt-5.6-sol", 1000, 0, 100, false),
+            (new DateTimeOffset(2025, 3, 9, 10, 0, 0, TimeSpan.Zero), "gpt-5.6-sol", 2000, 0, 200, false))),
+        "short-day seed merge");
+
+    var shortProbe = Probe(shortFrom, shortTo, zone, out var shortDay);
+    AssertEqual(23, shortProbe.Buckets, "a 23-hour day has 23 columns, not 24 with a phantom");
+    AssertHourlyPartition(shortDay, shortFrom, shortTo);
+    AssertEqual(3, shortDay.Buckets[2].StartLocal.DateTime.Hour, "the third column is 03:00 local - 02:00 does not exist");
+    AssertEqual(1100L, shortDay.Buckets[0].TotalTokens, "00:00 local keeps its own usage");
+    AssertEqual(2200L, shortDay.Buckets[2].TotalTokens, "the hour after the gap keeps its own usage");
+    AssertEqual(3300L, shortDay.TotalTokens, "no usage is lost or doubled across the transition");
+
+    // The regression this fixes: the phantom zero-width column was counted as a whole elapsed hour,
+    // so a finished 23-hour day claimed 24 and both Average and Projected were diluted by 1/24.
+    AssertEqual(23, shortProbe.WholeBuckets, "a finished short day has 23 elapsed hours, not 24");
+    Assert(Math.Abs(shortProbe.Elapsed - 23) < 0.001, $"the elapsed fraction matches the column count, got {shortProbe.Elapsed}");
+
+    // ---- FALL BACK: 25 real hours, and 01:00 local happens twice -------------------------------
+    var longFrom = LocalMidnight(zone, 2025, 11, 2);
+    var longTo = LocalMidnight(zone, 2025, 11, 3);
+    Assert(longTo - longFrom == TimeSpan.FromHours(25), "2 November 2025 is a 25-hour day in this zone");
+
+    // Both of these are "01:00 local" - the first in daylight time, the second in standard time.
+    Assert(
+        UsageLedger.TryMerge(UsageLedgerScope.Codex, LedgerCodexBatch(
+            true,
+            (new DateTimeOffset(2025, 11, 2, 8, 0, 0, TimeSpan.Zero), "gpt-5.6-sol", 1000, 0, 100, false),
+            (new DateTimeOffset(2025, 11, 2, 9, 0, 0, TimeSpan.Zero), "gpt-5.6-sol", 2000, 0, 200, false))),
+        "long-day seed merge");
+
+    var longProbe = Probe(longFrom, longTo, zone, out var longDay);
+    AssertEqual(25, longProbe.Buckets, "a 25-hour day has 25 columns");
+    AssertHourlyPartition(longDay, longFrom, longTo);
+    AssertEqual(1, longDay.Buckets[1].StartLocal.DateTime.Hour, "the repeated hour's first pass is 01:00 local");
+    AssertEqual(1, longDay.Buckets[2].StartLocal.DateTime.Hour, "and so is its second pass");
+    Assert(longDay.Buckets[1].StartLocal.Offset != longDay.Buckets[2].StartLocal.Offset, "the two passes differ by their offset, which is what tells them apart");
+
+    // The regression this fixes: both hours used to fold into one column, so one of them vanished.
+    AssertEqual(1100L, longDay.Buckets[1].TotalTokens, "the first 01:00 keeps its own usage");
+    AssertEqual(2200L, longDay.Buckets[2].TotalTokens, "the second 01:00 is a column of its own");
+    AssertEqual(3300L, longDay.TotalTokens, "no usage is lost or doubled across the transition");
+    AssertEqual(25, longProbe.WholeBuckets, "a finished long day has 25 elapsed hours");
+    Assert(Math.Abs(longProbe.Elapsed - 25) < 0.001, $"the elapsed fraction matches the column count, got {longProbe.Elapsed}");
+}
+
 static void UsageLedgerSplitsClaudeComponentsPerTier()
 {
     using var fixture = new UsageLedgerFixture();
@@ -1860,6 +2016,133 @@ static void UsageLedgerPricesBuiltInOnlyClaudeModelsLikeTheScan()
     Both(8.07m, 300_000, 300_000, 300_000, 300_000, "all four components split at their own cutoff");
 }
 
+// The defect this pins: Claude pricing chose between models.dev and the built-in table per RECORD
+// (catalog ?? built-in). models.dev's anthropic entries for claude-sonnet-4-5 / -4-6 carry base rates
+// and NO context_over_200k block, so the catalog record replaced the built-in one wholesale and took
+// the 200k tier with it — those models priced FLAT, and the long-context premium was live only for
+// the one sonnet id the catalog happens not to carry. Resolution is per FIELD now.
+static void ClaudePricingKeepsBuiltInTierWhereCatalogIsSilent()
+{
+    // A pinned catalog, because the real one is a network fetch cached per machine: without this the
+    // test would assert whatever models.dev served this developer today, which is exactly the kind of
+    // "passes here" pricing test that let the defect through.
+    //   claude-sonnet-4-5  base rates only  -> the silent case, built-in 200k tier must survive
+    //   claude-opus-4-5    fully described  -> catalog must win outright, rates AND tier
+    //   claude-sonnet-4-6  tier disagrees   -> an EXPLICIT catalog tier must override the built-in one
+    const string catalogJson = """
+        {
+          "anthropic": {
+            "id": "anthropic",
+            "models": {
+              "claude-sonnet-4-5": {
+                "id": "claude-sonnet-4-5",
+                "cost": { "input": 3, "output": 15, "cache_read": 0.3, "cache_write": 3.75 }
+              },
+              "claude-opus-4-5": {
+                "id": "claude-opus-4-5",
+                "cost": {
+                  "input": 7, "output": 35, "cache_read": 0.7, "cache_write": 8.75,
+                  "context_over_200k": { "input": 14, "output": 70, "cache_read": 1.4, "cache_write": 17.5 }
+                }
+              },
+              "claude-sonnet-4-6": {
+                "id": "claude-sonnet-4-6",
+                "cost": {
+                  "input": 3, "output": 15, "cache_read": 0.3, "cache_write": 3.75,
+                  "context_over_200k": { "input": 9, "output": 45, "cache_read": 0.9, "cache_write": 11.25 }
+                }
+              }
+            }
+          }
+        }
+        """;
+
+    using var catalogOverride = ModelsDevPricing.OverrideCatalogForTests(catalogJson);
+
+    // The precondition the whole test rests on, asserted rather than assumed: the catalog really is
+    // SILENT about a long-context tier for this model, which is what used to erase the built-in one.
+    var rawCatalog = ModelsDevPricing.Lookup("anthropic", "claude-sonnet-4-5");
+    Assert(rawCatalog is not null, "the pinned catalog must resolve claude-sonnet-4-5");
+    Assert(rawCatalog!.ThresholdTokens is null, "and must carry no long-context tier of its own");
+
+    var sonnet45 = ClaudeModelPricing.For("claude-sonnet-4-5");
+    Assert(sonnet45 is not null, "claude-sonnet-4-5 must price");
+    AssertEqual(200_000, sonnet45!.ThresholdTokens ?? 0, "the built-in 200k tier survives a silent catalog");
+    AssertEqual(3.00m, sonnet45.InputPerMillion, "base rates still come from the catalog");
+    AssertEqual(6.00m, sonnet45.InputPerMillionAboveThreshold ?? 0m, "above-threshold input from the built-in table");
+    AssertEqual(22.50m, sonnet45.OutputPerMillionAboveThreshold ?? 0m, "above-threshold output from the built-in table");
+    AssertEqual(0.60m, sonnet45.CacheReadPerMillionAboveThreshold ?? 0m, "above-threshold cache read from the built-in table");
+    AssertEqual(7.50m, sonnet45.CacheCreationPerMillionAboveThreshold ?? 0m, "above-threshold cache write from the built-in table");
+
+    // A model the catalog fully describes stays catalog-driven end to end — that is the whole point of
+    // fetching it. Every one of these numbers differs from the built-in row (5.00 / 25.00 / 0.50 /
+    // 6.25, no tier at all), so a built-in leak would show up here immediately.
+    var opus45 = ClaudeModelPricing.For("claude-opus-4-5");
+    Assert(opus45 is not null, "claude-opus-4-5 must price");
+    AssertEqual(7.00m, opus45!.InputPerMillion, "catalog base input wins over the built-in 5.00");
+    AssertEqual(35.00m, opus45.OutputPerMillion, "catalog base output wins over the built-in 25.00");
+    AssertEqual(0.70m, opus45.CacheReadPerMillion ?? 0m, "catalog cache read wins");
+    AssertEqual(8.75m, opus45.CacheCreationPerMillion ?? 0m, "catalog cache write wins");
+    AssertEqual(200_000, opus45.ThresholdTokens ?? 0, "a catalog tier applies even where the built-in row has none");
+    AssertEqual(14.00m, opus45.InputPerMillionAboveThreshold ?? 0m, "and its above-threshold column is the catalog's");
+
+    // And where BOTH sources carry a tier the catalog's wins: the built-in above-input for -4-6 is
+    // 6.00, so 9.00 proves the fallback is per-field and not "built-in wins the tier".
+    var sonnet46 = ClaudeModelPricing.For("claude-sonnet-4-6");
+    AssertEqual(9.00m, sonnet46!.InputPerMillionAboveThreshold ?? 0m, "an explicit catalog tier overrides the built-in one");
+    AssertEqual(45.00m, sonnet46.OutputPerMillionAboveThreshold ?? 0m, "on every component");
+
+    // Now the dollars, on BOTH paths. The scan path is reached through the reader's own private entry
+    // point, so these are the figures the 30-day history actually renders.
+    var scanEstimate = typeof(ClaudeUsageInsightsReader).GetMethod("EstimateCost", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+    Assert(scanEstimate is not null, "ClaudeUsageInsightsReader.EstimateCost should exist");
+    decimal ScanCost(string model, long rawInput, long cachedInput, long cacheCreation, long output)
+        => (decimal)(scanEstimate!.Invoke(null, [model, rawInput, cachedInput, cacheCreation, output]) as decimal? ?? -1m);
+
+    using var fixture = new UsageLedgerFixture();
+    var day = new DateTimeOffset(2026, 7, 2, 0, 0, 0, TimeSpan.Zero);
+    var slot = 0;
+
+    // One row per hour of the same day, each queried alone, so the cases stay independent.
+    decimal LedgerCost(string model, long rawInput, long cachedInput, long cacheCreation, long output)
+    {
+        var at = day.AddHours(slot++);
+        var builder = new UsageLedgerBatchBuilder(accountingVersion: 3);
+        builder.CoverDay(at);
+        builder.AddClaudeRow(at, model, rawInput, cachedInput, cacheCreation, output, ClaudeModelPricing.ThresholdTokensFor(model));
+        Assert(UsageLedger.TryMerge(UsageLedgerScope.Claude, builder.Build(at)), "seed merge");
+
+        var series = LedgerQueryUtc(UsageLedgerScope.Claude, at, at.AddHours(1), UsageLedgerGranularity.Hour, LedgerPricing.For(UsageLedgerScope.Claude));
+        Assert(!series.HasIncompleteCost, "the model must price COMPLETELY on the ledger path");
+        Assert(!series.ThresholdMismatch, "the query's threshold resolver must agree with the one the batch recorded");
+        return series.TotalEstimatedCostUsd;
+    }
+
+    void Both(decimal expected, string model, long rawInput, long cachedInput, long cacheCreation, long output, string what)
+    {
+        AssertClose(expected, ScanCost(model, rawInput, cachedInput, cacheCreation, output), $"scan path: {what}");
+        AssertClose(expected, LedgerCost(model, rawInput, cachedInput, cacheCreation, output), $"ledger path: {what}");
+    }
+
+    // claude-sonnet-4-5, wholly under the cutoff: unaffected by the tier either way, so it pins that
+    // the merge did not disturb the base column. 0.1M*3 + 0.05M*0.30 + 0.02M*3.75 + 0.01M*15.
+    Both(0.54m, "claude-sonnet-4-5", 100_000, 50_000, 20_000, 10_000, "sonnet-4-5 wholly sub-threshold");
+
+    // Input past the cutoff. Priced FLAT (the defect) this is 250k*3 = 0.75 + 0.003 + 0.01875 + 0.12
+    // = 0.89175; with the tier restored the 50k over bills at 6.00: 0.2M*3 + 0.05M*6 = 0.90.
+    Both(1.04175m, "claude-sonnet-4-5", 250_000, 10_000, 5_000, 8_000, "sonnet-4-5 input past the cutoff splits");
+
+    // Every component past the cutoff at once. Flat this would be 300k at base across the board
+    // = 0.90 + 0.09 + 1.125 + 4.50 = 6.615; tiered: input 0.2*3+0.1*6=1.20; cache read
+    // 0.2*0.30+0.1*0.60=0.12; cache write 0.2*3.75+0.1*7.50=1.50; output 0.2*15+0.1*22.50=5.25.
+    Both(8.07m, "claude-sonnet-4-5", 300_000, 300_000, 300_000, 300_000, "sonnet-4-5 all four components split");
+
+    // The fully-described model, in dollars, at the catalog's own rates: input 0.2*7+0.1*14=2.80;
+    // cache read 0.2*0.70+0.1*1.40=0.28; cache write 0.2*8.75+0.1*17.50=3.50;
+    // output 0.2*35+0.1*70=14.00.
+    Both(20.58m, "claude-opus-4-5", 300_000, 300_000, 300_000, 300_000, "opus-4-5 prices entirely from the catalog");
+}
+
 // The defect this pins: LedgerPricing supplied no ModelLabel, so the ledger grouped rows under
 // UsageLedger.DefaultModelLabel — the RAW logged model id — while the scan grouped under its
 // normalised one. The same model then appeared under two labels depending on which source answered
@@ -2068,6 +2351,358 @@ static void UsageLedgerBackfillWritesNothingWhenCancelled()
 
     Assert(result.Outcome == UsageLedgerBackfillOutcome.Cancelled, $"cancelled outcome: {result.Outcome} - {result.Message}");
     Assert(!UsageLedger.GetCoverage(UsageLedgerScope.Codex).HasHistory, "a cancelled import must leave the ledger untouched");
+    AssertEqual(0, result.DaysImported, "nothing committed, so nothing is claimed");
+    Assert(result.Message.Contains("Nothing was changed", StringComparison.Ordinal), "and it may say so, because it is true");
+}
+
+/// <summary>
+/// The merge is per CORPUS, so a cancel that arrives while the second one is being read finds the
+/// first already fully written. Reporting "nothing was changed" there is a lie about the user's own
+/// data - the one report a data store must never produce.
+/// </summary>
+static void UsageLedgerBackfillReportsWhatItCommittedWhenCancelled()
+{
+    using var fixture = new UsageLedgerFixture();
+    using var cancellation = new CancellationTokenSource();
+    var at = new DateTimeOffset(2026, 6, 2, 11, 0, 0, TimeSpan.Zero);
+
+    var committed = new StubBackfillSource(UsageLedgerScope.Codex, at);
+    var abandoned = new StubBackfillSource(UsageLedgerScope.Claude, at) { CancelOnScan = cancellation };
+
+    var result = UsageLedgerBackfill.Run(null, cancellation.Token, [committed, abandoned]);
+
+    Assert(result.Outcome == UsageLedgerBackfillOutcome.Cancelled, $"cancelled outcome: {result.Outcome} - {result.Message}");
+
+    // The guarantee that survives: no corpus is ever half-written.
+    Assert(UsageLedger.GetCoverage(UsageLedgerScope.Codex).HasHistory, "the corpus that committed before the cancel keeps its rows");
+    Assert(!UsageLedger.GetCoverage(UsageLedgerScope.Claude).HasHistory, "the corpus cancelled mid-scan writes nothing at all");
+
+    // The guarantee that was missing: the report matches what is on disk.
+    AssertEqual(1, result.DaysImported, "a cancelled run must report the days it actually wrote");
+    AssertEqual(new DateOnly(2026, 6, 2), result.FirstDay!.Value, "and the range it wrote them over");
+    Assert(result.FilesScanned > 0, "and the files it read on the way");
+    Assert(
+        !result.Message.Contains("Nothing was changed", StringComparison.Ordinal),
+        $"a cancel that committed a corpus must not claim the ledger is untouched: {result.Message}");
+}
+
+/// <summary>
+/// One corrupt timestamp used to expand a merge to ~739,000 covered days over ~2,000 year shards -
+/// each one a read-modify-write under a cross-process mutex - and the import stopped responding.
+/// </summary>
+static void UsageLedgerDropsImplausibleTimestamps()
+{
+    using var fixture = new UsageLedgerFixture();
+    var good = new DateTimeOffset(2026, 6, 15, 9, 0, 0, TimeSpan.Zero);
+
+    var builder = new UsageLedgerBatchBuilder(accountingVersion: 3);
+    // A zeroed timestamp, a garbage epoch far in the future, and a Unix-epoch sentinel: the three
+    // shapes a broken or future log format actually produces.
+    builder.AddCodexRow(DateTimeOffset.MinValue, "gpt-5.6-sol", 1000, 0, 100, isFast: false, thresholdTokens: 272_000);
+    builder.AddCodexRow(DateTimeOffset.MaxValue, "gpt-5.6-sol", 1000, 0, 100, isFast: false, thresholdTokens: 272_000);
+    builder.AddCodexRow(DateTimeOffset.UnixEpoch, "gpt-5.6-sol", 1000, 0, 100, isFast: false, thresholdTokens: 272_000);
+    builder.AddCodexRow(good, "gpt-5.6-sol", 1000, 0, 100, isFast: false, thresholdTokens: 272_000);
+
+    AssertEqual(1, builder.RecordCount, "only the plausible row is recorded");
+
+    // Exactly what the backfill asks for when the earliest row it saw is corrupt.
+    builder.CoverDays(DateTimeOffset.MinValue, DateTimeOffset.Now);
+
+    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+    Assert(UsageLedger.TryMerge(UsageLedgerScope.Codex, builder.Build(good)), "the merge must still succeed");
+    stopwatch.Stop();
+
+    Assert(
+        stopwatch.Elapsed < TimeSpan.FromSeconds(30),
+        $"a corrupt timestamp must not make the merge quadratic: it took {stopwatch.Elapsed}");
+
+    // Fan-out is bounded by the plausible span, not by the corrupt value.
+    var shards = Directory.GetFiles(fixture.Root, "codex-*.json").Length;
+    var span = DateTime.UtcNow.Year - UsageTimestampText.EarliestPlausibleDay.Year + 1;
+    Assert(shards <= span, $"shard fan-out must stay inside the plausible span: {shards} files for a {span}-year span");
+
+    AssertEqual(
+        1100L,
+        LedgerQueryUtc(
+            UsageLedgerScope.Codex,
+            new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero),
+            new DateTimeOffset(2027, 1, 1, 0, 0, 0, TimeSpan.Zero),
+            UsageLedgerGranularity.Month).TotalTokens,
+        "the one plausible row still lands");
+
+    // Text timestamps are rejected at the same door, before anything downstream sees them.
+    Assert(!UsageTimestampText.IsPlausibleDay(new DateOnly(1, 1, 1)), "year 0001 is not a session day");
+    Assert(!UsageTimestampText.IsPlausibleDay(DateOnly.FromDateTime(DateTime.UtcNow).AddDays(30)), "a month in the future is corrupt, not future");
+    Assert(UsageTimestampText.IsPlausibleDay(DateOnly.FromDateTime(DateTime.UtcNow)), "today is plausible");
+    Assert(UsageTimestampText.IsPlausibleDay(DateOnly.FromDateTime(DateTime.UtcNow).AddDays(1)), "tomorrow is within the offset slack");
+}
+
+/// <summary>
+/// The read paths deserialize whole year shards, and the graphs window drove all of them on the UI
+/// thread for every history update and every period change.
+/// </summary>
+static void UsageLedgerCachesParsedShardsAndInvalidatesOnMerge()
+{
+    using var fixture = new UsageLedgerFixture();
+    var at = new DateTimeOffset(2026, 5, 10, 13, 0, 0, TimeSpan.Zero);
+    var from = new DateTimeOffset(2026, 5, 1, 0, 0, 0, TimeSpan.Zero);
+    var to = new DateTimeOffset(2026, 6, 1, 0, 0, 0, TimeSpan.Zero);
+
+    long Parses() => Interlocked.Read(ref UsageLedger.ShardParseCount);
+
+    Assert(UsageLedger.TryMerge(UsageLedgerScope.Codex, LedgerCodexBatch(true, (at, "gpt-5.6-sol", 1000, 0, 100, false))), "seed merge");
+
+    var beforeFirstRead = Parses();
+    AssertEqual(1100L, LedgerQueryUtc(UsageLedgerScope.Codex, from, to, UsageLedgerGranularity.Day).TotalTokens, "seeded total");
+    var afterFirstRead = Parses();
+    Assert(afterFirstRead > beforeFirstRead, "the first read after a merge has to parse the shard");
+
+    // Every read after it is served from the parsed copy - which is the whole point, because these
+    // three are exactly what one graphs-window refresh runs.
+    LedgerQueryUtc(UsageLedgerScope.Codex, from, to, UsageLedgerGranularity.Day);
+    UsageLedger.GetCoverage(UsageLedgerScope.Codex);
+    UsageLedger.QueryTotal(UsageLedgerScope.Codex, TimeZoneInfo.Utc);
+    UsageLedger.WarmCache(UsageLedgerScope.Codex);
+    AssertEqual(afterFirstRead, Parses(), "a warm shard is never deserialized twice");
+
+    // A MERGE MUST INVALIDATE. A cache that survived one would show the user numbers their own
+    // rescan had already corrected.
+    Assert(UsageLedger.TryMerge(UsageLedgerScope.Codex, LedgerCodexBatch(true, (at, "gpt-5.6-sol", 4000, 0, 500, false))), "corrected merge");
+    AssertEqual(4500L, LedgerQueryUtc(UsageLedgerScope.Codex, from, to, UsageLedgerGranularity.Day).TotalTokens, "a merge must invalidate the read cache");
+    Assert(Parses() > afterFirstRead, "and the shard is parsed again afterwards");
+}
+
+/// <summary>
+/// The data-loss case the ledger's replace-by-scope makes possible: a Codex rollout named after the
+/// day its session STARTED, still being appended to months later. The manual import reaches it; the
+/// 30-day scan used to skip it by name and then delete the day it had contributed to.
+/// </summary>
+static void CodexScanKeepsHistoryImportedFromOldNamedSession()
+{
+    using var ledger = new UsageLedgerFixture();
+    using var fixture = new CodexFixture();
+
+    var now = DateTimeOffset.Now;
+    var longAgo = DateOnly.FromDateTime(now.DateTime).AddDays(-120);
+
+    // Named 120 days ago, written NOW, and carrying today's rows.
+    fixture.WriteSessionLog(
+        $"rollout-{longAgo:yyyy-MM-dd}T09-00-00-01960000-0000-7000-8000-000000000001.jsonl",
+        CodexTokenCountLine(model: "gpt-5.6-sol", input: 5000, cacheRead: 0, output: 100, limitId: "codex"));
+
+    // An ordinary session from today, so the scan has something to find either way and cannot bail
+    // out early with "no session logs".
+    fixture.WriteSessionLog(
+        $"rollout-{DateOnly.FromDateTime(now.DateTime):yyyy-MM-dd}T10-00-00-01960000-0000-7000-8000-000000000002.jsonl",
+        CodexTokenCountLine(model: "gpt-5.6-sol", input: 1000, cacheRead: 0, output: 20, limitId: "codex"));
+
+    // What the manual import wrote for today, including the old-named file's 5,100 tokens.
+    Assert(
+        UsageLedger.TryMerge(UsageLedgerScope.Codex, LedgerCodexBatch(true, (now, "gpt-5.6-sol", 5000, 0, 100, false))),
+        "seed the ledger the way the manual import would");
+
+    var result = fixture.ReadWithLedger();
+    Assert(result.Insights is not null, $"the scan must produce insights: {result.Error}");
+
+    var window = LedgerQueryUtc(
+        UsageLedgerScope.Codex,
+        now.AddDays(-2).ToUniversalTime(),
+        now.AddDays(2).ToUniversalTime(),
+        UsageLedgerGranularity.Day);
+
+    // The scan declares its 30 days COMPLETE, which deletes every existing record for them. Before
+    // the enumeration was widened it could not see the old-named file, so the day came back holding
+    // only the fresh session's 1,020 tokens and the imported 5,100 were gone.
+    Assert(
+        window.TotalTokens >= 5100L,
+        $"a complete scan must not delete history it could not enumerate: {window.TotalTokens} tokens left");
+    AssertEqual(6120L, window.TotalTokens, "both sessions are enumerated and the day is rewritten from both");
+
+    // The flyout's own numbers agree, which is what makes the ledger and the chart the same story.
+    AssertEqual(6000L, result.Insights!.Daily.Sum(day => day.InputTokens), "the 30-day scan counts the long-running session too");
+}
+
+/// <summary>
+/// The worst failure this feature has: a scan DELETING months the user spent 1-3 minutes importing.
+/// </summary>
+/// <remarks>
+/// A row is admitted by the scan on the calendar date its own log SPELLS, but a ledger record is
+/// keyed by the true UTC instant - and one local day straddles two UTC days. A scan whose window
+/// opens on local day F therefore emits records on UTC day F-1 (the tail of that UTC day which fell
+/// inside local day F) after reading only a few hours of it. While a complete batch promoted its
+/// records' days into its authority set, that sliver licensed the merge to delete the WHOLE of UTC
+/// day F-1 and write the sliver back, so every graphs-window open shaved the oldest boundary day off
+/// the backfilled history. The same arithmetic runs at the other end of the window with the opposite
+/// sign of offset, which is why the second batch below clips a day AFTER its window.
+/// </remarks>
+static void UsageLedgerKeepsImportedHistoryOnClippedDays()
+{
+    using var fixture = new UsageLedgerFixture();
+
+    var may = new DateTimeOffset(2026, 5, 1, 0, 0, 0, TimeSpan.Zero);
+    var june = new DateTimeOffset(2026, 6, 1, 0, 0, 0, TimeSpan.Zero);
+
+    UsageLedgerSeries DayTotals(DateTimeOffset from) =>
+        LedgerQueryUtc(UsageLedgerScope.Codex, from, from.AddDays(1), UsageLedgerGranularity.Day);
+
+    // ---- what the manual import wrote, in full -------------------------------------------------
+    var import = new UsageLedgerBatchBuilder(accountingVersion: 3);
+    for (var day = 1; day <= 31; day++)
+    {
+        import.CoverDay(new DateTimeOffset(2026, 5, day, 12, 0, 0, TimeSpan.Zero));
+    }
+
+    // The day BEFORE the scan window, holding a full day of usage: morning, plus the late hour a
+    // +05:30 scan will re-read as the head of its own first local day.
+    import.AddCodexRow(new DateTimeOffset(2026, 5, 9, 3, 0, 0, TimeSpan.Zero), "gpt-5.6-sol", 5000, 0, 500, false, 272_000);
+    import.AddCodexRow(new DateTimeOffset(2026, 5, 9, 23, 0, 0, TimeSpan.Zero), "gpt-5.6-sol", 100, 0, 10, false, 272_000);
+
+    // The day AFTER the scan window, same shape mirrored: the early hour is what a negative-offset
+    // scan re-reads as the tail of its own last local day.
+    import.AddCodexRow(new DateTimeOffset(2026, 5, 21, 1, 0, 0, TimeSpan.Zero), "gpt-5.6-sol", 200, 0, 20, false, 272_000);
+    import.AddCodexRow(new DateTimeOffset(2026, 5, 21, 15, 0, 0, TimeSpan.Zero), "gpt-5.6-sol", 8000, 0, 800, false, 272_000);
+
+    Assert(UsageLedger.TryMerge(UsageLedgerScope.Codex, import.Build(june)), "the import must land");
+    AssertEqual(5610L, DayTotals(new DateTimeOffset(2026, 5, 9, 0, 0, 0, TimeSpan.Zero)).TotalTokens, "imported day before the window");
+    AssertEqual(9020L, DayTotals(new DateTimeOffset(2026, 5, 21, 0, 0, 0, TimeSpan.Zero)).TotalTokens, "imported day after the window");
+
+    // ---- and what a complete 30-day scan does to it ---------------------------------------------
+    UsageLedgerBatch Scan()
+    {
+        var scan = new UsageLedgerBatchBuilder(accountingVersion: 3);
+
+        // Declared window: UTC days 2026-05-10 .. 2026-05-20, read in full.
+        for (var day = 10; day <= 20; day++)
+        {
+            scan.CoverDay(new DateTimeOffset(2026, 5, day, 12, 0, 0, TimeSpan.Zero));
+        }
+
+        // Exactly the rows the window's straddling local days drag in from either side.
+        scan.AddCodexRow(new DateTimeOffset(2026, 5, 9, 23, 0, 0, TimeSpan.Zero), "gpt-5.6-sol", 100, 0, 10, false, 272_000);
+        scan.AddCodexRow(new DateTimeOffset(2026, 5, 15, 10, 0, 0, TimeSpan.Zero), "gpt-5.6-sol", 700, 0, 70, false, 272_000);
+        scan.AddCodexRow(new DateTimeOffset(2026, 5, 21, 1, 0, 0, TimeSpan.Zero), "gpt-5.6-sol", 200, 0, 20, false, 272_000);
+        return scan.Build(june);
+    }
+
+    Assert(UsageLedger.TryMerge(UsageLedgerScope.Codex, Scan()), "the scan must merge");
+
+    AssertEqual(
+        5610L,
+        DayTotals(new DateTimeOffset(2026, 5, 9, 0, 0, 0, TimeSpan.Zero)).TotalTokens,
+        "a scan that only clipped the day before its window must not delete the imported day");
+    AssertEqual(
+        9020L,
+        DayTotals(new DateTimeOffset(2026, 5, 21, 0, 0, 0, TimeSpan.Zero)).TotalTokens,
+        "nor the imported day after it");
+    AssertEqual(770L, DayTotals(new DateTimeOffset(2026, 5, 15, 0, 0, 0, TimeSpan.Zero)).TotalTokens, "the declared days are still replaced");
+
+    // Still idempotent on the clipped days: MAX is what keeps the sliver from accumulating.
+    for (var i = 0; i < 3; i++)
+    {
+        Assert(UsageLedger.TryMerge(UsageLedgerScope.Codex, Scan()), "the scan must re-merge");
+    }
+
+    var month = LedgerQueryUtc(UsageLedgerScope.Codex, may, june, UsageLedgerGranularity.Month);
+    AssertEqual(15_400L, month.TotalTokens, "re-scanning a clipped day must converge, not double count");
+    Assert(!month.HasPartialDays, "a clipped day the ledger already held in full is not demoted to partial");
+}
+
+/// <summary>
+/// The declaration side of the same boundary: a scan may only CLAIM a UTC day it read end to end.
+/// </summary>
+/// <remarks>
+/// Both readers filter rows on the wall-clock date the log spells, and a log line is written either
+/// in UTC (both CLIs stamp a Z) or in the local frame (no zone, or a numeric epoch). A row in frame
+/// o at instant t survives iff t >= firstReportDay - o, so the scan can only vouch for instants from
+/// firstReportDay - min(o) onward. With a NEGATIVE local offset that lands inside the first report
+/// day itself, and claiming it would delete the hours before it.
+/// </remarks>
+static void UsageLedgerClaimsOnlyFullyCoveredUtcDays()
+{
+    var firstReportDay = new DateOnly(2026, 5, 10);
+    var scannedAt = new DateTimeOffset(2026, 6, 8, 20, 0, 0, TimeSpan.FromHours(-8));
+
+    static int UtcDay(int year, int month, int day)
+        => UsageLedger.ToUtcDay(new DateTimeOffset(year, month, day, 0, 0, 0, TimeSpan.Zero));
+
+    static IReadOnlySet<int> Claimed(DateOnly firstReportDay, DateTimeOffset scannedAt, TimeSpan offset)
+    {
+        var builder = new UsageLedgerBatchBuilder(accountingVersion: 3);
+        builder.CoverReportWindow(
+            firstReportDay,
+            scannedAt,
+            TimeZoneInfo.CreateCustomTimeZone($"test{offset}", offset, "test", "test"));
+        return builder.Build(scannedAt).CoveredUtcDays;
+    }
+
+    // +05:30. The guarantee starts exactly on the report day's midnight, so it is claimable - and
+    // the day before it, which the local frame only clips, never is.
+    var ahead = Claimed(firstReportDay, scannedAt, new TimeSpan(5, 30, 0));
+    Assert(ahead.Contains(UtcDay(2026, 5, 10)), "a non-negative offset covers the first report day in full");
+    Assert(!ahead.Contains(UtcDay(2026, 5, 9)), "the day before the window is never claimed");
+
+    // -08:00. The scan has read 2026-05-10 only from 08:00 UTC, so it may not claim it.
+    var behind = Claimed(firstReportDay, scannedAt, TimeSpan.FromHours(-8));
+    Assert(!behind.Contains(UtcDay(2026, 5, 10)), "a negative offset leaves the first report day only partly read");
+    Assert(behind.Contains(UtcDay(2026, 5, 11)), "the day after it is covered end to end");
+
+    // The top is the clock, not local "today": nothing past the scan may be claimed, in either
+    // frame, or a complete batch would delete a future-stamped row it never read.
+    foreach (var claimed in new[] { ahead, behind })
+    {
+        Assert(claimed.Contains(UtcDay(2026, 6, 9)), "the UTC day the scan ran in is claimed");
+        Assert(!claimed.Contains(UtcDay(2026, 6, 10)), "no day past the scan is ever claimed");
+    }
+}
+
+/// <summary>
+/// The persisted UiVibes flag is shared with the frozen WinForms app and survives an in-place
+/// upgrade, so the WinUI shell - which implements none of the vibes appearance - must be able to
+/// make it inert. Pure record logic, no registry: Load/Save touch HKCU and would rewrite the
+/// developer's real settings.
+/// </summary>
+static void StaleVibesFlagIsInertWithoutVibes()
+{
+    // What a user who enabled vibes in the old shell and then picked Solid arrives with.
+    var stale = new UiSettings { VibesEnabled = true, Material = BackdropMaterial.Solid, Theme = AppThemeMode.Light };
+
+    // Honoured, by design, for the shell that DOES render vibes: the chosen material and the
+    // chosen theme are both overridden. This is exactly what stranded the WinUI user.
+    Assert(stale.EffectiveMaterial == BackdropMaterial.Acrylic, "vibes pins the backdrop to Acrylic");
+    Assert(stale.ResolveIsDark(), "vibes forces dark over an explicit Light theme");
+
+    var neutral = stale.WithoutVibes();
+
+    Assert(!neutral.VibesEnabled, "WithoutVibes clears the flag");
+    Assert(neutral.Material == stale.Material, "the user's material choice is preserved, not rewritten");
+    Assert(neutral.EffectiveMaterial == BackdropMaterial.Solid, "the chosen material applies again");
+    Assert(!neutral.ResolveIsDark(), "the explicit Light theme applies again");
+
+    // Idempotent, and identity-preserving when there is nothing to clear: the shell calls this on
+    // every load and on every settings change.
+    AssertEqual(neutral.VibesEnabled, neutral.WithoutVibes().VibesEnabled, "WithoutVibes is idempotent");
+    var clean = new UiSettings { Material = BackdropMaterial.Mica };
+    Assert(ReferenceEquals(clean, clean.WithoutVibes()), "a settings record without vibes is returned unchanged");
+    Assert(clean.WithoutVibes().EffectiveMaterial == BackdropMaterial.Mica, "a clean record keeps its material");
+
+    // Every non-vibes field must survive the copy - this is what the settings window writes back.
+    var carried = new UiSettings
+    {
+        VibesEnabled = true,
+        Theme = AppThemeMode.Dark,
+        Material = BackdropMaterial.MicaAlt,
+        TintOpacityPercent = 12,
+        CodexEnabled = false,
+        ClaudeEnabled = true,
+        CursorEnabled = false,
+        ChartColorOverrides = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["gpt-5.6"] = "#ABCDEF" }
+    }.WithoutVibes();
+
+    Assert(carried.Theme == AppThemeMode.Dark, "theme survives");
+    Assert(carried.Material == BackdropMaterial.MicaAlt, "material survives");
+    AssertEqual(12, carried.TintOpacityPercent, "tint survives");
+    Assert(!carried.CodexEnabled && carried.ClaudeEnabled && !carried.CursorEnabled, "provider opt-outs survive");
+    AssertEqual(1, carried.ChartColorOverrides.Count, "chart colour overrides survive");
 }
 
 static void Assert(bool condition, string message)
@@ -2092,6 +2727,148 @@ static void AssertClose(decimal expected, decimal actual, string message)
     {
         throw new InvalidOperationException($"{message}: expected {expected}, got {actual}");
     }
+}
+
+
+// ---------------------------------------------------------------- graphs period
+//
+// GraphsPeriod is compiled into this exe (see the csproj) rather than referenced, because
+// CodexBar.WinUI cannot be referenced from a plain net10.0-windows test host. These exercise the
+// exact source the window runs on.
+
+static void GraphsPeriodBoundsEveryGranularity()
+{
+    var anchor = new DateOnly(2026, 7, 30); // a Thursday
+
+    var (dayStart, dayEnd) = GraphsPeriod.Bounds(UsageLedgerGranularity.Day, anchor);
+    AssertEqual(anchor, dayStart, "a day period starts on its anchor");
+    AssertEqual(anchor, dayEnd, "a day period ends on its anchor");
+    Assert(GraphsPeriod.BucketOf(UsageLedgerGranularity.Day) == UsageLedgerGranularity.Hour, "day view is HOURLY");
+
+    // ISO Monday, matching UsageLedger.Floor - a strip that disagreed would place a column outside
+    // its own period.
+    var (weekStart, weekEnd) = GraphsPeriod.Bounds(UsageLedgerGranularity.Week, anchor);
+    AssertEqual(new DateOnly(2026, 7, 27), weekStart, "weeks start on Monday");
+    AssertEqual(new DateOnly(2026, 8, 2), weekEnd, "weeks end on Sunday");
+
+    var (monthStart, monthEnd) = GraphsPeriod.Bounds(UsageLedgerGranularity.Month, anchor);
+    AssertEqual(new DateOnly(2026, 7, 1), monthStart, "month start");
+    AssertEqual(new DateOnly(2026, 7, 31), monthEnd, "month end");
+
+    var (yearStart, yearEnd) = GraphsPeriod.Bounds(UsageLedgerGranularity.Year, anchor);
+    AssertEqual(new DateOnly(2026, 1, 1), yearStart, "year start");
+    AssertEqual(new DateOnly(2026, 12, 31), yearEnd, "year end");
+    Assert(GraphsPeriod.BucketOf(UsageLedgerGranularity.Year) == UsageLedgerGranularity.Month, "year view is monthly");
+
+    // The arrows step in whole periods and stay inside the period they land in.
+    AssertEqual(new DateOnly(2025, 1, 1), GraphsPeriod.Shift(UsageLedgerGranularity.Year, anchor, -1), "the year arrow steps a whole year");
+    AssertEqual(new DateOnly(2026, 6, 1), GraphsPeriod.Shift(UsageLedgerGranularity.Month, anchor, -1), "the month arrow steps a calendar month");
+    AssertEqual(new DateOnly(2026, 7, 20), GraphsPeriod.Shift(UsageLedgerGranularity.Week, anchor, -1), "the week arrow steps to the previous Monday");
+    AssertEqual(new DateOnly(2026, 7, 29), GraphsPeriod.Shift(UsageLedgerGranularity.Day, anchor, -1), "the day arrow steps a day");
+}
+
+static void GraphsPeriodCountsCurrentBucketFractionally()
+{
+    // Six days of a month, the sixth of them in progress at 06:00 - a quarter of a day.
+    var buckets = DayBuckets(new DateTime(2026, 7, 1), 10);
+    var now = new DateTimeOffset(new DateTime(2026, 7, 6, 6, 0, 0), TimeSpan.Zero);
+
+    var elapsed = GraphsPeriod.Elapsed(buckets, now, null);
+    Assert(elapsed.CurrentInProgress, "today is in progress");
+    AssertEqual(6, elapsed.Buckets, "six whole days are named in prose");
+    Assert(Math.Abs(elapsed.Fraction - 5.25) < 0.001, $"today counts as a quarter of a day, got {elapsed.Fraction}");
+
+    // The point of the fraction: at 06:00 a whole-day count would divide by 6 and understate the
+    // rate, and the projection built on it would be low by the same amount.
+    Assert(elapsed.Fraction < 6, "a partial day must not count as a whole one");
+
+    // A completed period has no in-progress bucket at all.
+    var past = GraphsPeriod.Elapsed(buckets, new DateTimeOffset(new DateTime(2026, 8, 1), TimeSpan.Zero), null);
+    Assert(!past.CurrentInProgress, "a finished period has nothing in progress");
+    AssertEqual(10, past.Buckets, "every bucket of a finished period is elapsed");
+    Assert(Math.Abs(past.Fraction - 10) < 0.001, "a finished period is exactly its bucket count");
+
+    // A period that has barely begun is floored rather than allowed to blow the divisor up.
+    var justStarted = GraphsPeriod.Elapsed(buckets, new DateTimeOffset(new DateTime(2026, 7, 1, 0, 1, 0), TimeSpan.Zero), null);
+    Assert(justStarted.Fraction >= 0.25, "the elapsed fraction is floored");
+    AssertEqual(1, justStarted.Buckets, "the in-progress bucket still counts as one in prose");
+}
+
+static void GraphsPeriodClampsElapsedToCoverageFloor()
+{
+    // Recording began on the 20th, so the month has 12 days of data and 31 days of calendar.
+    var buckets = DayBuckets(new DateTime(2026, 7, 1), 31);
+    var floor = new DateTimeOffset(new DateTime(2026, 7, 20), TimeSpan.Zero);
+    var now = new DateTimeOffset(new DateTime(2026, 7, 31, 23, 0, 0), TimeSpan.Zero);
+
+    var elapsed = GraphsPeriod.Elapsed(buckets, now, floor);
+    AssertEqual(12, elapsed.Buckets, "only the days at or after the coverage floor are elapsed");
+    Assert(elapsed.Fraction < 12 && elapsed.Fraction > 11.9, $"the last day is still partial, got {elapsed.Fraction}");
+}
+
+static void GraphsPeriodArrowsFollowGranularity()
+{
+    var anchor = new DateOnly(2026, 7, 30);
+
+    // Nothing known about how far back the data goes must not disable navigation.
+    Assert(GraphsPeriod.CanGoBack(UsageLedgerGranularity.Month, anchor, null), "an unknown floor leaves the arrow live");
+
+    // The rule is the PREVIOUS period's end against the floor, one rule for all four granularities.
+    Assert(GraphsPeriod.CanGoBack(UsageLedgerGranularity.Month, anchor, new DateOnly(2026, 6, 15)), "June is reachable from July when the floor is mid-June");
+    Assert(!GraphsPeriod.CanGoBack(UsageLedgerGranularity.Month, anchor, new DateOnly(2026, 7, 1)), "nothing precedes the month the floor starts");
+
+    // Year: live as soon as the floor falls in an earlier year, dead when it does not. This is the
+    // case that kept Year hidden.
+    Assert(!GraphsPeriod.CanGoBack(UsageLedgerGranularity.Year, anchor, new DateOnly(2026, 3, 1)), "2025 is unreachable when history starts in March 2026");
+    Assert(GraphsPeriod.CanGoBack(UsageLedgerGranularity.Year, anchor, new DateOnly(2025, 12, 31)), "2025 is reachable when history reaches its last day");
+
+    Assert(GraphsPeriod.CanGoBack(UsageLedgerGranularity.Day, anchor, new DateOnly(2026, 7, 29)), "yesterday is reachable when the floor is yesterday");
+    Assert(!GraphsPeriod.CanGoBack(UsageLedgerGranularity.Day, anchor, anchor), "no day precedes the floor day");
+
+    Assert(GraphsPeriod.IsCurrent(UsageLedgerGranularity.Month, anchor, new DateOnly(2026, 7, 1)), "July contains 1 July");
+    Assert(!GraphsPeriod.IsCurrent(UsageLedgerGranularity.Month, anchor, new DateOnly(2026, 8, 1)), "July does not contain 1 August");
+}
+
+static void GraphsPeriodDrillsOneLevelFiner()
+{
+    Assert(GraphsPeriod.Finer(UsageLedgerGranularity.Year) == UsageLedgerGranularity.Month, "a year drills to a month");
+    Assert(GraphsPeriod.Finer(UsageLedgerGranularity.Month) == UsageLedgerGranularity.Day, "a month drills to a day");
+    Assert(GraphsPeriod.Finer(UsageLedgerGranularity.Week) == UsageLedgerGranularity.Day, "a week drills to a day");
+
+    Assert(GraphsPeriod.CanStepFiner(UsageLedgerGranularity.Year), "year can drill");
+    Assert(GraphsPeriod.CanStepFiner(UsageLedgerGranularity.Week), "week can drill");
+    Assert(!GraphsPeriod.CanStepFiner(UsageLedgerGranularity.Day), "day is the floor - there is no hour PERIOD");
+}
+
+static void GraphsPeriodNamesWholeDayColumnWithoutHour()
+{
+    var at = new DateTime(2026, 7, 30, 15, 0, 0);
+
+    // A real hourly column names its hour...
+    Assert(
+        GraphsPeriod.BucketLabel(UsageLedgerGranularity.Day, at, TimeSpan.FromHours(1)).Contains("3 PM", StringComparison.Ordinal),
+        "an hourly column is named by its hour");
+
+    // ...but the single column the SCAN can answer with covers the whole day, and calling it "12 AM"
+    // would claim an hour the data never had.
+    var wholeDay = GraphsPeriod.BucketLabel(UsageLedgerGranularity.Day, at.Date, TimeSpan.FromDays(1));
+    Assert(
+        !wholeDay.Contains("AM", StringComparison.Ordinal) && !wholeDay.Contains("PM", StringComparison.Ordinal),
+        $"a whole-day column must not name an hour, got \"{wholeDay}\"");
+}
+
+/// <summary>Dense day buckets, the shape UsageLedger.Query returns them in.</summary>
+static IReadOnlyList<(DateTimeOffset Start, DateTimeOffset EndExclusive)> DayBuckets(DateTime start, int count)
+{
+    var buckets = new List<(DateTimeOffset, DateTimeOffset)>(count);
+    for (var index = 0; index < count; index++)
+    {
+        buckets.Add((
+            new DateTimeOffset(start.AddDays(index), TimeSpan.Zero),
+            new DateTimeOffset(start.AddDays(index + 1), TimeSpan.Zero)));
+    }
+
+    return buckets;
 }
 
 /// <summary>
@@ -2179,6 +2956,16 @@ sealed class CodexFixture : IDisposable
         return new CodexUsageInsightsReader(Path.Combine(root, "codex")).ReadLatest();
     }
 
+    /// <summary>
+    /// Reads the fixture corpus AND merges into the ledger, synchronously. Only usable under a
+    /// <see cref="UsageLedgerFixture"/> - the factory refuses otherwise - because what it exercises
+    /// is the scan's authority to DELETE days, which against the real root would delete real months.
+    /// </summary>
+    public ProviderUsageInsightsLookupResult ReadWithLedger()
+    {
+        return CodexUsageInsightsReader.CreateLedgerWritingReaderForTests(Path.Combine(root, "codex")).ReadLatest();
+    }
+
     public void Dispose()
     {
         Environment.SetEnvironmentVariable("PI_HOME", originalPiHome);
@@ -2215,7 +3002,15 @@ sealed class UsageLedgerFixture : IDisposable
         => Path.Combine(Root, $"{(scope == UsageLedgerScope.Codex ? "codex" : "claude")}-{year}-v{UsageLedger.SchemaVersion}.json");
 
     public void WriteRawShard(UsageLedgerScope scope, int year, string payload)
-        => File.WriteAllText(ShardPath(scope, year), payload);
+    {
+        File.WriteAllText(ShardPath(scope, year), payload);
+
+        // Written BEHIND the store's back, so the store's own identity check (length + last write
+        // time) cannot be relied on: successive payloads of equal length inside one file-time tick
+        // are indistinguishable to it. A hand-edited shard is not a case production has to survive
+        // at millisecond resolution, so the test says so explicitly instead of weakening the check.
+        UsageLedger.InvalidateShardCache();
+    }
 
     public string ReadRawShard(UsageLedgerScope scope, int year) => File.ReadAllText(ShardPath(scope, year));
 

@@ -496,12 +496,20 @@
                                         (a custom palette, gradient meters and celebration
                                         animations) wired through six UI files; none of that has
                                         been ported. The row is hidden rather than deleted because
-                                        the setting is still READ (UiSettings.EffectiveMaterial and
-                                        ResolveIsDark honour it) and it lives in a registry key
-                                        SHARED with the WinForms app - offering it here would
-                                        advertise a feature that does nothing while silently
-                                        restyling the other shell. Restore the row once VibeTheme
-                                        is ported.
+                                        the setting lives in a registry key SHARED with the
+                                        WinForms app - offering it here would advertise a feature
+                                        that does nothing while silently restyling the other shell.
+
+                                        Because it is hidden, NOTHING IN THIS SHELL MAY READ IT: a
+                                        hidden setting that still gates a visible control is a dead
+                                        end the user cannot escape from inside the app - this one
+                                        disabled the Material picker outright for every user who
+                                        arrived with UiVibes=1 from the WinForms app, since that
+                                        registry key survives an in-place upgrade. AppTheme.Settings
+                                        therefore forces the flag off shell-wide through
+                                        UiSettings.WithoutVibes, which also keeps EffectiveMaterial
+                                        and ResolveIsDark honest here. Restore the row and drop that
+                                        call together, once VibeTheme is ported.
                                     -->
                                     <Grid Style="{StaticResource SettingRowStyle}" Visibility="Collapsed">
                                         <Grid.ColumnDefinitions>

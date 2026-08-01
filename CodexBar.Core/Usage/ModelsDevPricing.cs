@@ -73,6 +73,51 @@ internal static class ModelsDevPricing
         LookupMemo.Clear();
     }
 
+    /// <summary>
+    /// Swaps the in-memory catalog for a literal one until the returned handle is disposed.
+    /// </summary>
+    /// <remarks>
+    /// Tests only, and the only way to exercise catalog-vs-built-in precedence deterministically: the
+    /// real catalog is a network fetch cached under LocalApplicationData, so whether a given model has
+    /// a catalog entry depends on the developer's machine and on what models.dev shipped that day. A
+    /// pricing test that cannot pin BOTH sources can only assert what happens to be true right now.
+    /// <para/>
+    /// The previous state (including the not-yet-loaded state) is restored on dispose and the memo is
+    /// cleared on both edges, because entries resolved against one catalog - null included - would
+    /// otherwise outlive it.
+    /// </remarks>
+    internal static IDisposable OverrideCatalogForTests(string catalogJson)
+    {
+        using var document = JsonDocument.Parse(catalogJson);
+        var replacement = document.RootElement.Clone();
+        CatalogOverride restore;
+        lock (CacheLock)
+        {
+            restore = new CatalogOverride(cacheLoaded, cachedCatalog, cachedFetchedAt);
+            cachedCatalog = replacement;
+            cachedFetchedAt = DateTimeOffset.UtcNow;
+            cacheLoaded = true;
+        }
+
+        InvalidateLookupMemo();
+        return restore;
+    }
+
+    private sealed class CatalogOverride(bool loaded, JsonElement? catalog, DateTimeOffset fetchedAt) : IDisposable
+    {
+        public void Dispose()
+        {
+            lock (CacheLock)
+            {
+                cacheLoaded = loaded;
+                cachedCatalog = catalog;
+                cachedFetchedAt = fetchedAt;
+            }
+
+            InvalidateLookupMemo();
+        }
+    }
+
     private static async Task RefreshIfNeededAsync(CancellationToken cancellationToken)
     {
         var load = Load();

@@ -44,7 +44,14 @@ public static partial class UsageLedger
 
             var accumulators = buckets.Select(bucket => new BucketAccumulator(bucket.StartLocal, bucket.EndLocalExclusive)).ToArray();
             var total = new BucketAccumulator(buckets[0].StartLocal, buckets[^1].EndLocalExclusive);
-            var starts = buckets.Select(bucket => bucket.StartLocalUnspecified).ToArray();
+
+            // INSTANTS, not wall clock. A record is keyed by a true UTC hour and the buckets are a
+            // partition of the real timeline, so the match is an instant comparison; matching on the
+            // local wall clock instead is undefined exactly where DST makes it interesting - the
+            // repeated hour of a fall-back day maps two distinct instants onto one local time, and
+            // the array of local starts is not even strictly increasing there, which a binary search
+            // requires.
+            var starts = buckets.Select(bucket => bucket.StartLocal.UtcDateTime).ToArray();
 
             var fromUtc = fromLocal.UtcDateTime;
             var toUtc = toLocalExclusive.UtcDateTime;
@@ -57,9 +64,9 @@ public static partial class UsageLedger
                 hasPartialDays |= day.Partial;
                 hasTruncatedDays |= day.Truncated;
 
-                var localHour = TimeZoneInfo.ConvertTime(FromUtcHour(record.Key.UtcHour), zone).DateTime;
-                var index = IndexOf(starts, localHour);
-                if (index < 0 || localHour >= buckets[index].EndLocalUnspecified)
+                var instant = FromUtcHour(record.Key.UtcHour).UtcDateTime;
+                var index = IndexOf(starts, instant);
+                if (index < 0 || instant >= buckets[index].EndLocalExclusive.UtcDateTime)
                 {
                     continue;
                 }
@@ -318,7 +325,40 @@ public static partial class UsageLedger
         var buckets = new List<BucketBounds>();
         if (granularity == UsageLedgerGranularity.All)
         {
-            buckets.Add(new BucketBounds(fromLocal, toLocalExclusive, fromLocal.DateTime, toLocalExclusive.DateTime));
+            buckets.Add(new BucketBounds(fromLocal, toLocalExclusive));
+            return buckets;
+        }
+
+        if (granularity == UsageLedgerGranularity.Hour)
+        {
+            // THE DAY'S OWN TIMELINE, not 24 wall-clock hours. A calendar day is a day however long
+            // it is, so Day/Week/Month/Year still step in wall clock below - but an HOUR bucket is a
+            // fixed span of real time, and walking the wall clock produced a bucket set that did not
+            // partition the day it claimed to cover:
+            //
+            //   spring forward - 02:00 local never happens, so [02:00, 03:00) is the SAME instant
+            //     twice: an empty, zero-width column that GraphsPeriod.Elapsed then counted as a
+            //     whole elapsed hour, deflating Average and Projected all day.
+            //   fall back - 01:00 local happens twice, so two real hours folded into one column and
+            //     the day lost one of them.
+            //
+            // Advancing by a real hour from the day's first instant gives 23 columns on a short day
+            // and 25 on a long one, every column exactly one hour wide - so the count of columns and
+            // the count of elapsed hours are the same number by construction, which is the property
+            // Elapsed relies on.
+            var instant = ToLocal(Floor(fromLocal.DateTime, granularity), zone);
+            while (instant < toLocalExclusive && buckets.Count < MaxBuckets)
+            {
+                var next = instant.AddHours(1);
+
+                // Re-projected through the zone at each end rather than carried: the offset changes
+                // mid-day, and the local face of a bucket is what labels and selects it.
+                buckets.Add(new BucketBounds(
+                    TimeZoneInfo.ConvertTime(instant, zone),
+                    TimeZoneInfo.ConvertTime(next, zone)));
+                instant = next;
+            }
+
             return buckets;
         }
 
@@ -327,7 +367,7 @@ public static partial class UsageLedger
         while (cursor < end && buckets.Count < MaxBuckets)
         {
             var next = Advance(cursor, granularity);
-            buckets.Add(new BucketBounds(ToLocal(cursor, zone), ToLocal(next, zone), cursor, next));
+            buckets.Add(new BucketBounds(ToLocal(cursor, zone), ToLocal(next, zone)));
             cursor = next;
         }
 
@@ -356,11 +396,14 @@ public static partial class UsageLedger
         _ => DateTime.MaxValue
     };
 
+    /// <summary>
+    /// One column's bounds. Both ends are INSTANTS carrying the zone's offset at that instant, which
+    /// is the only representation that survives a DST boundary: the local face is
+    /// <c>StartLocal.DateTime</c> and the identity used for matching is <c>StartLocal.UtcDateTime</c>.
+    /// </summary>
     private readonly record struct BucketBounds(
         DateTimeOffset StartLocal,
-        DateTimeOffset EndLocalExclusive,
-        DateTime StartLocalUnspecified,
-        DateTime EndLocalUnspecified);
+        DateTimeOffset EndLocalExclusive);
 
     /// <summary>Read-side view of a shard's interned model table; never mutates the shard.</summary>
     private sealed class ReadOnlyModelTable(List<string> ids)

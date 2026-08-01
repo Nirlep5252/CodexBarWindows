@@ -21,6 +21,32 @@ namespace CodexBarWindows;
 internal static class UsageTimestampText
 {
     /// <summary>
+    /// Earliest day a session log can plausibly be ABOUT.
+    /// </summary>
+    /// <remarks>
+    /// A log cannot predate the tool that writes it: Claude Code shipped in 2024 and the Codex CLI
+    /// in 2025, so 2023-01-01 clears both by more than a year and cannot exclude a real session.
+    /// What it DOES exclude is the two corruptions that actually occur — a missing/zeroed timestamp
+    /// parsed as year 0001, and a nanosecond epoch read as seconds — and that matters far beyond one
+    /// wrong row: a ledger day number drives shard fan-out, so a single year-0001 row expands a
+    /// merge to ~739,000 covered days across ~2,000 year shards and the import appears to hang.
+    /// Bounding it at PARSE time is what keeps the bad value out of every downstream structure.
+    /// </remarks>
+    public static readonly DateOnly EarliestPlausibleDay = new(2023, 1, 1);
+
+    /// <summary>
+    /// Days past today a timestamp may still claim. A log is written in its own frame and read in
+    /// another (+14:00 is the widest real offset), plus a little clock skew; anything beyond that is
+    /// corrupt rather than future, and future days are the cheap half of the fan-out problem.
+    /// </summary>
+    public const int FutureSlackDays = 2;
+
+    /// <summary>True when a calendar day is one a session log could honestly be about.</summary>
+    public static bool IsPlausibleDay(DateOnly day)
+        => day >= EarliestPlausibleDay &&
+            day.DayNumber <= DateOnly.FromDateTime(DateTime.UtcNow).DayNumber + FutureSlackDays;
+
+    /// <summary>
     /// Finds the first <c>yyyy-MM-dd</c> in <paramref name="value"/>. <paramref name="index"/>
     /// receives the offset of the year digit so a caller can keep scanning for the time part.
     /// </summary>
@@ -84,7 +110,11 @@ internal static class UsageTimestampText
     {
         timestamp = default;
         if (!TryFindDate(value, out var index, out var year, out var month, out var day) ||
-            !TryMakeDate(year, month, day, out _))
+            !TryMakeDate(year, month, day, out var date) ||
+            // The plausibility floor lives HERE rather than in the ledger alone, because a row is
+            // cheapest to reject before it has been aggregated, cached and merged. See the remarks
+            // on EarliestPlausibleDay for why a bad date is a fan-out problem, not a rounding one.
+            !IsPlausibleDay(date))
         {
             return false;
         }

@@ -5,10 +5,38 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWindowsForms>true</UseWindowsForms>
+    <!--
+      Compiles the WinUI-free half of ChartPalette.cs (see below). The palette's colour tables and
+      colour maths are guarded by this symbol being ABSENT in the shell, so nothing here changes
+      what the app builds.
+    -->
+    <DefineConstants>$(DefineConstants);CHARTPALETTE_TEST_HOST</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\CodexBar.Core\CodexBar.Core.csproj" />
     <ProjectReference Include="..\..\CodexBarWindows.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      ChartPalette lives in CodexBar.WinUI, which this project CANNOT reference: that project is
+      WinUI 3 / WindowsAppSDK, self-contained and win-x64 only, and a plain net10.0-windows exe
+      referencing it does not restore. The palette's colour half is deliberately free of every
+      WinUI type, so the file is COMPILED IN here instead - the palette tests then exercise the
+      exact source the shell ships rather than a copy that can drift away from it.
+    -->
+    <Compile Include="..\..\CodexBar.WinUI\Theming\ChartPalette.cs" Link="Theming\ChartPalette.cs" />
+    <!--
+      Same arrangement, same reason: GraphsPeriod is the graphs window's whole notion of "which
+      period am I looking at" - bucket bounds, the partial-current-bucket arithmetic and the back
+      arrow's rule - and it is deliberately free of every WinUI type so the tests can exercise the
+      exact source the shell ships.
+    -->
+    <Compile Include="..\..\CodexBar.WinUI\Views\GraphsPeriod.cs" Link="Views\GraphsPeriod.cs" />
+    <!-- Must track CodexBar.WinUI's transitive SkiaSharp (via LiveChartsCore.SkiaSharpView.WinUI):
+         SKColor's HSL conversions are what the palette is written against. Managed-only use, so
+         no native asset is loaded at test time. -->
+    <PackageReference Include="SkiaSharp" Version="3.119.0" />
   </ItemGroup>
 </Project>

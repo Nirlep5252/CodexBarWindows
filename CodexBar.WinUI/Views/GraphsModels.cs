@@ -1,9 +1,6 @@
-using System;
 using System.Collections.Generic;
 using System.ComponentModel;
-using System.Globalization;
 using System.Runtime.CompilerServices;
-using CodexBarWindows;
 using Microsoft.UI.Xaml.Media;
 
 namespace CodexBar.WinUI;
@@ -25,6 +22,7 @@ public sealed class ModelRowModel : INotifyPropertyChanged
     private string name = string.Empty;
     private double meterValue;
     private Brush? colorBrush;
+    private Brush? trackBrush;
     private string costText = string.Empty;
     private string tokensText = string.Empty;
     private string detailText = string.Empty;
@@ -62,6 +60,21 @@ public sealed class ModelRowModel : INotifyPropertyChanged
         internal set => Set(ref colorBrush, value);
     }
 
+    /// <summary>
+    /// The UNFILLED part of the meter.
+    /// </summary>
+    /// <remarks>
+    /// Carried on the row rather than left to the ProgressBar's own track because the stock track is
+    /// a 1px rule (<c>ProgressBarTrackHeight</c>) - see the meter's comment in the XAML. Painting it
+    /// from <c>ChartPalette.Track</c> is also what keeps it correct under a forced theme, which a
+    /// brush read out of the app resources would not be.
+    /// </remarks>
+    public Brush? TrackBrush
+    {
+        get => trackBrush;
+        internal set => Set(ref trackBrush, value);
+    }
+
     public string CostText
     {
         get => costText;
@@ -91,162 +104,5 @@ public sealed class ModelRowModel : INotifyPropertyChanged
 
         field = value;
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
-    }
-}
-
-/// <summary>
-/// The timeline strip's arithmetic: a granularity plus an ANCHOR DATE derives everything else.
-/// </summary>
-/// <remarks>
-/// The period is never stored as a pair of dates. Storing the anchor is what makes a granularity
-/// change keep the user where they were (July, switched to Week, lands on the week containing the
-/// anchor) instead of resetting to today.
-/// </remarks>
-internal static class GraphsPeriod
-{
-    /// <summary>
-    /// Inclusive local bounds of the period containing <paramref name="anchor"/>.
-    /// </summary>
-    /// <remarks>
-    /// Weeks start on MONDAY, not on the culture's first day: <see cref="UsageLedger.Query"/> floors
-    /// its week buckets to ISO Monday, and a strip that disagreed with the buckets it is asking for
-    /// would place a column outside its own period.
-    /// </remarks>
-    public static (DateOnly Start, DateOnly EndInclusive) Bounds(UsageLedgerGranularity granularity, DateOnly anchor) => granularity switch
-    {
-        UsageLedgerGranularity.Year => (new DateOnly(anchor.Year, 1, 1), new DateOnly(anchor.Year, 12, 31)),
-        UsageLedgerGranularity.Month => (new DateOnly(anchor.Year, anchor.Month, 1),
-            new DateOnly(anchor.Year, anchor.Month, DateTime.DaysInMonth(anchor.Year, anchor.Month))),
-        UsageLedgerGranularity.Week => WeekBounds(anchor),
-        _ => (anchor, anchor)
-    };
-
-    private static (DateOnly Start, DateOnly EndInclusive) WeekBounds(DateOnly anchor)
-    {
-        var start = anchor.AddDays(-(((int)anchor.DayOfWeek + 6) % 7));
-        return (start, start.AddDays(6));
-    }
-
-    /// <summary>The bucket a column of the chart stands for, one step finer than the period.</summary>
-    public static UsageLedgerGranularity BucketOf(UsageLedgerGranularity granularity) => granularity switch
-    {
-        UsageLedgerGranularity.Year => UsageLedgerGranularity.Month,
-        UsageLedgerGranularity.Day => UsageLedgerGranularity.Hour,
-        _ => UsageLedgerGranularity.Day
-    };
-
-    /// <summary>Moves the anchor by whole periods, staying inside the new period.</summary>
-    public static DateOnly Shift(UsageLedgerGranularity granularity, DateOnly anchor, int delta) => granularity switch
-    {
-        UsageLedgerGranularity.Year => new DateOnly(anchor.Year + delta, 1, 1),
-        UsageLedgerGranularity.Month => FirstOfMonth(anchor).AddMonths(delta),
-        UsageLedgerGranularity.Week => WeekBounds(anchor).Start.AddDays(7 * delta),
-        _ => anchor.AddDays(delta)
-    };
-
-    private static DateOnly FirstOfMonth(DateOnly day) => new(day.Year, day.Month, 1);
-
-    /// <summary>
-    /// The strip's label. Relative wording is used for Day ONLY - a week or a month named
-    /// "This week" reads as a filter rather than as a position in a sequence you can page through.
-    /// </summary>
-    public static string Label(UsageLedgerGranularity granularity, DateOnly anchor, DateOnly today)
-    {
-        var (start, end) = Bounds(granularity, anchor);
-        switch (granularity)
-        {
-            case UsageLedgerGranularity.Year:
-                return start.Year.ToString(CultureInfo.CurrentCulture);
-
-            case UsageLedgerGranularity.Month:
-                // The year is always shown: months are the navigation currency here, and "July"
-                // alone is ambiguous the moment a second year of history exists.
-                return start.ToString("MMMM yyyy", CultureInfo.CurrentCulture);
-
-            case UsageLedgerGranularity.Week:
-                if (start.Year != end.Year)
-                {
-                    return $"{start:d MMM yyyy} - {end:d MMM yyyy}";
-                }
-
-                return start.Year == today.Year
-                    ? $"{start:d MMM} - {end:d MMM}"
-                    : $"{start:d MMM} - {end:d MMM yyyy}";
-
-            default:
-                if (start == today)
-                {
-                    return "Today";
-                }
-
-                if (start == today.AddDays(-1))
-                {
-                    return "Yesterday";
-                }
-
-                return start.Year == today.Year
-                    ? start.ToString("ddd d MMM", CultureInfo.CurrentCulture)
-                    : start.ToString("ddd d MMM yyyy", CultureInfo.CurrentCulture);
-        }
-    }
-
-    /// <summary>The unabbreviated inclusive range, for the label's tooltip.</summary>
-    public static string RangeTooltip(UsageLedgerGranularity granularity, DateOnly anchor)
-    {
-        var (start, end) = Bounds(granularity, anchor);
-        return start == end
-            ? start.ToString("dddd, d MMMM yyyy", CultureInfo.CurrentCulture)
-            : $"{start:d MMMM yyyy} - {end:d MMMM yyyy}";
-    }
-
-    /// <summary>What one column of the chart is called, for the drill-down chip and the peak metric.</summary>
-    public static string BucketLabel(UsageLedgerGranularity granularity, DateTime bucketStart) => granularity switch
-    {
-        UsageLedgerGranularity.Year => bucketStart.ToString("MMMM", CultureInfo.CurrentCulture),
-        UsageLedgerGranularity.Day => bucketStart.ToString("ddd d MMM, h tt", CultureInfo.CurrentCulture),
-        _ => bucketStart.ToString("ddd d MMM", CultureInfo.CurrentCulture)
-    };
-
-    /// <summary>"day" / "week" / "month" / "year" - the unit the arrows step in.</summary>
-    public static string Noun(UsageLedgerGranularity granularity) => granularity switch
-    {
-        UsageLedgerGranularity.Year => "year",
-        UsageLedgerGranularity.Month => "month",
-        UsageLedgerGranularity.Week => "week",
-        _ => "day"
-    };
-
-    /// <summary>What one BUCKET is called in prose ("day", "hour", "month").</summary>
-    public static string BucketNoun(UsageLedgerGranularity granularity) => granularity switch
-    {
-        UsageLedgerGranularity.Year => "month",
-        UsageLedgerGranularity.Day => "hour",
-        _ => "day"
-    };
-
-    /// <summary>Short name of the PREVIOUS period, for the delta metric's detail line.</summary>
-    public static string PreviousShortLabel(UsageLedgerGranularity granularity, DateOnly anchor)
-    {
-        var previous = Shift(granularity, anchor, -1);
-        return granularity switch
-        {
-            UsageLedgerGranularity.Year => previous.Year.ToString(CultureInfo.CurrentCulture),
-            UsageLedgerGranularity.Month => previous.ToString("MMMM", CultureInfo.CurrentCulture),
-            UsageLedgerGranularity.Week => $"the week of {Bounds(granularity, previous).Start:d MMM}",
-            _ => previous.ToString("ddd d MMM", CultureInfo.CurrentCulture)
-        };
-    }
-
-    /// <summary>Where the projection lands: "by 31 Jul", "by Sun", "by 11 PM", "by Dec".</summary>
-    public static string ProjectionTarget(UsageLedgerGranularity granularity, DateOnly anchor)
-    {
-        var (_, end) = Bounds(granularity, anchor);
-        return granularity switch
-        {
-            UsageLedgerGranularity.Year => $"by {end:MMM}",
-            UsageLedgerGranularity.Week => $"by {end:ddd}",
-            UsageLedgerGranularity.Day => "by 11 PM",
-            _ => $"by {end:d MMM}"
-        };
     }
 }

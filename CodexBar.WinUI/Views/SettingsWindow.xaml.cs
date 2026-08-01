@@ -117,6 +117,11 @@ public sealed partial class SettingsWindow : Window
 
         hwnd = WindowNative.GetWindowHandle(this);
         queue = DispatcherQueue.GetForCurrentThread();
+        // Vibes-neutralised (see AppTheme.Settings), which this window is also the one place that
+        // WRITES BACK: every Save here carries VibesEnabled=false, so the first appearance change
+        // a stranded UiVibes=1 user makes also clears the stale flag out of the shared registry
+        // key for good. That migration is a side effect, not the fix - the fix is that nothing in
+        // this shell reads the flag any more - and it is idempotent by construction.
         settings = AppTheme.Settings;
         palette = FlyoutPalette.For(RootGrid);
         codexEntries = CodexCliSettings.Load().ToList();
@@ -543,6 +548,11 @@ public sealed partial class SettingsWindow : Window
         ApplyMaterialEnablement();
     }
 
+    /// <summary>
+    /// Unreachable today: the row is Collapsed and <see cref="AppTheme.Settings"/> neutralises
+    /// the flag, so a saved <c>true</c> would come straight back as <c>false</c>. Kept wired for
+    /// the port - un-hiding the row means dropping the WithoutVibes call in the same change.
+    /// </summary>
     private void OnVibesToggled()
     {
         if (suppressWrites || VibesToggle.IsOn == settings.VibesEnabled)
@@ -556,13 +566,22 @@ public sealed partial class SettingsWindow : Window
     }
 
     /// <summary>
-    /// Vibes always rides the stock Acrylic backdrop, so the material picker is inert while it
-    /// is on; the tint slider stays live so translucency remains adjustable, except on Solid
-    /// where there is no material to tint.
+    /// The tint slider is dead on Solid - there is no material to tint - so the whole row is
+    /// disabled there. That is the ONLY enablement rule on this page, and it is driven by the
+    /// Material combo sitting directly above it.
     /// </summary>
+    /// <remarks>
+    /// The material combo used to be disabled while vibes were on (vibes always rode the stock
+    /// Acrylic backdrop, so the picker was inert). That gate SHIPPED BROKEN once the vibes row
+    /// was hidden here: a user arriving with <c>UiVibes=1</c> from the WinForms app - the
+    /// registry key survives an in-place upgrade - got a permanently disabled material picker
+    /// and no visible control to turn vibes off, a dead end with no escape from inside the app.
+    /// A control must never be gated on a setting the user cannot reach. The gate is also
+    /// pointless now: <see cref="AppTheme.Settings"/> neutralises vibes for this shell, so
+    /// <c>EffectiveMaterial</c> here is always just <c>Material</c>.
+    /// </remarks>
     private void ApplyMaterialEnablement()
     {
-        MaterialCombo.IsEnabled = !settings.VibesEnabled;
         OpacityRow.IsEnabled = settings.EffectiveMaterial != BackdropMaterial.Solid;
     }
 
@@ -952,7 +971,11 @@ public sealed partial class SettingsWindow : Window
         ImportHistoryButton.Content = "Import";
         ImportHistoryProgress.Visibility = Visibility.Collapsed;
         ImportHistoryProgress.IsIndeterminate = true;
-        ImportHistoryCaption.Text = result.Outcome == UsageLedgerBackfillOutcome.Cancelled
+        // A cancel that committed NOTHING goes back to the idle caption, because there is nothing to
+        // report. One that had already written a corpus must keep saying so - the backfill goes to
+        // the trouble of reporting real counts for a partial import, and dropping them here would
+        // put the "nothing was changed" impression back by other means.
+        ImportHistoryCaption.Text = result.Outcome == UsageLedgerBackfillOutcome.Cancelled && result.DaysImported == 0
             ? ImportIdleCaption
             : result.Message;
 
@@ -965,7 +988,9 @@ public sealed partial class SettingsWindow : Window
             _ => StatusLevel.Info
         });
 
-        if (result.Outcome == UsageLedgerBackfillOutcome.Imported)
+        // A cancelled run that committed a corpus wrote real data, so it is worth the same log line
+        // as a completed one.
+        if (result.Outcome == UsageLedgerBackfillOutcome.Imported || result.DaysImported > 0)
         {
             DiagnosticLog.Write(
                 "history import: {0} files, {1} days, {2} to {3}",
