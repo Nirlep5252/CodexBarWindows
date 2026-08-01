@@ -34,6 +34,7 @@ public sealed record UiSettings
     private const string VibesValueName = "UiVibes";
     private const string CodexEnabledValueName = "ProviderCodexEnabled";
     private const string ClaudeEnabledValueName = "ProviderClaudeEnabled";
+    private const string GrokEnabledValueName = "ProviderGrokEnabled";
     private const string CursorEnabledValueName = "ProviderCursorEnabled";
     private const string OpenCodeGoEnabledValueName = "ProviderOpenCodeGoEnabled";
     private const string ChartColorsValueName = "ChartColorOverrides";
@@ -99,6 +100,14 @@ public sealed record UiSettings
 
     public bool ClaudeEnabled { get; init; } = true;
 
+    /// <summary>
+    /// OFF by default, unlike the others. Codex/Claude/Cursor were on from the first release, so
+    /// nobody is surprised by them; Grok arrives into existing installs, where defaulting on gives
+    /// every user who has never run Grok a permanent tab reading "Run `grok login`" and a tray
+    /// tooltip segment that pushes the 63-character limit. Opt in from Settings.
+    /// </summary>
+    public bool GrokEnabled { get; init; }
+
     public bool CursorEnabled { get; init; } = true;
 
     /// <summary>
@@ -128,6 +137,7 @@ public sealed record UiSettings
     public bool IsProviderEnabled(UsageProvider provider) => provider switch
     {
         UsageProvider.Claude => ClaudeEnabled,
+        UsageProvider.Grok => GrokEnabled,
         UsageProvider.Cursor => CursorEnabled,
         UsageProvider.OpenCodeGo => OpenCodeGoEnabled,
         _ => CodexEnabled
@@ -175,6 +185,10 @@ public sealed record UiSettings
             static bool ReadEnabled(RegistryKey key, string name)
                 => key.GetValue(name) is not int value || value != 0;
 
+            // ABSENT MEANS OFF, the opposite of ReadEnabled. A provider that shipped after the
+            // first release has no value under an existing install, and ReadEnabled would read
+            // that silence as "on" - turning a newly added provider on for everyone who upgraded
+            // and bypassing the property default entirely.
             static bool ReadOptIn(RegistryKey key, string name)
                 => key.GetValue(name) is int value && value != 0;
 
@@ -186,6 +200,7 @@ public sealed record UiSettings
                 VibesEnabled = vibes,
                 CodexEnabled = ReadEnabled(key, CodexEnabledValueName),
                 ClaudeEnabled = ReadEnabled(key, ClaudeEnabledValueName),
+                GrokEnabled = ReadOptIn(key, GrokEnabledValueName),
                 CursorEnabled = ReadEnabled(key, CursorEnabledValueName),
                 OpenCodeGoEnabled = ReadOptIn(key, OpenCodeGoEnabledValueName),
                 ChartColorOverrides = ReadChartColors(key)
@@ -279,6 +294,7 @@ public sealed record UiSettings
             key.SetValue(VibesValueName, VibesEnabled ? 1 : 0, RegistryValueKind.DWord);
             key.SetValue(CodexEnabledValueName, CodexEnabled ? 1 : 0, RegistryValueKind.DWord);
             key.SetValue(ClaudeEnabledValueName, ClaudeEnabled ? 1 : 0, RegistryValueKind.DWord);
+            key.SetValue(GrokEnabledValueName, GrokEnabled ? 1 : 0, RegistryValueKind.DWord);
             key.SetValue(CursorEnabledValueName, CursorEnabled ? 1 : 0, RegistryValueKind.DWord);
             key.SetValue(OpenCodeGoEnabledValueName, OpenCodeGoEnabled ? 1 : 0, RegistryValueKind.DWord);
 

@@ -74,19 +74,25 @@
                          headroom, because a fixed column cannot grow for one row without breaking
                          that shared track - it can only ellipsise (reset) or clip (percent).
                          Percent 46: "100%" measures ~31 DIP at the caption's 12px.
-                         Reset 104: the longest form FormatResetShort produces is now the beyond-
-                         a-week date, "30 Sep 10:29 AM" at ~90 DIP - "Tomorrow 10:29 AM" was ~109
-                         and was the reported cut-off, which is why that prefix is now "Tmrw".
-                         The ~15% slack is deliberate: the columns are DIPs and scale cleanly, but
-                         glyph advances are hinted per DPI and the user's text-size setting scales
-                         the font WITHOUT scaling the layout, so an exact fit would break.
-                         The width comes out of the star column, which still leaves the meter
-                         ~123 DIP inside the 400 DIP flyout - well above its 60 DIP MinWidth. -->
+                         Reset 76: the longest countdown FormatResetShort produces is
+                         "·  in 23h 59m" at ~66 DIP, and the ~15% slack is deliberate - the columns
+                         are DIPs and scale cleanly, but glyph advances are hinted per DPI and the
+                         user's text-size setting scales the font WITHOUT scaling the layout, so an
+                         exact fit would break.
+                         SIZED FOR THE COUNTDOWN, not for the dates this column used to hold. At
+                         104 it was still carrying headroom for "30 Sep 10:29 AM", which left a
+                         wide dead strip against the card edge once the text went left-aligned and
+                         short. Left-aligned variable text cannot be flush on both sides, so the
+                         column is trimmed to its real worst case instead: the gap that remains is
+                         the difference between THIS row's countdown and the longest one, which is
+                         the smallest it can honestly be.
+                         The width comes out of the star column, which leaves the meter ~151 DIP
+                         inside the 400 DIP flyout - well above its 60 DIP MinWidth. -->
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="42" />
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="46" />
-                        <ColumnDefinition Width="104" />
+                        <ColumnDefinition Width="76" />
                     </Grid.ColumnDefinitions>
 
                     <TextBlock
@@ -115,13 +121,20 @@
                         TextAlignment="Right"
                         VerticalAlignment="Center" />
 
+                    <!-- LEFT, not Right. Right-aligning anchored each string to the card edge and
+                         let its left edge fall wherever the length put it, so "·  in 34m" started
+                         a long way right of "·  in 4d 8h" and the column read as scattered. The
+                         "·  " prefix is a constant, so left-aligning puts the separator AND the
+                         first character of every countdown on the same x for every row of every
+                         provider. The percent column stays right-aligned: those are numbers of the
+                         same magnitude, and right is where digits line up. -->
                     <TextBlock
                         Grid.Column="3"
                         MaxLines="1"
                         Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                         Style="{StaticResource CaptionTextBlockStyle}"
                         Text="{x:Bind ResetText, Mode=OneWay}"
-                        TextAlignment="Right"
+                        TextAlignment="Left"
                         TextTrimming="CharacterEllipsis"
                         VerticalAlignment="Center" />
                 </Grid>

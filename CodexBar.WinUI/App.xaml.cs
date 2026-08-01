@@ -217,6 +217,10 @@ public partial class App : Application
         // false: do NOT opt the process into Efficiency Mode - background polling timers
         // (added in a later phase) must not be throttled.
         trayIcon.ForceCreate(enablesEfficiencyMode: false);
+        DiagnosticLog.Write(
+            "tray icon created visible={0} tooltip={1}",
+            trayIcon.Visibility,
+            trayIcon.ToolTipText);
 
         WatchSystemThemeForTrayIcon();
     }

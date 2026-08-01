@@ -38,6 +38,14 @@ internal static class ProviderGeometry
     private const string OpenCodeGoData =
         "F0 M 20 12 H 80 V 88 H 20 Z M 35 27 H 65 V 72 H 35 Z";
 
+    /// <summary>
+    /// Thin geometric X in the same visual weight class as the Codex/Cursor marks (not a heavy
+    /// filled block). View box is roughly 0–100; <see cref="Normalize"/> scales it to
+    /// <see cref="IconSize"/>.
+    /// </summary>
+    private const string GrokData =
+        "F0 M 18 8 L 28 8 L 50 36 L 72 8 L 82 8 L 82 18 L 54 50 L 82 82 L 82 92 L 72 92 L 50 64 L 28 92 L 18 92 L 18 82 L 46 50 L 18 18 Z";
+
     /// <summary>Edge length of the square the mark is normalised into, in DIPs.</summary>
     private const double IconSize = 14;
 
@@ -58,6 +66,7 @@ internal static class ProviderGeometry
             UsageProvider.Claude => ClaudeData,
             UsageProvider.Cursor => CursorData,
             UsageProvider.OpenCodeGo => OpenCodeGoData,
+            UsageProvider.Grok => GrokData,
             _ => CodexData
         });
 

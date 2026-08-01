@@ -50,6 +50,14 @@ internal static class ProviderPlanFormatter
             }
         }
 
+        // Grok's tiers arrive already cased as brands ("SuperGrok", "SuperGrok Heavy"). ToTitleCase
+        // lowercases everything after the first letter, which turned those into "Supergrok heavy".
+        // Anything carrying an interior capital is a name, not a slug, so it is passed through.
+        if (provider == UsageProvider.Grok && value.Skip(1).Any(char.IsUpper))
+        {
+            return value;
+        }
+
         return ToTitleCase(value.Replace('_', ' ').Replace('-', ' '));
     }
 

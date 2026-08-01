@@ -136,6 +136,8 @@ public sealed class UsageGraphsForm : Form
 
         providerKeys.Add(UsagePopupForm.ClaudeProviderKey);
         names.Add("Claude");
+        providerKeys.Add(UsagePopupForm.GrokProviderKey);
+        names.Add("Grok");
 
         suppressComboEvents = true;
         providerCombo.Items.Clear();

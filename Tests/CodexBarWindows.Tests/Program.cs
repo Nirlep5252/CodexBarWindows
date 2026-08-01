@@ -146,7 +146,15 @@ var tests = new (string Name, Action Run)[]
     ("OpenCode Go cookie header normalization trims prefix", OpenCodeGoCookieHeaderNormalizationTrimsPrefix),
     ("OpenCode Go normalizes workspace URLs", OpenCodeGoNormalizesWorkspaceUrls),
     ("OpenCode Go parses serialized usage windows", OpenCodeGoParsesSerializedUsageWindows),
+    ("OpenCode Go keeps serialized one percent", OpenCodeGoKeepsSerializedOnePercent),
     ("OpenCode Go parses nested JSON usage", OpenCodeGoParsesNestedJsonUsage),
+    ("Grok billing maps weekly credit percent", GrokBillingMapsWeeklyCreditPercent),
+    ("Grok billing maps on-demand when cap is set", GrokBillingMapsOnDemandWhenCapIsSet),
+    ("Grok billing accepts wrapped config payloads", GrokBillingAcceptsWrappedConfigPayloads),
+    ("Grok history aggregates turn_completed usage", GrokHistoryAggregatesTurnCompletedUsage),
+    ("Grok history excludes rows outside the 30-day report", GrokHistoryExcludesRowsOutsideReport),
+    ("Grok history prefers stamped cost ticks", GrokHistoryPrefersStampedCostTicks),
+    ("Grok history does not double count reasoning tokens", GrokHistoryDoesNotDoubleCountReasoningTokens),
     ("Usage ledger re-merges a day idempotently", UsageLedgerRemergesDayIdempotently),
     ("Usage ledger lets a complete rescan decrease a day", UsageLedgerCompleteRescanCanDecreaseDay),
     ("Usage ledger merges a partial batch monotonically", UsageLedgerPartialBatchMergesMonotonically),
@@ -1277,6 +1285,19 @@ static void OpenCodeGoParsesSerializedUsageWindows()
     AssertEqual(observedAt.AddHours(1), snapshot.Primary.ResetsAt!.Value, "rolling reset time");
 }
 
+static void OpenCodeGoKeepsSerializedOnePercent()
+{
+    var observedAt = new DateTimeOffset(2026, 8, 1, 10, 0, 0, TimeSpan.Zero);
+    const string response =
+        "rollingUsage:{resetInSec:3600,usagePercent:3}," +
+        "weeklyUsage:{resetInSec:7200,usagePercent:1}";
+
+    var snapshot = OpenCodeGoUsageReader.ParseUsage(response, observedAt);
+
+    AssertClose(3m, (decimal)snapshot.Primary.UsedPercent, "serialized rolling usage is already a percentage");
+    AssertClose(1m, (decimal)snapshot.Secondary!.UsedPercent, "serialized weekly usage is not rescaled to 100");
+}
+
 static void OpenCodeGoParsesNestedJsonUsage()
 {
     var observedAt = new DateTimeOffset(2026, 8, 1, 10, 0, 0, TimeSpan.Zero);
@@ -1297,6 +1318,211 @@ static void OpenCodeGoParsesNestedJsonUsage()
     AssertClose(25m, (decimal)snapshot.Primary.UsedPercent, "fractional rolling utilization is normalized");
     AssertClose(50m, (decimal)snapshot.AdditionalWindows![0].UsedPercent, "used and limit become a percent");
     AssertEqual(observedAt.AddDays(1), snapshot.AdditionalWindows[0].ResetsAt!.Value, "monthly reset time");
+}
+
+static void GrokBillingMapsWeeklyCreditPercent()
+{
+    var billing = GrokUsageReader.ParseBillingResponse("""
+        {
+          "creditUsagePercent": 12.5,
+          "currentPeriod": {
+            "type": "USAGE_PERIOD_TYPE_WEEKLY",
+            "start": "2026-07-26T04:07:16.204303+00:00",
+            "end": "2026-08-02T04:07:16.204303+00:00"
+          },
+          "onDemandCap": { "val": 0 },
+          "onDemandUsed": { "val": 0 },
+          "subscriptionTier": "SuperGrok"
+        }
+        """);
+
+    var snapshot = GrokUsageReader.MapUsage(
+        billing,
+        new GrokUsageReader.GrokSessionCredentials(
+            "token",
+            true,
+            null,
+            DateTimeOffset.UtcNow.AddHours(1),
+            "user@example.com",
+            "user-1",
+            "https://auth.x.ai",
+            "client",
+            null));
+
+    Assert(snapshot.Provider == UsageProvider.Grok, "provider should be Grok");
+    AssertEqual("Weekly limit", snapshot.Primary.Title, "primary title");
+    AssertClose(12.5m, (decimal)snapshot.Primary.UsedPercent, "credit percent");
+    AssertEqual(10080, snapshot.Primary.WindowMinutes, "weekly window minutes");
+    Assert(snapshot.Secondary is null, "on-demand should be omitted when cap is zero");
+    AssertEqual("SuperGrok", snapshot.PlanType!, "plan");
+    Assert(snapshot.AccountEmail is null, "Grok must not surface account email in the snapshot");
+}
+
+static void GrokBillingMapsOnDemandWhenCapIsSet()
+{
+    var billing = GrokUsageReader.ParseBillingResponse("""
+        {
+          "creditUsagePercent": 40,
+          "currentPeriod": {
+            "type": "USAGE_PERIOD_TYPE_WEEKLY",
+            "start": "2026-07-26T00:00:00Z",
+            "end": "2026-08-02T00:00:00Z"
+          },
+          "onDemandCap": { "val": 20 },
+          "onDemandUsed": { "val": 5 }
+        }
+        """);
+
+    var snapshot = GrokUsageReader.MapUsage(billing);
+
+    Assert(snapshot.Secondary is not null, "on-demand window expected");
+    AssertEqual("On-demand", snapshot.Secondary!.Title, "on-demand title");
+    AssertClose(25m, (decimal)snapshot.Secondary.UsedPercent, "on-demand percent");
+    Assert(snapshot.Cost is not null, "on-demand cost expected");
+    AssertClose(5m, snapshot.Cost!.Used, "on-demand used");
+    AssertClose(20m, snapshot.Cost.Limit!.Value, "on-demand cap");
+}
+
+static void GrokBillingAcceptsWrappedConfigPayloads()
+{
+    var billing = GrokUsageReader.ParseBillingResponse("""
+        {
+          "config": {
+            "creditUsagePercent": 5,
+            "currentPeriod": {
+              "type": "USAGE_PERIOD_TYPE_WEEKLY",
+              "start": "2026-07-26T00:00:00Z",
+              "end": "2026-08-02T00:00:00Z"
+            }
+          },
+          "subscriptionTier": "SuperGrok Heavy"
+        }
+        """);
+
+    var snapshot = GrokUsageReader.MapUsage(billing);
+    AssertClose(5m, (decimal)snapshot.Primary.UsedPercent, "wrapped credit percent");
+    AssertEqual("SuperGrok Heavy", snapshot.PlanType!, "subscription tier from wrapper root");
+}
+
+static void GrokHistoryAggregatesTurnCompletedUsage()
+{
+    using var fixture = new GrokFixture();
+    var now = DateTimeOffset.Now.ToUnixTimeSeconds();
+    fixture.WriteSessionLog(
+        "session-a",
+        GrokTurnCompletedLine(now, "prompt-1", "grok-4.5-build", input: 1000, cacheRead: 200, cacheCreate: 0, output: 50, reasoning: 10, costTicks: null),
+        GrokTurnCompletedLine(now, "prompt-2", "grok-4.5", input: 500, cacheRead: 0, cacheCreate: 0, output: 25, reasoning: 0, costTicks: null));
+
+    // 1000 + 50 and 500 + 25. The reasoning columns (10 and 0) are NOT added: reasoningTokens is a
+    // breakdown of outputTokens, which the fixture encodes the way real logs do (totalTokens ==
+    // inputTokens + outputTokens). Adding them made this 1585 and inflated every Grok chart.
+    var today = Today(fixture.Read());
+    AssertEqual(1575L, today.TotalTokens, "grok local tokens");
+    Assert(today.EstimatedCostUsd > 0, "estimated cost should be positive from built-in rates");
+}
+
+static void GrokHistoryExcludesRowsOutsideReport()
+{
+    using var fixture = new GrokFixture();
+    fixture.WriteSessionLog(
+        "session-window",
+        GrokTurnCompletedLine(DateTimeOffset.Now.AddDays(-31).ToUnixTimeSeconds(), "prompt-old", "grok-4.5", input: 100, cacheRead: 0, cacheCreate: 0, output: 10, reasoning: 0, costTicks: null),
+        GrokTurnCompletedLine(DateTimeOffset.Now.ToUnixTimeSeconds(), "prompt-current", "grok-4.5", input: 10, cacheRead: 0, cacheCreate: 0, output: 5, reasoning: 0, costTicks: null));
+
+    var result = fixture.Read();
+    Assert(result.Insights is not null, result.Error ?? "missing Grok insights");
+    AssertEqual(15L, result.Insights!.Last30DaysTokens, "30-day total excludes the lookback buffer");
+    AssertEqual(15L, result.Insights.Models.Sum(model => model.TotalTokens), "model totals use the report window");
+}
+
+static void GrokHistoryDoesNotDoubleCountReasoningTokens()
+{
+    using var fixture = new GrokFixture();
+    var now = DateTimeOffset.Now.ToUnixTimeSeconds();
+
+    // The shape that made the bug visible: a short answer that is mostly thinking. Folding
+    // reasoning into output reported 106 output tokens for 57, an 86% overstatement.
+    fixture.WriteSessionLog(
+        "session-reasoning",
+        GrokTurnCompletedLine(now, "prompt-r", "grok-4.5", input: 46327, cacheRead: 46080, cacheCreate: 0, output: 57, reasoning: 49, costTicks: null));
+
+    var today = Today(fixture.Read());
+    AssertEqual(46384L, today.TotalTokens, "reasoning tokens are part of output, not extra to it");
+}
+
+static void GrokHistoryPrefersStampedCostTicks()
+{
+    using var fixture = new GrokFixture();
+    var now = DateTimeOffset.Now.ToUnixTimeSeconds();
+    fixture.WriteSessionLog(
+        "session-b",
+        GrokTurnCompletedLine(now, "prompt-cost", "grok-4.5", input: 10, cacheRead: 0, cacheCreate: 0, output: 5, reasoning: 0, costTicks: 15_000_000_000m));
+
+    var today = Today(fixture.Read());
+    AssertClose(1.5m, today.EstimatedCostUsd, "stamped cost ticks should win over estimates");
+}
+
+static string GrokTurnCompletedLine(
+    long unixSeconds,
+    string promptId,
+    string model,
+    long input,
+    long cacheRead,
+    long cacheCreate,
+    long output,
+    long reasoning,
+    decimal? costTicks)
+{
+    var modelUsage = new Dictionary<string, object?>
+    {
+        [model] = new Dictionary<string, object?>
+        {
+            ["inputTokens"] = input,
+            ["outputTokens"] = output,
+            ["totalTokens"] = input + output,
+            ["cachedReadTokens"] = cacheRead,
+            ["cacheCreationTokens"] = cacheCreate,
+            ["reasoningTokens"] = reasoning,
+            ["modelCalls"] = 1,
+            ["costUsdTicks"] = costTicks
+        }
+    };
+
+    var usage = new Dictionary<string, object?>
+    {
+        ["inputTokens"] = input,
+        ["outputTokens"] = output,
+        ["totalTokens"] = input + output,
+        ["cachedReadTokens"] = cacheRead,
+        ["cacheCreationTokens"] = cacheCreate,
+        ["reasoningTokens"] = reasoning,
+        ["modelCalls"] = 1,
+        ["modelUsage"] = modelUsage
+    };
+
+    if (costTicks is { } ticks)
+    {
+        usage["costUsdTicks"] = ticks;
+    }
+
+    var payload = new
+    {
+        timestamp = unixSeconds,
+        method = "_x.ai/session/update",
+        @params = new
+        {
+            sessionId = "test-session",
+            update = new
+            {
+                sessionUpdate = "turn_completed",
+                prompt_id = promptId,
+                stop_reason = "end_turn",
+                usage
+            }
+        }
+    };
+
+    return JsonSerializer.Serialize(payload);
 }
 
 static ProviderDailyUsage Today(ProviderUsageInsightsLookupResult result)
@@ -3120,6 +3346,39 @@ sealed class ClaudeFixture : IDisposable
     public ProviderUsageInsightsLookupResult Read()
     {
         return new ClaudeUsageInsightsReader([root], refreshModelsDevPricing: false).ReadLatest();
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+        catch
+        {
+        }
+    }
+}
+
+sealed class GrokFixture : IDisposable
+{
+    private readonly string root = Path.Combine(Path.GetTempPath(), "codexbar-grok-tests", Guid.NewGuid().ToString("N"));
+
+    public void WriteSessionLog(string sessionId, params string[] lines)
+    {
+        var dir = Path.Combine(root, "workspace", sessionId);
+        Directory.CreateDirectory(dir);
+        var file = Path.Combine(dir, "updates.jsonl");
+        File.WriteAllLines(file, lines);
+        File.SetLastWriteTime(file, DateTime.Now);
+    }
+
+    public ProviderUsageInsightsLookupResult Read()
+    {
+        return new GrokUsageInsightsReader([root], refreshModelsDevPricing: false).ReadLatest();
     }
 
     public void Dispose()

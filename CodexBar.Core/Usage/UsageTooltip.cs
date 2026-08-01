@@ -26,20 +26,29 @@ public static class UsageTooltip
         IReadOnlyList<CodexCliEntry> codexEntries,
         IReadOnlyDictionary<string, ProviderUsageLookupResult> codexUsage,
         ProviderUsageLookupResult claudeUsage,
+        ProviderUsageLookupResult grokUsage,
         ProviderUsageLookupResult cursorUsage,
-        ProviderUsageLookupResult? openCodeGoUsage)
+        ProviderUsageLookupResult openCodeGoUsage,
+        UiSettings settings)
     {
         if (codexUsage.Values.All(result => result.Snapshot is null) &&
             claudeUsage.Snapshot is null &&
+            grokUsage.Snapshot is null &&
             cursorUsage.Snapshot is null &&
-            openCodeGoUsage?.Snapshot is null)
+            openCodeGoUsage.Snapshot is null)
         {
             return Trim("CodexBarWindows: no usage data found");
         }
 
-        var codexText = string.Join(
-            ", ",
-            codexEntries.Take(2).Select(entry =>
+        // ONLY ENABLED PROVIDERS. The string is capped at 63 characters by the shell and Trim cuts
+        // mid-word, so every segment for a tool the user switched off costs a segment they wanted:
+        // five providers plus two Codex accounts already overflows, and providers late in the list
+        // are the ones that disappear.
+        var segments = new List<string>();
+
+        if (settings.CodexEnabled)
+        {
+            segments.AddRange(codexEntries.Take(2).Select(entry =>
             {
                 var result = codexUsage.TryGetValue(ProviderKeys.Codex(entry.Id), out var value)
                     ? value
@@ -48,19 +57,39 @@ public static class UsageTooltip
                     ? $"{entry.Name} {snapshot.Primary.UsedPercent:0.#}% {ShortWindow(snapshot.Primary.WindowMinutes)}"
                     : $"{entry.Name} --";
             }));
-        var claudeText = claudeUsage.Snapshot is { } claude
-            ? $"Claude {claude.Primary.UsedPercent:0.#}% {ShortWindow(claude.Primary.WindowMinutes)}"
-            : "Claude --";
-        var cursorText = cursorUsage.Snapshot is { } cursor
-            ? $"Cursor {cursor.Primary.UsedPercent:0.#}%"
-            : "Cursor --";
-        var openCodeGoText = openCodeGoUsage?.Snapshot is { } openCodeGo
-            ? $", Go {openCodeGo.Primary.UsedPercent:0.#}% {ShortWindow(openCodeGo.Primary.WindowMinutes)}"
-            : openCodeGoUsage is null
-                ? string.Empty
-                : ", Go --";
+        }
 
-        return Trim($"{codexText}, {claudeText}, {cursorText}{openCodeGoText}");
+        if (settings.ClaudeEnabled)
+        {
+            segments.Add(claudeUsage.Snapshot is { } claude
+                ? $"Claude {claude.Primary.UsedPercent:0.#}% {ShortWindow(claude.Primary.WindowMinutes)}"
+                : "Claude --");
+        }
+
+        if (settings.GrokEnabled)
+        {
+            segments.Add(grokUsage.Snapshot is { } grok
+                ? $"Grok {grok.Primary.UsedPercent:0.#}% {ShortWindow(grok.Primary.WindowMinutes)}"
+                : "Grok --");
+        }
+
+        if (settings.CursorEnabled)
+        {
+            segments.Add(cursorUsage.Snapshot is { } cursor
+                ? $"Cursor {cursor.Primary.UsedPercent:0.#}%"
+                : "Cursor --");
+        }
+
+        if (settings.OpenCodeGoEnabled)
+        {
+            segments.Add(openCodeGoUsage.Snapshot is { } openCodeGo
+                ? $"Go {openCodeGo.Primary.UsedPercent:0.#}% {ShortWindow(openCodeGo.Primary.WindowMinutes)}"
+                : "Go --");
+        }
+
+        return segments.Count == 0
+            ? Trim("CodexBarWindows: no tools enabled")
+            : Trim(string.Join(", ", segments));
     }
 
     private static string Trim(string value) => value.Length <= MaxLength ? value : value[..MaxLength];

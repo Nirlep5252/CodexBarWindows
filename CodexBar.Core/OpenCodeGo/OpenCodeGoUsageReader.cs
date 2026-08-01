@@ -309,8 +309,10 @@ public sealed partial class OpenCodeGoUsageReader
             return null;
         }
 
+        // The dashboard's serialized `usagePercent` fields are already on a 0...100 scale.
+        // In particular, 1 means 1%, not the fractional representation 100%.
         return new ParsedWindow(
-            NormalizePercent(percent.Value),
+            Math.Clamp(percent.Value, 0, 100),
             resetAt ?? observedAt.AddSeconds(Math.Max(0, resetSeconds!.Value)));
     }
 

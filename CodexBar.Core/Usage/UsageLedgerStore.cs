@@ -283,7 +283,14 @@ public static partial class UsageLedger
     internal static string ShardPath(UsageLedgerScope scope, int year)
         => Path.Combine(RootDirectory, $"{ScopeName(scope)}-{year}-v{SchemaVersion}.json");
 
-    private static string ScopeName(UsageLedgerScope scope) => scope == UsageLedgerScope.Codex ? "codex" : "claude";
+    // A switch and not a two-way ternary: the ternary mapped every non-Codex scope onto "claude",
+    // so a scope added to the enum silently READ AND WROTE CLAUDE'S SHARDS rather than failing.
+    private static string ScopeName(UsageLedgerScope scope) => scope switch
+    {
+        UsageLedgerScope.Codex => "codex",
+        UsageLedgerScope.Claude => "claude",
+        _ => throw new ArgumentOutOfRangeException(nameof(scope), scope, "Unknown ledger scope.")
+    };
 
     // ---- Instant helpers ----------------------------------------------------------------------
 

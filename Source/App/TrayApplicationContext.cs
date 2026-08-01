@@ -3,6 +3,7 @@ namespace CodexBarWindows;
 public sealed class TrayApplicationContext : ApplicationContext
 {
     private readonly ClaudeUsageReader claudeUsageReader = new();
+    private readonly GrokUsageReader grokUsageReader = new();
     private readonly CursorUsageReader cursorUsageReader = new();
     private readonly OpenCodeGoUsageReader openCodeGoUsageReader = new();
     private readonly GitHubReleaseUpdater releaseUpdater = new();
@@ -23,6 +24,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly Dictionary<string, ProviderUsageInsightsLookupResult> latestHistory = [];
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, CodexRateLimitStabilizer> codexStabilizers = [];
     private ProviderUsageLookupResult latestClaudeUsage = new(null, "Usage has not been loaded yet.");
+    private ProviderUsageLookupResult latestGrokUsage = new(null, "Usage has not been loaded yet.");
     private ProviderUsageLookupResult latestCursorUsage = new(null, "Usage has not been loaded yet.");
     private ProviderUsageLookupResult latestOpenCodeGoUsage = new(null, "Usage has not been loaded yet.");
     private CancellationTokenSource? refreshCancellation;
@@ -43,6 +45,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
 
         latestHistory[UsagePopupForm.ClaudeProviderKey] = new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet.");
+        latestHistory[UsagePopupForm.GrokProviderKey] = new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet.");
         popup.ConfigureCodexEntries(codexCliEntries);
         notifyIcon = new NotifyIcon
         {
@@ -197,6 +200,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
 
         popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
+        popup.UpdateUsage(UsagePopupForm.GrokProviderKey, latestGrokUsage);
         popup.UpdateUsage(UsagePopupForm.CursorProviderKey, latestCursorUsage);
         popup.UpdateUsage(UsagePopupForm.OpenCodeGoProviderKey, latestOpenCodeGoUsage);
         popup.ShowNear(anchor);
@@ -301,7 +305,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                         popup.UpdateUsage(pair.Key, merged);
                     }
 
-                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage, latestOpenCodeGoUsage);
+                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestGrokUsage, latestCursorUsage, latestOpenCodeGoUsage);
                 });
             }
 
@@ -330,7 +334,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 {
                     latestClaudeUsage = ProviderUsageLookupResult.KeepLastGood(latestClaudeUsage, claudeResult);
                     popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
-                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage, latestOpenCodeGoUsage);
+                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestGrokUsage, latestCursorUsage, latestOpenCodeGoUsage);
                 });
             }
 
@@ -348,6 +352,31 @@ public sealed class TrayApplicationContext : ApplicationContext
                 });
             }
 
+            async Task RefreshGrokLimitsAsync()
+            {
+                var grokResult = await grokUsageReader.ReadLatestAsync(cancellation.Token).ConfigureAwait(false);
+                PostIfCurrent(() =>
+                {
+                    latestGrokUsage = ProviderUsageLookupResult.KeepLastGood(latestGrokUsage, grokResult);
+                    popup.UpdateUsage(UsagePopupForm.GrokProviderKey, latestGrokUsage);
+                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestGrokUsage, latestCursorUsage, latestOpenCodeGoUsage);
+                });
+            }
+
+            async Task RefreshGrokHistoryAsync()
+            {
+                var grokHistory = await Task.Run(() => new GrokUsageInsightsReader().ReadLatest(), cancellation.Token)
+                    .ConfigureAwait(false);
+                PostIfCurrent(() =>
+                {
+                    var merged = ProviderUsageInsightsLookupResult.KeepLastGood(
+                        latestHistory.TryGetValue(UsagePopupForm.GrokProviderKey, out var previous) ? previous : null,
+                        grokHistory);
+                    latestHistory[UsagePopupForm.GrokProviderKey] = merged;
+                    graphsForm?.UpdateHistory(UsagePopupForm.GrokProviderKey, merged);
+                });
+            }
+
             async Task RefreshCursorLimitsAsync()
             {
                 var cursorResult = await cursorUsageReader.ReadLatestAsync(cancellation.Token).ConfigureAwait(false);
@@ -355,7 +384,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 {
                     latestCursorUsage = ProviderUsageLookupResult.KeepLastGood(latestCursorUsage, cursorResult);
                     popup.UpdateUsage(UsagePopupForm.CursorProviderKey, latestCursorUsage);
-                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage, latestOpenCodeGoUsage);
+                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestGrokUsage, latestCursorUsage, latestOpenCodeGoUsage);
                 });
             }
 
@@ -373,6 +402,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                         codexCliEntries,
                         latestCodexUsage,
                         latestClaudeUsage,
+                        latestGrokUsage,
                         latestCursorUsage,
                         latestOpenCodeGoUsage);
                 });
@@ -390,6 +420,11 @@ public sealed class TrayApplicationContext : ApplicationContext
             if (settings.ClaudeEnabled)
             {
                 refreshTasks.Add(RefreshClaudeLimitsAsync());
+            }
+
+            if (settings.GrokEnabled)
+            {
+                refreshTasks.Add(RefreshGrokLimitsAsync());
             }
 
             if (settings.CursorEnabled)
@@ -412,6 +447,11 @@ public sealed class TrayApplicationContext : ApplicationContext
                 if (settings.ClaudeEnabled)
                 {
                     refreshTasks.Add(RefreshClaudeHistoryAsync());
+                }
+
+                if (settings.GrokEnabled)
+                {
+                    refreshTasks.Add(RefreshGrokHistoryAsync());
                 }
             }
 
@@ -446,6 +486,10 @@ public sealed class TrayApplicationContext : ApplicationContext
                         latestClaudeUsage,
                         new ProviderUsageLookupResult(null, message));
                     popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
+                    latestGrokUsage = ProviderUsageLookupResult.KeepLastGood(
+                        latestGrokUsage,
+                        new ProviderUsageLookupResult(null, message));
+                    popup.UpdateUsage(UsagePopupForm.GrokProviderKey, latestGrokUsage);
                     latestCursorUsage = ProviderUsageLookupResult.KeepLastGood(
                         latestCursorUsage,
                         new ProviderUsageLookupResult(null, message));
@@ -458,6 +502,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                         codexCliEntries,
                         latestCodexUsage,
                         latestClaudeUsage,
+                        latestGrokUsage,
                         latestCursorUsage,
                         latestOpenCodeGoUsage);
                 });
@@ -540,6 +585,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
 
         form.UpdateHistory(UsagePopupForm.ClaudeProviderKey, GetLatestHistory(UsagePopupForm.ClaudeProviderKey));
+        form.UpdateHistory(UsagePopupForm.GrokProviderKey, GetLatestHistory(UsagePopupForm.GrokProviderKey));
     }
 
     private void ShowSettings()
@@ -704,6 +750,11 @@ public sealed class TrayApplicationContext : ApplicationContext
             return latestClaudeUsage;
         }
 
+        if (providerKey == UsagePopupForm.GrokProviderKey)
+        {
+            return latestGrokUsage;
+        }
+
         if (providerKey == UsagePopupForm.CursorProviderKey)
         {
             return latestCursorUsage;
@@ -773,7 +824,9 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
 
         latestHistory.TryAdd(UsagePopupForm.ClaudeProviderKey, new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet."));
+        latestHistory.TryAdd(UsagePopupForm.GrokProviderKey, new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet."));
         popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
+        popup.UpdateUsage(UsagePopupForm.GrokProviderKey, latestGrokUsage);
         popup.UpdateUsage(UsagePopupForm.CursorProviderKey, latestCursorUsage);
         popup.UpdateUsage(UsagePopupForm.OpenCodeGoProviderKey, latestOpenCodeGoUsage);
 
@@ -790,15 +843,11 @@ public sealed class TrayApplicationContext : ApplicationContext
         IReadOnlyList<CodexCliEntry> codexEntries,
         IReadOnlyDictionary<string, ProviderUsageLookupResult> codexUsage,
         ProviderUsageLookupResult claudeUsage,
+        ProviderUsageLookupResult grokUsage,
         ProviderUsageLookupResult cursorUsage,
         ProviderUsageLookupResult openCodeGoUsage)
     {
-        return UsageTooltip.Build(
-            codexEntries,
-            codexUsage,
-            claudeUsage,
-            cursorUsage,
-            UiSettings.Load().OpenCodeGoEnabled ? openCodeGoUsage : null);
+        return UsageTooltip.Build(codexEntries, codexUsage, claudeUsage, grokUsage, cursorUsage, openCodeGoUsage, UiSettings.Load());
     }
 
     /// <summary>

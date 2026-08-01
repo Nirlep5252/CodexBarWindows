@@ -284,6 +284,7 @@ public sealed partial class SettingsWindow : Window
         StartupToggle.IsOn = StartupSettings.IsEnabledFor(ShellIdentity.StartupRegistryValueName);
         CodexEnabledToggle.IsOn = settings.CodexEnabled;
         ClaudeEnabledToggle.IsOn = settings.ClaudeEnabled;
+        GrokEnabledToggle.IsOn = settings.GrokEnabled;
         CursorEnabledToggle.IsOn = settings.CursorEnabled;
         OpenCodeGoEnabledToggle.IsOn = settings.OpenCodeGoEnabled;
 
@@ -322,6 +323,7 @@ public sealed partial class SettingsWindow : Window
 
         CodexEnabledToggle.Toggled += (_, _) => OnProviderEnabledChanged();
         ClaudeEnabledToggle.Toggled += (_, _) => OnProviderEnabledChanged();
+        GrokEnabledToggle.Toggled += (_, _) => OnProviderEnabledChanged();
         CursorEnabledToggle.Toggled += (_, _) => OnProviderEnabledChanged();
         OpenCodeGoEnabledToggle.Toggled += (_, _) => OnProviderEnabledChanged();
 
@@ -439,6 +441,7 @@ public sealed partial class SettingsWindow : Window
     {
         CodexMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Codex, palette.Glyph);
         ClaudeMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Claude, palette.ClaudeGlyph);
+        GrokMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Grok, palette.GrokGlyph);
         CursorMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Cursor, palette.Glyph);
         OpenCodeGoMark.Child = ProviderGeometry.CreateIcon(UsageProvider.OpenCodeGo, palette.Glyph);
         BuiltInAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Codex, palette.Glyph);
@@ -466,6 +469,7 @@ public sealed partial class SettingsWindow : Window
 
         if (!CodexEnabledToggle.IsOn &&
             !ClaudeEnabledToggle.IsOn &&
+            !GrokEnabledToggle.IsOn &&
             !CursorEnabledToggle.IsOn &&
             !OpenCodeGoEnabledToggle.IsOn)
         {
@@ -486,6 +490,7 @@ public sealed partial class SettingsWindow : Window
         {
             CodexEnabled = CodexEnabledToggle.IsOn,
             ClaudeEnabled = ClaudeEnabledToggle.IsOn,
+            GrokEnabled = GrokEnabledToggle.IsOn,
             CursorEnabled = CursorEnabledToggle.IsOn,
             OpenCodeGoEnabled = OpenCodeGoEnabledToggle.IsOn
         };

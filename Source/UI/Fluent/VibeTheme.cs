@@ -68,6 +68,13 @@ public static class VibeTheme
         Color.FromArgb(0xFF, 0xFF, 0x8A, 0x3C),
         Color.FromArgb(0xFF, 0xFF, 0x4E, 0x6A));
 
+    /// <summary>Grok / xAI: cool white -> electric blue -> deep indigo.</summary>
+    public static readonly ProviderVibe GrokVibe = new(
+        Color.FromArgb(0xFF, 0xE8, 0xF1, 0xFF),
+        Color.FromArgb(0xFF, 0x7A, 0xC4, 0xFF),
+        Color.FromArgb(0xFF, 0x3D, 0x8B, 0xFF),
+        Color.FromArgb(0xFF, 0x1A, 0x2A, 0x6C));
+
     /// <summary>The signature magenta -> violet -> blue sweep (Cursor, OpenCode Go, and fallback).</summary>
     public static readonly ProviderVibe SignatureVibe = new(Accent, GradientStart, GradientMid, GradientEnd);
 
@@ -82,6 +89,11 @@ public static class VibeTheme
         if (providerKey.Contains("claude", StringComparison.OrdinalIgnoreCase))
         {
             return ClaudeVibe;
+        }
+
+        if (providerKey.Contains("grok", StringComparison.OrdinalIgnoreCase))
+        {
+            return GrokVibe;
         }
 
         return providerKey.Contains("cursor", StringComparison.OrdinalIgnoreCase) ||

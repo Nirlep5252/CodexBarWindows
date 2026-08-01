@@ -48,6 +48,7 @@ public sealed class UsageRefreshService : IDisposable
 
     private readonly Action<Action> post;
     private readonly ClaudeUsageReader claudeUsageReader = new();
+    private readonly GrokUsageReader grokUsageReader = new();
     private readonly CursorUsageReader cursorUsageReader = new();
     private readonly OpenCodeGoUsageReader openCodeGoUsageReader = new();
     private readonly Dictionary<string, ProviderUsageLookupResult> latestCodexUsage = new(StringComparer.Ordinal);
@@ -58,6 +59,7 @@ public sealed class UsageRefreshService : IDisposable
     private readonly Timer refreshTimer;
 
     private ProviderUsageLookupResult latestClaudeUsage = NotLoaded;
+    private ProviderUsageLookupResult latestGrokUsage = NotLoaded;
     private ProviderUsageLookupResult latestCursorUsage = NotLoaded;
     private ProviderUsageLookupResult latestOpenCodeGoUsage = NotLoaded;
     private CancellationTokenSource? refreshCancellation;
@@ -89,6 +91,7 @@ public sealed class UsageRefreshService : IDisposable
         }
 
         latestHistory[ProviderKeys.Claude] = HistoryNotLoaded;
+        latestHistory[ProviderKeys.Grok] = HistoryNotLoaded;
 
         // Created stopped. Start/Stop is driven purely by SetWindowOpen.
         refreshTimer = new Timer(_ => post(() => BeginRefresh()), null, Timeout.Infinite, Timeout.Infinite);
@@ -130,6 +133,11 @@ public sealed class UsageRefreshService : IDisposable
             return latestClaudeUsage;
         }
 
+        if (providerKey == ProviderKeys.Grok)
+        {
+            return latestGrokUsage;
+        }
+
         if (providerKey == ProviderKeys.Cursor)
         {
             return latestCursorUsage;
@@ -154,8 +162,10 @@ public sealed class UsageRefreshService : IDisposable
             CodexEntries,
             latestCodexUsage,
             latestClaudeUsage,
+            latestGrokUsage,
             latestCursorUsage,
-            UiSettings.Load().OpenCodeGoEnabled ? latestOpenCodeGoUsage : null);
+            latestOpenCodeGoUsage,
+            UiSettings.Load());
 
     /// <summary>
     /// Reports whether a usage-showing window is open. The poll timer runs while any is, and
@@ -302,6 +312,7 @@ public sealed class UsageRefreshService : IDisposable
         }
 
         UsageUpdated?.Invoke(ProviderKeys.Claude, latestClaudeUsage);
+        UsageUpdated?.Invoke(ProviderKeys.Grok, latestGrokUsage);
         UsageUpdated?.Invoke(ProviderKeys.Cursor, latestCursorUsage);
         UsageUpdated?.Invoke(ProviderKeys.OpenCodeGo, latestOpenCodeGoUsage);
         BeginRefresh();
@@ -535,6 +546,30 @@ public sealed class UsageRefreshService : IDisposable
                 });
             }
 
+            async Task RefreshGrokLimitsAsync()
+            {
+                var grokResult = await grokUsageReader.ReadLatestAsync(cancellation.Token).ConfigureAwait(false);
+                PostIfCurrent(() =>
+                {
+                    latestGrokUsage = ProviderUsageLookupResult.KeepLastGood(latestGrokUsage, grokResult);
+                    PublishUsage(ProviderKeys.Grok, latestGrokUsage);
+                });
+            }
+
+            async Task RefreshGrokHistoryAsync()
+            {
+                var grokHistory = await Task.Run(() => new GrokUsageInsightsReader().ReadLatest(), cancellation.Token)
+                    .ConfigureAwait(false);
+                PostIfCurrent(() =>
+                {
+                    var merged = ProviderUsageInsightsLookupResult.KeepLastGood(
+                        latestHistory.TryGetValue(ProviderKeys.Grok, out var previous) ? previous : null,
+                        grokHistory);
+                    latestHistory[ProviderKeys.Grok] = merged;
+                    HistoryUpdated?.Invoke(ProviderKeys.Grok, merged);
+                });
+            }
+
             async Task RefreshCursorLimitsAsync()
             {
                 var cursorResult = await cursorUsageReader.ReadLatestAsync(cancellation.Token).ConfigureAwait(false);
@@ -572,6 +607,11 @@ public sealed class UsageRefreshService : IDisposable
                 refreshTasks.Add(RefreshClaudeLimitsAsync());
             }
 
+            if (settings.GrokEnabled)
+            {
+                refreshTasks.Add(RefreshGrokLimitsAsync());
+            }
+
             if (settings.CursorEnabled)
             {
                 refreshTasks.Add(RefreshCursorLimitsAsync());
@@ -592,6 +632,11 @@ public sealed class UsageRefreshService : IDisposable
                 if (settings.ClaudeEnabled)
                 {
                     refreshTasks.Add(RefreshClaudeHistoryAsync());
+                }
+
+                if (settings.GrokEnabled)
+                {
+                    refreshTasks.Add(RefreshGrokHistoryAsync());
                 }
             }
 
@@ -626,6 +671,11 @@ public sealed class UsageRefreshService : IDisposable
                         latestClaudeUsage,
                         new ProviderUsageLookupResult(null, message));
                     PublishUsage(ProviderKeys.Claude, latestClaudeUsage);
+
+                    latestGrokUsage = ProviderUsageLookupResult.KeepLastGood(
+                        latestGrokUsage,
+                        new ProviderUsageLookupResult(null, message));
+                    PublishUsage(ProviderKeys.Grok, latestGrokUsage);
 
                     latestCursorUsage = ProviderUsageLookupResult.KeepLastGood(
                         latestCursorUsage,

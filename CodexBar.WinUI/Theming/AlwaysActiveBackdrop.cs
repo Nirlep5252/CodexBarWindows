@@ -62,10 +62,22 @@ internal sealed partial class AlwaysActiveBackdrop(BackdropKind kind) : SystemBa
             return;
         }
 
-        var defaults = GetDefaultSystemBackdropConfiguration(target, xamlRoot);
-        configuration.Theme = defaults.Theme;
-        configuration.IsHighContrast = defaults.IsHighContrast;
-        configuration.HighContrastBackgroundColor = defaults.HighContrastBackgroundColor;
+        // XAML can fire OnDefaultSystemBackdropConfigurationChanged with a target that is
+        // already disconnected (tray flyout hide/show races, prewarm teardown). Asking for the
+        // default config then throws ArgumentException ("target"), which used to spam the crash
+        // log and could leave the flyout looking like it died mid-open.
+        try
+        {
+            var defaults = GetDefaultSystemBackdropConfiguration(target, xamlRoot);
+            configuration.Theme = defaults.Theme;
+            configuration.IsHighContrast = defaults.IsHighContrast;
+            configuration.HighContrastBackgroundColor = defaults.HighContrastBackgroundColor;
+        }
+        catch (ArgumentException)
+        {
+            // Keep the last known theme on our owned configuration.
+        }
+
         // IsInputActive is deliberately NOT copied - that is the whole point of this type.
     }
 

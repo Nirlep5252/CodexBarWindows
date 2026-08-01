@@ -257,6 +257,8 @@ public sealed partial class FlyoutWindow : Window
     {
         public bool IsClaude => Provider == UsageProvider.Claude;
 
+        public bool IsGrok => Provider == UsageProvider.Grok;
+
         public bool IsCursor => Provider == UsageProvider.Cursor;
     }
 
@@ -270,6 +272,7 @@ public sealed partial class FlyoutWindow : Window
         var descriptors = service.CodexEntries
             .Select(entry => new ProviderDescriptor(ProviderKeys.Codex(entry.Id), entry.Name, UsageProvider.Codex))
             .Append(new ProviderDescriptor(ProviderKeys.Claude, "Claude", UsageProvider.Claude))
+            .Append(new ProviderDescriptor(ProviderKeys.Grok, "Grok", UsageProvider.Grok))
             .Append(new ProviderDescriptor(ProviderKeys.Cursor, "Cursor", UsageProvider.Cursor))
             .Append(new ProviderDescriptor(ProviderKeys.OpenCodeGo, "OpenCode Go", UsageProvider.OpenCodeGo))
             .Where(descriptor => settings.IsProviderEnabled(descriptor.Provider))
@@ -475,7 +478,7 @@ public sealed partial class FlyoutWindow : Window
     {
         var icon = ProviderGeometry.CreateIcon(
             descriptor.Provider,
-            descriptor.IsClaude ? palette.ClaudeGlyph : palette.Glyph);
+            ProviderGlyphBrush(descriptor, palette));
 
         var nameText = new TextBlock
         {
@@ -687,7 +690,7 @@ public sealed partial class FlyoutWindow : Window
         // palette is rebuilt on ActualThemeChanged and the group visuals are not.
         if (group.IconShape is { } shape)
         {
-            shape.Fill = descriptor.IsClaude ? palette.ClaudeGlyph : palette.Glyph;
+            shape.Fill = ProviderGlyphBrush(descriptor, palette);
         }
 
         group.NameText.Text = descriptor.Name;
@@ -741,7 +744,12 @@ public sealed partial class FlyoutWindow : Window
             segments.Add(ProviderPlanFormatter.DisplayName(descriptor.Provider, snapshot.PlanType));
         }
 
-        if (descriptor.IsCursor && CursorCostText(snapshot) is { Length: > 0 } cost)
+        // Grok gets this line ONLY when it has no on-demand meter of its own. With a cap the reader
+        // emits a secondary window carrying the same figure, so printing it here too put the same
+        // number twice in one card; with spend but no cap there is no meter, and this is the only
+        // place it can appear at all.
+        var showsCost = descriptor.IsCursor || (descriptor.IsGrok && snapshot.Secondary is null);
+        if (showsCost && CursorCostText(snapshot) is { Length: > 0 } cost)
         {
             segments.Add(cost);
         }
@@ -771,7 +779,9 @@ public sealed partial class FlyoutWindow : Window
             var loading = service.IsRefreshing;
             var titles = descriptor.IsCursor
                 ? new[] { "Total", "Auto", "API" }
-                : ["5 hour limit", "Weekly limit"];
+                : descriptor.IsGrok
+                    ? ["Week"]
+                    : ["5 hour limit", "Weekly limit"];
 
             for (var index = 0; index < titles.Length; index++)
             {
@@ -847,6 +857,11 @@ public sealed partial class FlyoutWindow : Window
     /// The compact label for a rate-limit window title. Unknown titles are passed through
     /// UNCHANGED: a mangled or empty label is strictly worse than a long one.
     /// </summary>
+    /// <remarks>
+    /// The label column is a FIXED 42 DIP shared by every meter. Anything longer than about five
+    /// characters ellipsises ("Weekl…"), so every known weekly/monthly title must collapse here —
+    /// including Grok's billing strings — to the same "Week"/"Month" the Codex and Claude rows use.
+    /// </remarks>
     private static string ShortWindowLabel(string title)
     {
         if (string.IsNullOrWhiteSpace(title))
@@ -854,9 +869,25 @@ public sealed partial class FlyoutWindow : Window
             return title;
         }
 
-        if (title.Equals("Weekly limit", StringComparison.OrdinalIgnoreCase))
+        // Contains, not Equals: Grok and future readers may say "Weekly credits", "Weekly limit",
+        // "7-day weekly window", etc. All of them must land on the same short label.
+        if (title.Contains("weekly", StringComparison.OrdinalIgnoreCase) ||
+            title.Equals("Week", StringComparison.OrdinalIgnoreCase))
         {
             return "Week";
+        }
+
+        if (title.Contains("monthly", StringComparison.OrdinalIgnoreCase) ||
+            title.Equals("Month", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Month";
+        }
+
+        // Grok's second meter. Nine characters ellipsises to "On-de…" in the 42 DIP label column,
+        // which reads as a truncation bug rather than a label.
+        if (title.Equals("On-demand", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Extra";
         }
 
         if (title.StartsWith("Fable", StringComparison.OrdinalIgnoreCase))
@@ -1167,6 +1198,14 @@ public sealed partial class FlyoutWindow : Window
         return local.ToString("ddd, dd MMM h:mm tt");
     }
 
+    /// <summary>
+    /// The long form, for the row's tooltip: the countdown plus the instant it lands on.
+    /// </summary>
+    /// <remarks>
+    /// THE DATE IS PART OF IT, not just the clock time. The row itself is now a pure countdown, so
+    /// this is the only place the actual reset moment appears - and "4:30 AM" on its own is
+    /// ambiguous for anything past today, which is exactly when someone hovers to ask.
+    /// </remarks>
     private static string FormatReset(DateTimeOffset resetAt)
     {
         var remaining = resetAt - DateTimeOffset.Now;
@@ -1181,45 +1220,59 @@ public sealed partial class FlyoutWindow : Window
                 ? $"in {(int)remaining.TotalHours}h {remaining.Minutes}m"
                 : $"in {Math.Max(1, (int)Math.Ceiling(remaining.TotalMinutes))}m";
 
-        return $"{relative}, {resetAt.ToLocalTime():h:mm tt}";
+        var local = resetAt.ToLocalTime();
+        var absolute = local.Date == DateTimeOffset.Now.Date
+            ? local.ToString("h:mm tt")
+            : remaining.TotalDays < 6
+                ? local.ToString("ddd h:mm tt")
+                : local.ToString("ddd dd MMM h:mm tt");
+
+        return $"{relative}, {absolute}";
     }
 
     /// <summary>
-    /// The one-line form: a clock time while the reset is still today, a weekday for the rest of
-    /// the week, a date beyond that. The long form stays on the row's tooltip.
+    /// TIME LEFT, not the wall-clock instant: "in 2h 15m", "in 3d 9h". The exact reset time stays
+    /// on the row's tooltip via <see cref="FormatReset"/>.
     /// </summary>
+    /// <remarks>
+    /// The question this column answers is "how long until I get my quota back", and a countdown
+    /// answers it directly where a timestamp made the reader do the subtraction. It also removes
+    /// the format zoo the absolute form needed to fit a fixed-width column - a bare clock time
+    /// today, "Tmrw", a weekday, then a date - which stacked four different shapes down one column
+    /// and left "Tmrw 9:37 AM" sitting under "Thu 4:30 AM" and "08 Aug 11:32 AM".
+    ///
+    /// One unit of precision below the leading one: the second unit is what distinguishes "in 3d"
+    /// from "in 3d 23h", and anything finer is noise on a window that refreshes on a poll. Past a
+    /// week the hours stop being interesting and are dropped. This is the same vocabulary as the
+    /// reset-credit line's "expires in 11d", so a Codex card now reads in one voice.
+    /// </remarks>
     private static string FormatResetShort(DateTimeOffset resetAt)
     {
-        var local = resetAt.ToLocalTime();
-        var now = DateTimeOffset.Now;
-        if (local <= now)
+        var remaining = resetAt - DateTimeOffset.Now;
+        if (remaining.TotalSeconds <= 0)
         {
             return "now";
         }
 
-        // The TIME is the point of this line - "Thu" alone does not tell anyone whether they get
-        // their quota back over breakfast or at midnight - so every case carries h:mm. The date
-        // part is what shortens with distance: nothing for today, a weekday inside the week, a
-        // date beyond it.
-        if (local.Date == now.Date)
+        if (remaining.TotalDays >= 7)
         {
-            return local.ToString("h:mm tt");
+            return $"in {(int)remaining.TotalDays}d";
         }
 
-        if (local.Date == now.Date.AddDays(1))
+        if (remaining.TotalDays >= 1)
         {
-            // "Tmrw", not "Tomorrow": the row's reset column is a FIXED width shared by every
-            // meter in the window, and "Tomorrow 10:29 AM" (~109 DIP) overflowed it and got
-            // ellipsised - swallowing the clock time, which is the whole point of this line.
-            // "Tmrw" costs ~25 DIP less and puts this case in the same size class as the weekday
-            // form below, so no single string forces the column wider than the rest need. The
-            // unabbreviated wording stays on the row tooltip via FormatReset.
-            return local.ToString(@"\T\m\r\w h:mm tt");
+            var days = (int)remaining.TotalDays;
+            return remaining.Hours > 0 ? $"in {days}d {remaining.Hours}h" : $"in {days}d";
         }
 
-        return (local - now).TotalDays < 6
-            ? local.ToString("ddd h:mm tt")
-            : local.ToString("dd MMM h:mm tt");
+        if (remaining.TotalHours >= 1)
+        {
+            var hours = (int)remaining.TotalHours;
+            return remaining.Minutes > 0 ? $"in {hours}h {remaining.Minutes}m" : $"in {hours}h";
+        }
+
+        // Never "in 0m" for a reset that has not happened yet.
+        return $"in {Math.Max(1, (int)Math.Ceiling(remaining.TotalMinutes))}m";
     }
 
     private static string FormatExpiry(DateTimeOffset expiresAt)
@@ -1253,6 +1306,13 @@ public sealed partial class FlyoutWindow : Window
             : string.Empty;
         return $"On-demand {used}{budget}";
     }
+
+    private static Brush ProviderGlyphBrush(ProviderDescriptor descriptor, FlyoutPalette palette) =>
+        descriptor.IsClaude
+            ? palette.ClaudeGlyph
+            : descriptor.IsGrok
+                ? palette.GrokGlyph
+                : palette.Glyph;
 
     private static string FormatCurrency(decimal value, string currencyCode)
     {

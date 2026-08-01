@@ -550,6 +550,11 @@ public sealed partial class GraphsWindow : Window
             options.Add(new ProviderOption(ProviderKeys.Claude, "Claude"));
         }
 
+        if (settings.IsProviderEnabled(UsageProvider.Grok))
+        {
+            options.Add(new ProviderOption(ProviderKeys.Grok, "Grok"));
+        }
+
         if (options.Count == 0)
         {
             options.Add(new ProviderOption(ProviderKeys.Codex("default"), "Codex"));
@@ -757,6 +762,17 @@ public sealed partial class GraphsWindow : Window
             return;
         }
 
+        // The import writes to the LEDGER, so it can do nothing at all for a provider that has no
+        // scope behind it. Saying so beats running an import that completes and changes nothing.
+        if (LedgerScope is null)
+        {
+            RenderStatus(
+                $"{providers.FirstOrDefault(option => option.Key == selectedProviderKey)?.Name ?? "This tool"}" +
+                " history is the last 30 days of local sessions — there is nothing older to import",
+                isStale: false);
+            return;
+        }
+
         if (ImportHistoryRequested is { } handler)
         {
             handler(this, EventArgs.Empty);
@@ -853,8 +869,17 @@ public sealed partial class GraphsWindow : Window
             UsageLedgerCoverage next;
             try
             {
-                UsageLedger.WarmCache(scope);
-                next = UsageLedger.GetCoverage(scope);
+                // A scan-only provider has no shards and therefore no coverage floor of its own;
+                // CoverageStart falls back to the scan's own earliest day, which is the truth for it.
+                if (scope is not { } ledgerScope)
+                {
+                    next = UsageLedgerCoverage.None;
+                }
+                else
+                {
+                    UsageLedger.WarmCache(ledgerScope);
+                    next = UsageLedger.GetCoverage(ledgerScope);
+                }
             }
             catch
             {
@@ -901,10 +926,23 @@ public sealed partial class GraphsWindow : Window
         });
     }
 
-    private UsageLedgerScope LedgerScope =>
-        ProviderKeys.ProviderOf(selectedProviderKey) == UsageProvider.Claude
-            ? UsageLedgerScope.Claude
-            : UsageLedgerScope.Codex;
+    /// <summary>
+    /// The ledger scope behind the selected provider, or NULL when the provider has no ledger at
+    /// all and its history comes only from the 30-day scan.
+    /// </summary>
+    /// <remarks>
+    /// Grok is that provider. Null rather than a scope-that-happens-to-be-empty: the emptiness was
+    /// load-bearing but unenforced, and a scope is also what the mapping below can get WRONG. When
+    /// this was a two-way expression, Grok fell through to Claude and the picker painted Anthropic
+    /// models under Grok - so every arm is now explicit and the absence of a ledger is a value.
+    /// </remarks>
+    private UsageLedgerScope? LedgerScope =>
+        ProviderKeys.ProviderOf(selectedProviderKey) switch
+        {
+            UsageProvider.Claude => UsageLedgerScope.Claude,
+            UsageProvider.Grok => null,
+            _ => UsageLedgerScope.Codex
+        };
 
     private void InvalidatePeriod()
     {
@@ -1148,7 +1186,7 @@ public sealed partial class GraphsWindow : Window
     private (decimal Cost, long Tokens, int Models) ReadDay(DateOnly day, ProviderUsageInsights insights)
     {
         var scope = LedgerScope;
-        var series = QueryRange(scope, day, day, UsageLedgerGranularity.Day, LedgerPricing.For(scope));
+        var series = QueryRange(scope, day, day, UsageLedgerGranularity.Day, PricingFor(scope));
         var buckets = (IReadOnlyList<UsageLedgerBucket>)series.Buckets;
 
         if (!series.HasPriceableData && BuildFallbackBuckets(buckets, insights) is { } fallback)
@@ -1228,7 +1266,7 @@ public sealed partial class GraphsWindow : Window
         var (start, end) = GraphsPeriod.Bounds(granularity, anchor);
         var bucket = GraphsPeriod.BucketOf(granularity);
         var scope = LedgerScope;
-        var pricing = LedgerPricing.For(scope);
+        var pricing = PricingFor(scope);
 
         var series = QueryRange(scope, start, end, bucket, pricing);
         var buckets = (IReadOnlyList<UsageLedgerBucket>)series.Buckets;
@@ -1360,17 +1398,27 @@ public sealed partial class GraphsWindow : Window
         return BuildFallbackBuckets([span], insights);
     }
 
+    /// <summary>Pricing for a scope, or null for a scan-only provider that has none.</summary>
+    private static UsageLedgerPricing? PricingFor(UsageLedgerScope? scope) =>
+        scope is { } ledgerScope ? LedgerPricing.For(ledgerScope) : null;
+
     private static UsageLedgerSeries QueryRange(
-        UsageLedgerScope scope,
+        UsageLedgerScope? scope,
         DateOnly start,
         DateOnly endInclusive,
         UsageLedgerGranularity bucket,
-        UsageLedgerPricing pricing)
+        UsageLedgerPricing? pricing)
     {
         var from = new DateTimeOffset(start.ToDateTime(TimeOnly.MinValue), TimeZoneInfo.Local.GetUtcOffset(start.ToDateTime(TimeOnly.MinValue)));
         var toDate = endInclusive.AddDays(1).ToDateTime(TimeOnly.MinValue);
         var to = new DateTimeOffset(toDate, TimeZoneInfo.Local.GetUtcOffset(toDate));
-        return UsageLedger.Query(scope, from, to, bucket, TimeZoneInfo.Local, pricing);
+
+        // A scan-only provider gets the bucket partition and nothing else, so every downstream
+        // "the ledger had nothing priceable, use the scan" branch takes itself without a scope
+        // having to exist and stay empty for it.
+        return scope is { } ledgerScope
+            ? UsageLedger.Query(ledgerScope, from, to, bucket, TimeZoneInfo.Local, pricing)
+            : UsageLedger.EmptyRange(from, to, bucket, TimeZoneInfo.Local);
     }
 
     /// <summary>

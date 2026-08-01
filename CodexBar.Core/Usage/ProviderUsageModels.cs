@@ -5,7 +5,8 @@ public enum UsageProvider
     Codex,
     Claude,
     Cursor,
-    OpenCodeGo
+    OpenCodeGo,
+    Grok
 }
 
 public sealed record ProviderUsageSnapshot(
