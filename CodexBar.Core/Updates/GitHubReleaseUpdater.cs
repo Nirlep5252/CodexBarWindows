@@ -22,7 +22,15 @@ public sealed class GitHubReleaseUpdater(string? installFolderName = null, strin
     private const string Owner = "Nirlep5252";
     private const string Repository = "CodexBarWindows";
     private const string RepositoryApiUrl = "https://api.github.com/repos/" + Owner + "/" + Repository;
+    /// <summary>Deadline for the release-metadata call, which is a few KB.</summary>
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    /// Cap for the MSI download. Sized for a slow connection rather than a fast one: the asset is
+    /// ~77 MB, so even 1 Mbit/s finishes inside this, and anything slower is better reported as a
+    /// failure than left running for an hour.
+    /// </summary>
+    private static readonly TimeSpan DownloadTimeout = TimeSpan.FromMinutes(15);
 
     private readonly string installFolderName =
         string.IsNullOrWhiteSpace(installFolderName) ? AppInfo.AppName : installFolderName;
@@ -94,7 +102,15 @@ public sealed class GitHubReleaseUpdater(string? installFolderName = null, strin
     {
         var client = new HttpClient
         {
-            Timeout = RequestTimeout
+            // INFINITE ON THE CLIENT, bounded per request instead. HttpClient.Timeout is a
+            // whole-operation deadline: with HttpCompletionOption.ResponseHeadersRead it keeps
+            // running while the body streams, so a 20 second client timeout also capped the MSI
+            // DOWNLOAD at 20 seconds. That asset is ~77 MB, which needs a sustained ~31 Mbit/s to
+            // land in time, so the updater failed with "the request was canceled due to the
+            // configured HttpClient.Timeout" on any ordinary connection - and because a check that
+            // finds nothing new never reaches the download, the bug stayed invisible until the
+            // first release that actually had an update to fetch.
+            Timeout = Timeout.InfiniteTimeSpan
         };
 
         client.DefaultRequestHeaders.UserAgent.ParseAdd(AppInfo.AppName + "/" + AppInfo.CurrentVersion);
@@ -111,14 +127,19 @@ public sealed class GitHubReleaseUpdater(string? installFolderName = null, strin
 
     private static async Task<GitHubRelease?> FetchLatestReleaseAsync(HttpClient httpClient, CancellationToken cancellationToken)
     {
-        using var response = await httpClient.GetAsync(RepositoryApiUrl + "/releases/latest", cancellationToken).ConfigureAwait(false);
+        // The metadata call is a few KB, so it keeps the short deadline: an unreachable GitHub
+        // should fail the check quickly rather than leave the user staring at a spinner.
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(RequestTimeout);
+
+        using var response = await httpClient.GetAsync(RepositoryApiUrl + "/releases/latest", deadline.Token).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
         {
             return null;
         }
 
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-        return await JsonSerializer.DeserializeAsync<GitHubRelease>(stream, JsonOptions(), cancellationToken).ConfigureAwait(false);
+        await using var stream = await response.Content.ReadAsStreamAsync(deadline.Token).ConfigureAwait(false);
+        return await JsonSerializer.DeserializeAsync<GitHubRelease>(stream, JsonOptions(), deadline.Token).ConfigureAwait(false);
     }
 
     private static async Task<string> DownloadAssetAsync(
@@ -135,13 +156,26 @@ public sealed class GitHubReleaseUpdater(string? installFolderName = null, strin
         request.Headers.Accept.Clear();
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/octet-stream"));
 
-        using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        // A generous CAP, not a deadline anyone should hit: the download is tens of megabytes and
+        // its duration is the user's bandwidth, not ours to predict. The point is only that a
+        // half-open connection cannot wedge the updater forever.
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(DownloadTimeout);
+
+        using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, deadline.Token).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
 
-        await using var input = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-        await using var output = File.Create(downloadPath);
-        await input.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
+        // Downloaded to a .partial and renamed only once complete. A cancelled or failed download
+        // that left a truncated file under the real name would be handed straight to msiexec by the
+        // next run, which fails with an opaque installer error rather than "download interrupted".
+        var partialPath = downloadPath + ".partial";
+        await using (var input = await response.Content.ReadAsStreamAsync(deadline.Token).ConfigureAwait(false))
+        await using (var output = File.Create(partialPath))
+        {
+            await input.CopyToAsync(output, deadline.Token).ConfigureAwait(false);
+        }
 
+        File.Move(partialPath, downloadPath, overwrite: true);
         return downloadPath;
     }
 
