@@ -15,7 +15,7 @@
     -->
     <OutputName>CodexBarWindows-$(ProductVersion)-win-x64</OutputName>
     <OutputType>Package</OutputType>
-    <ProductVersion Condition="'$(ProductVersion)' == ''">0.9.3</ProductVersion>
+    <ProductVersion Condition="'$(ProductVersion)' == ''">0.9.4</ProductVersion>
     <PublishDir Condition="'$(PublishDir)' == ''">..\bin\publish-winui\win-x64</PublishDir>
     <DefineConstants>ProductVersion=$(ProductVersion);PublishDir=$(PublishDir)</DefineConstants>
     <!--
