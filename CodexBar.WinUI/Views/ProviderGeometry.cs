@@ -39,12 +39,25 @@ internal static class ProviderGeometry
         "F0 M 20 12 H 80 V 88 H 20 Z M 35 27 H 65 V 72 H 35 Z";
 
     /// <summary>
-    /// Thin geometric X in the same visual weight class as the Codex/Cursor marks (not a heavy
-    /// filled block). View box is roughly 0–100; <see cref="Normalize"/> scales it to
-    /// <see cref="IconSize"/>.
+    /// The Grok mark: the two interlocking xAI swooshes, authored on a 0–24 view box (the
+    /// official artwork's). <see cref="Normalize"/> scales it to <see cref="IconSize"/>, so the
+    /// smaller view box costs nothing.
     /// </summary>
+    /// <remarks>
+    /// The source SVG draws the outer sweep with two elliptical arcs. They are transcribed here
+    /// as a straight line (the first arc's sagitta is under 0.1 units - invisible at 14 DIPs)
+    /// and one cubic bezier fitted to the second, which keeps the data parseable by the
+    /// WinForms tab painter's mini path parser too - it has no arc support.
+    /// </remarks>
     private const string GrokData =
-        "F0 M 18 8 L 28 8 L 50 36 L 72 8 L 82 8 L 82 18 L 54 50 L 82 82 L 82 92 L 72 92 L 50 64 L 28 92 L 18 92 L 18 82 L 46 50 L 18 18 Z";
+        "F0 M9.27 15.29 l7.978-5.897 c.391-.29.95-.177 1.137.272 .98 2.369.542 5.215-1.41 7.169 " +
+        "-1.951 1.954-4.667 2.382-7.149 1.406 l-2.711 1.257 c3.889 2.661 8.611 2.003 11.562-.953 " +
+        "2.341-2.344 3.066-5.539 2.388-8.42 l.006.007 c-.983-4.232.242-5.924 2.75-9.383 " +
+        ".06-.082.12-.164.179-.248 l-3.301 3.305 v-.01 L9.267 15.292 Z " +
+        "M7.623 16.723 c-2.792-2.67-2.31-6.801.071-9.184 1.761-1.763 4.647-2.483 7.166-1.425 " +
+        "l2.705-1.25 L15.736 3.864 C12.388 2.494 8.54 3.27 5.984 5.83 " +
+        "c-2.533 2.536-3.33 6.436-1.962 9.764 1.022 2.487-.653 4.246-2.34 6.022 " +
+        "-.599.63-1.199 1.259-1.682 1.925 l7.62-6.815 Z";
 
     /// <summary>Edge length of the square the mark is normalised into, in DIPs.</summary>
     private const double IconSize = 14;

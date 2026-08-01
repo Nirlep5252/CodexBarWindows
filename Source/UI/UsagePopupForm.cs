@@ -2448,6 +2448,22 @@ public sealed class UsagePopupForm : Form
         private const string CursorSymbolPathData =
             "M84.0704 28.9353L51.9066 10.4454C50.8738 9.85153 49.5994 9.85153 48.5666 10.4454L16.4043 28.9353C15.536 29.4345 15 30.3576 15 31.3575V68.6425C15 69.6424 15.536 70.5655 16.4043 71.0647L48.5681 89.5546C49.6009 90.1485 50.8753 90.1485 51.9081 89.5546L84.0719 71.0647C84.9402 70.5655 85.4762 69.6424 85.4762 68.6425V31.3575C85.4762 30.3576 84.9402 29.4345 84.0719 28.9353H84.0704ZM82.0501 32.8519L51.0006 86.4003C50.7907 86.7611 50.2366 86.6138 50.2366 86.1958V51.1329C50.2366 50.4322 49.8606 49.7842 49.2506 49.4324L18.7553 31.9017C18.3929 31.6927 18.5409 31.141 18.9606 31.141H81.0595C81.9414 31.141 82.4925 32.0927 82.0516 32.8534H82.0501V32.8519Z";
 
+        // The Grok mark, on the official artwork's 0-24 view box (the others are 0-100). Its two
+        // elliptical arcs are transcribed as a line (sagitta < 0.1 units, invisible at this size)
+        // and a fitted cubic, because CreateSvgPath below implements no arc command.
+        private const string GrokSymbolPathData =
+            "M9.27 15.29 l7.978-5.897 c.391-.29.95-.177 1.137.272 .98 2.369.542 5.215-1.41 7.169 " +
+            "-1.951 1.954-4.667 2.382-7.149 1.406 l-2.711 1.257 c3.889 2.661 8.611 2.003 11.562-.953 " +
+            "2.341-2.344 3.066-5.539 2.388-8.42 l.006.007 c-.983-4.232.242-5.924 2.75-9.383 " +
+            ".06-.082.12-.164.179-.248 l-3.301 3.305 v-.01 L9.267 15.292 Z " +
+            "M7.623 16.723 c-2.792-2.67-2.31-6.801.071-9.184 1.761-1.763 4.647-2.483 7.166-1.425 " +
+            "l2.705-1.25 L15.736 3.864 C12.388 2.494 8.54 3.27 5.984 5.83 " +
+            "c-2.533 2.536-3.33 6.436-1.962 9.764 1.022 2.487-.653 4.246-2.34 6.022 " +
+            "-.599.63-1.199 1.259-1.682 1.925 l7.62-6.815 Z";
+
+        /// <summary>View box edge the <see cref="GrokSymbolPathData"/> mark is authored on.</summary>
+        private const float GrokSymbolExtent = 24f;
+
         private static readonly string OpenAiWhiteLogoPath = Path.Combine(
             AppContext.BaseDirectory,
             "Assets",
@@ -2768,21 +2784,24 @@ public sealed class UsagePopupForm : Form
 
         private static void DrawGrokLogo(Graphics graphics, Rectangle bounds, Color color)
         {
-            // Match the WinUI mark: a thinner geometric X, not a heavy bar.
-            var inset = Math.Max(2.5f, bounds.Width * 0.22f);
-            var thickness = Math.Max(1.6f, bounds.Width * 0.11f);
-            var left = bounds.Left + inset;
-            var top = bounds.Top + inset;
-            var right = bounds.Right - inset;
-            var bottom = bounds.Bottom - inset;
-            using var pen = new Pen(color, thickness)
+            using var brush = new SolidBrush(color);
+            try
             {
-                StartCap = System.Drawing.Drawing2D.LineCap.Round,
-                EndCap = System.Drawing.Drawing2D.LineCap.Round,
-                LineJoin = System.Drawing.Drawing2D.LineJoin.Round
-            };
-            graphics.DrawLine(pen, left, top, right, bottom);
-            graphics.DrawLine(pen, right, top, left, bottom);
+                using var path = CreateSvgPath(GrokSymbolPathData);
+                using var transform = new System.Drawing.Drawing2D.Matrix(
+                    bounds.Width / GrokSymbolExtent,
+                    0,
+                    0,
+                    bounds.Height / GrokSymbolExtent,
+                    bounds.Left,
+                    bounds.Top);
+                path.Transform(transform);
+                graphics.FillPath(brush, path);
+            }
+            catch
+            {
+                graphics.FillEllipse(brush, bounds);
+            }
         }
 
         private static System.Drawing.Drawing2D.GraphicsPath CreateSvgPath(string data)
