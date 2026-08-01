@@ -285,6 +285,7 @@ public sealed partial class SettingsWindow : Window
         CodexEnabledToggle.IsOn = settings.CodexEnabled;
         ClaudeEnabledToggle.IsOn = settings.ClaudeEnabled;
         CursorEnabledToggle.IsOn = settings.CursorEnabled;
+        OpenCodeGoEnabledToggle.IsOn = settings.OpenCodeGoEnabled;
 
         ThemeCombo.SelectedIndex = (int)settings.Theme;
         MaterialCombo.SelectedIndex = (int)settings.Material;
@@ -295,6 +296,9 @@ public sealed partial class SettingsWindow : Window
 
         CursorCookieBox.Password = CursorSettings.LoadCookieHeader();
         RenderCursorSavedState();
+        OpenCodeGoCookieBox.Password = OpenCodeGoUsageReader.SessionValue(OpenCodeGoSettings.LoadCookieHeader());
+        OpenCodeGoWorkspaceBox.Text = OpenCodeGoSettings.LoadWorkspaceId();
+        RenderOpenCodeGoSavedState();
         RenderProviderMarks();
         RenderAccounts();
         RenderChartColors();
@@ -319,6 +323,7 @@ public sealed partial class SettingsWindow : Window
         CodexEnabledToggle.Toggled += (_, _) => OnProviderEnabledChanged();
         ClaudeEnabledToggle.Toggled += (_, _) => OnProviderEnabledChanged();
         CursorEnabledToggle.Toggled += (_, _) => OnProviderEnabledChanged();
+        OpenCodeGoEnabledToggle.Toggled += (_, _) => OnProviderEnabledChanged();
 
         ThemeCombo.SelectionChanged += (_, _) => OnThemeSelectionChanged();
         MaterialCombo.SelectionChanged += (_, _) => OnMaterialSelectionChanged();
@@ -342,6 +347,8 @@ public sealed partial class SettingsWindow : Window
 
         SaveCursorButton.Click += (_, _) => SaveCursorCookieHeader();
         ClearCursorButton.Click += (_, _) => ClearCursorCookieHeader();
+        SaveOpenCodeGoButton.Click += (_, _) => SaveOpenCodeGoSettings();
+        ClearOpenCodeGoButton.Click += (_, _) => ClearOpenCodeGoSession();
     }
 
     /// <summary>
@@ -433,8 +440,10 @@ public sealed partial class SettingsWindow : Window
         CodexMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Codex, palette.Glyph);
         ClaudeMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Claude, palette.ClaudeGlyph);
         CursorMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Cursor, palette.Glyph);
+        OpenCodeGoMark.Child = ProviderGeometry.CreateIcon(UsageProvider.OpenCodeGo, palette.Glyph);
         BuiltInAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Codex, palette.Glyph);
         CursorAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Cursor, palette.Glyph);
+        OpenCodeGoAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.OpenCodeGo, palette.Glyph);
 
         // The generated account rows hold marks too, and a Path cannot be shared between two
         // parents here (it takes the process down with 0xc000027b), so each row gets its own.
@@ -455,7 +464,10 @@ public sealed partial class SettingsWindow : Window
             return;
         }
 
-        if (!CodexEnabledToggle.IsOn && !ClaudeEnabledToggle.IsOn && !CursorEnabledToggle.IsOn)
+        if (!CodexEnabledToggle.IsOn &&
+            !ClaudeEnabledToggle.IsOn &&
+            !CursorEnabledToggle.IsOn &&
+            !OpenCodeGoEnabledToggle.IsOn)
         {
             suppressWrites = true;
             CodexEnabledToggle.IsOn = true;
@@ -474,7 +486,8 @@ public sealed partial class SettingsWindow : Window
         {
             CodexEnabled = CodexEnabledToggle.IsOn,
             ClaudeEnabled = ClaudeEnabledToggle.IsOn,
-            CursorEnabled = CursorEnabledToggle.IsOn
+            CursorEnabled = CursorEnabledToggle.IsOn,
+            OpenCodeGoEnabled = OpenCodeGoEnabledToggle.IsOn
         };
         settings.Save();
     }
@@ -1303,6 +1316,60 @@ public sealed partial class SettingsWindow : Window
         CursorSavedText.Text = string.IsNullOrWhiteSpace(stored)
             ? "No cookie header saved - Cursor usage is unavailable."
             : $"A cookie header is saved ({stored.Length} characters).";
+    }
+
+    // ------------------------------------------------------------ OpenCode Go
+
+    private void SaveOpenCodeGoSettings()
+    {
+        var normalizedCookie = OpenCodeGoUsageReader.NormalizeCookieHeader(OpenCodeGoCookieBox.Password);
+        if (string.IsNullOrWhiteSpace(normalizedCookie))
+        {
+            SetStatus(
+                "Paste the auth cookie value from opencode.ai, or use Clear session to remove the saved one.",
+                StatusLevel.Warning);
+            return;
+        }
+
+        var rawWorkspace = OpenCodeGoWorkspaceBox.Text.Trim();
+        var workspaceId = OpenCodeGoUsageReader.NormalizeWorkspaceId(rawWorkspace);
+        if (rawWorkspace.Length > 0 && workspaceId is null)
+        {
+            SetStatus(
+                "The workspace must be a wrk_… id or a full opencode.ai workspace URL.",
+                StatusLevel.Warning);
+            return;
+        }
+
+        OpenCodeGoSettings.Save(normalizedCookie, workspaceId);
+        OpenCodeGoCookieBox.Password = OpenCodeGoUsageReader.SessionValue(normalizedCookie);
+        OpenCodeGoWorkspaceBox.Text = workspaceId ?? string.Empty;
+        OpenCodeGoEnabledToggle.IsOn = true;
+        RenderOpenCodeGoSavedState();
+        service.Refresh();
+        SetStatus("OpenCode Go session saved. Usage will refresh.");
+    }
+
+    private void ClearOpenCodeGoSession()
+    {
+        var workspaceId = OpenCodeGoUsageReader.NormalizeWorkspaceId(OpenCodeGoWorkspaceBox.Text);
+        OpenCodeGoSettings.Save(string.Empty, workspaceId);
+        OpenCodeGoCookieBox.Password = string.Empty;
+        RenderOpenCodeGoSavedState();
+        service.Refresh();
+        SetStatus("OpenCode Go session cleared.");
+    }
+
+    private void RenderOpenCodeGoSavedState()
+    {
+        var stored = OpenCodeGoSettings.LoadCookieHeader();
+        var workspaceId = OpenCodeGoSettings.LoadWorkspaceId();
+        var workspaceText = string.IsNullOrWhiteSpace(workspaceId)
+            ? "workspace will be discovered automatically"
+            : $"workspace {workspaceId}";
+        OpenCodeGoSavedText.Text = string.IsNullOrWhiteSpace(stored)
+            ? "No session saved - OpenCode Go usage is unavailable."
+            : $"A session value is saved ({OpenCodeGoUsageReader.SessionValue(stored).Length} characters); {workspaceText}.";
     }
 
     // -------------------------------------------------------------------- glue

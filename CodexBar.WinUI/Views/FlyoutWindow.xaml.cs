@@ -271,6 +271,7 @@ public sealed partial class FlyoutWindow : Window
             .Select(entry => new ProviderDescriptor(ProviderKeys.Codex(entry.Id), entry.Name, UsageProvider.Codex))
             .Append(new ProviderDescriptor(ProviderKeys.Claude, "Claude", UsageProvider.Claude))
             .Append(new ProviderDescriptor(ProviderKeys.Cursor, "Cursor", UsageProvider.Cursor))
+            .Append(new ProviderDescriptor(ProviderKeys.OpenCodeGo, "OpenCode Go", UsageProvider.OpenCodeGo))
             .Where(descriptor => settings.IsProviderEnabled(descriptor.Provider))
             .ToList();
 

@@ -49,6 +49,7 @@ public sealed class UsageRefreshService : IDisposable
     private readonly Action<Action> post;
     private readonly ClaudeUsageReader claudeUsageReader = new();
     private readonly CursorUsageReader cursorUsageReader = new();
+    private readonly OpenCodeGoUsageReader openCodeGoUsageReader = new();
     private readonly Dictionary<string, ProviderUsageLookupResult> latestCodexUsage = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ProviderUsageInsightsLookupResult> latestHistory = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, CodexRateLimitStabilizer> codexStabilizers = new(StringComparer.Ordinal);
@@ -58,6 +59,7 @@ public sealed class UsageRefreshService : IDisposable
 
     private ProviderUsageLookupResult latestClaudeUsage = NotLoaded;
     private ProviderUsageLookupResult latestCursorUsage = NotLoaded;
+    private ProviderUsageLookupResult latestOpenCodeGoUsage = NotLoaded;
     private CancellationTokenSource? refreshCancellation;
     private int refreshGeneration;
     private int inFlightRefreshes;
@@ -133,6 +135,11 @@ public sealed class UsageRefreshService : IDisposable
             return latestCursorUsage;
         }
 
+        if (providerKey == ProviderKeys.OpenCodeGo)
+        {
+            return latestOpenCodeGoUsage;
+        }
+
         return latestCodexUsage.TryGetValue(providerKey, out var result) ? result : NotLoaded;
     }
 
@@ -143,7 +150,12 @@ public sealed class UsageRefreshService : IDisposable
         resetCreditStates.TryGetValue(providerKey, out var state) ? state : ResetCreditState.Idle;
 
     public string BuildTooltip() =>
-        UsageTooltip.Build(CodexEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage);
+        UsageTooltip.Build(
+            CodexEntries,
+            latestCodexUsage,
+            latestClaudeUsage,
+            latestCursorUsage,
+            UiSettings.Load().OpenCodeGoEnabled ? latestOpenCodeGoUsage : null);
 
     /// <summary>
     /// Reports whether a usage-showing window is open. The poll timer runs while any is, and
@@ -291,6 +303,7 @@ public sealed class UsageRefreshService : IDisposable
 
         UsageUpdated?.Invoke(ProviderKeys.Claude, latestClaudeUsage);
         UsageUpdated?.Invoke(ProviderKeys.Cursor, latestCursorUsage);
+        UsageUpdated?.Invoke(ProviderKeys.OpenCodeGo, latestOpenCodeGoUsage);
         BeginRefresh();
     }
 
@@ -532,6 +545,19 @@ public sealed class UsageRefreshService : IDisposable
                 });
             }
 
+            async Task RefreshOpenCodeGoLimitsAsync()
+            {
+                var openCodeGoResult = await openCodeGoUsageReader.ReadLatestAsync(cancellation.Token)
+                    .ConfigureAwait(false);
+                PostIfCurrent(() =>
+                {
+                    latestOpenCodeGoUsage = ProviderUsageLookupResult.KeepLastGood(
+                        latestOpenCodeGoUsage,
+                        openCodeGoResult);
+                    PublishUsage(ProviderKeys.OpenCodeGo, latestOpenCodeGoUsage);
+                });
+            }
+
             // A disabled tool is not polled at all - that is the point of the setting, and it
             // also removes its share of the refresh cost (notably the Codex app-server spawn).
             var settings = UiSettings.Load();
@@ -549,6 +575,11 @@ public sealed class UsageRefreshService : IDisposable
             if (settings.CursorEnabled)
             {
                 refreshTasks.Add(RefreshCursorLimitsAsync());
+            }
+
+            if (settings.OpenCodeGoEnabled)
+            {
+                refreshTasks.Add(RefreshOpenCodeGoLimitsAsync());
             }
 
             if (includeHistory)
@@ -600,6 +631,11 @@ public sealed class UsageRefreshService : IDisposable
                         latestCursorUsage,
                         new ProviderUsageLookupResult(null, message));
                     PublishUsage(ProviderKeys.Cursor, latestCursorUsage);
+
+                    latestOpenCodeGoUsage = ProviderUsageLookupResult.KeepLastGood(
+                        latestOpenCodeGoUsage,
+                        new ProviderUsageLookupResult(null, message));
+                    PublishUsage(ProviderKeys.OpenCodeGo, latestOpenCodeGoUsage);
                 });
             }
             finally

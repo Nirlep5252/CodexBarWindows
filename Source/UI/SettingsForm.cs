@@ -42,6 +42,7 @@ public sealed class SettingsForm : Form
     private Panel appearancePage = null!;
     private Panel accountsPage = null!;
     private Panel cursorPage = null!;
+    private Panel openCodeGoPage = null!;
 
     private Label generalTitleLabel = null!;
     private SettingsCard startupCard = null!;
@@ -66,6 +67,8 @@ public sealed class SettingsForm : Form
     private FluentToggle claudeEnabledToggle = null!;
     private SettingsCard cursorEnabledCard = null!;
     private FluentToggle cursorEnabledToggle = null!;
+    private SettingsCard openCodeGoEnabledCard = null!;
+    private FluentToggle openCodeGoEnabledToggle = null!;
     private bool suppressProviderToggleEvents;
 
     private Label accountsTitleLabel = null!;
@@ -87,8 +90,17 @@ public sealed class SettingsForm : Form
     private FluentButton saveCursorCookieButton = null!;
     private FluentButton clearCursorCookieButton = null!;
 
+    private Label openCodeGoTitleLabel = null!;
+    private Label openCodeGoCaptionLabel = null!;
+    private SettingsCard openCodeGoCard = null!;
+    private FluentTextField openCodeGoCookieTextBox = null!;
+    private FluentTextField openCodeGoWorkspaceTextBox = null!;
+    private FluentButton saveOpenCodeGoButton = null!;
+    private FluentButton clearOpenCodeGoButton = null!;
+
     public event EventHandler? CodexCliEntriesChanged;
     public event EventHandler? CursorSettingsChanged;
+    public event EventHandler? OpenCodeGoSettingsChanged;
 
     public SettingsForm()
     {
@@ -122,29 +134,34 @@ public sealed class SettingsForm : Form
         navRail = new NavigationRail(tokens)
         {
             Location = new Point(8, 16),
-            Size = new Size(192, 160)
+            Size = new Size(192, 220)
         };
         navRail.AddItem(GeneralGlyph, "General");
         navRail.AddItem(AppearanceGlyph, "Appearance");
         navRail.AddItem(AccountsGlyph, "Codex accounts");
         navRail.AddItem(CursorGlyph, "Cursor");
+        navRail.AddItem(CursorGlyph, "OpenCode Go");
 
         generalPage = CreatePage();
         appearancePage = CreatePage();
         accountsPage = CreatePage();
         cursorPage = CreatePage();
-        pages = [generalPage, appearancePage, accountsPage, cursorPage];
+        openCodeGoPage = CreatePage();
+        pages = [generalPage, appearancePage, accountsPage, cursorPage, openCodeGoPage];
 
         BuildGeneralPage();
         BuildAppearancePage();
         BuildAccountsPage();
         BuildCursorPage();
+        BuildOpenCodeGoPage();
 
-        Controls.AddRange([navRail, generalPage, appearancePage, accountsPage, cursorPage]);
+        Controls.AddRange([navRail, generalPage, appearancePage, accountsPage, cursorPage, openCodeGoPage]);
 
         navRail.SelectedIndexChanged += (_, _) => ShowPage(navRail.SelectedIndex);
 
         cursorCookieTextBox.Text = CursorSettings.LoadCookieHeader();
+        openCodeGoCookieTextBox.Text = OpenCodeGoUsageReader.SessionValue(OpenCodeGoSettings.LoadCookieHeader());
+        openCodeGoWorkspaceTextBox.Text = OpenCodeGoSettings.LoadWorkspaceId();
         RefreshCodexCliList();
         ShowPage(0);
         ApplyThemeToTree();
@@ -276,13 +293,26 @@ public sealed class SettingsForm : Form
         };
         cursorEnabledCard.ActionControl = cursorEnabledToggle;
 
+        openCodeGoEnabledToggle = new FluentToggle(tokens) { Checked = uiSettings.OpenCodeGoEnabled, Size = new Size(40, 20) };
+        openCodeGoEnabledToggle.CheckedChanged += (_, _) => OnProviderEnabledChanged();
+        openCodeGoEnabledCard = new SettingsCard(tokens)
+        {
+            Description = "Show OpenCode Go subscription limits",
+            Glyph = ToolsGlyph,
+            Location = new Point(24, 430),
+            Size = new Size(532, 64),
+            Title = "OpenCode Go"
+        };
+        openCodeGoEnabledCard.ActionControl = openCodeGoEnabledToggle;
+
         generalPage.Controls.AddRange([
             generalTitleLabel,
             startupCard,
             versionCard,
             codexEnabledCard,
             claudeEnabledCard,
-            cursorEnabledCard]);
+            cursorEnabledCard,
+            openCodeGoEnabledCard]);
     }
 
     /// <summary>
@@ -296,7 +326,10 @@ public sealed class SettingsForm : Form
             return;
         }
 
-        if (!codexEnabledToggle.Checked && !claudeEnabledToggle.Checked && !cursorEnabledToggle.Checked)
+        if (!codexEnabledToggle.Checked &&
+            !claudeEnabledToggle.Checked &&
+            !cursorEnabledToggle.Checked &&
+            !openCodeGoEnabledToggle.Checked)
         {
             suppressProviderToggleEvents = true;
             codexEnabledToggle.Checked = true;
@@ -307,7 +340,8 @@ public sealed class SettingsForm : Form
         {
             CodexEnabled = codexEnabledToggle.Checked,
             ClaudeEnabled = claudeEnabledToggle.Checked,
-            CursorEnabled = cursorEnabledToggle.Checked
+            CursorEnabled = cursorEnabledToggle.Checked,
+            OpenCodeGoEnabled = openCodeGoEnabledToggle.Checked
         };
         uiSettings.Save();
     }
@@ -539,6 +573,61 @@ public sealed class SettingsForm : Form
         cursorPage.Controls.AddRange([cursorTitleLabel, cursorCaptionLabel, cursorCard]);
     }
 
+    private void BuildOpenCodeGoPage()
+    {
+        openCodeGoTitleLabel = CreatePageTitle("OpenCode Go");
+        openCodeGoCaptionLabel = CreateCaption(
+            "Paste only the auth cookie value from opencode.ai. The workspace is discovered automatically.",
+            new Point(24, 58),
+            new Size(532, 18));
+
+        openCodeGoCookieTextBox = new FluentTextField(tokens)
+        {
+            Location = new Point(16, 46),
+            Size = new Size(500, 32),
+            PlaceholderText = "Paste session value",
+            UseSystemPasswordChar = true
+        };
+
+        openCodeGoWorkspaceTextBox = new FluentTextField(tokens)
+        {
+            Location = new Point(16, 86),
+            Size = new Size(500, 32),
+            PlaceholderText = "Optional workspace: wrk_..."
+        };
+
+        saveOpenCodeGoButton = new FluentButton(tokens, FluentButtonKind.Primary)
+        {
+            Location = new Point(364, 126),
+            Size = new Size(72, 32),
+            Text = "Save"
+        };
+        saveOpenCodeGoButton.Click += (_, _) => SaveOpenCodeGoSettings();
+
+        clearOpenCodeGoButton = new FluentButton(tokens, FluentButtonKind.Secondary)
+        {
+            Location = new Point(444, 126),
+            Size = new Size(72, 32),
+            Text = "Clear"
+        };
+        clearOpenCodeGoButton.Click += (_, _) => ClearOpenCodeGoSession();
+
+        openCodeGoCard = new SettingsCard(tokens)
+        {
+            Location = new Point(24, 88),
+            Size = new Size(532, 174),
+            Title = "Dashboard session",
+            TopAlignContent = true
+        };
+        openCodeGoCard.Controls.AddRange([
+            openCodeGoCookieTextBox,
+            openCodeGoWorkspaceTextBox,
+            saveOpenCodeGoButton,
+            clearOpenCodeGoButton]);
+
+        openCodeGoPage.Controls.AddRange([openCodeGoTitleLabel, openCodeGoCaptionLabel, openCodeGoCard]);
+    }
+
     private void OnThemeSelectionChanged()
     {
         var theme = (AppThemeMode)Math.Clamp(themeCombo.SelectedIndex, 0, 2);
@@ -635,13 +724,13 @@ public sealed class SettingsForm : Form
             page.BackColor = tokens.Background;
         }
 
-        foreach (var title in new[] { generalTitleLabel, appearanceTitleLabel, accountsTitleLabel, cursorTitleLabel })
+        foreach (var title in new[] { generalTitleLabel, appearanceTitleLabel, accountsTitleLabel, cursorTitleLabel, openCodeGoTitleLabel })
         {
             title.BackColor = tokens.Background;
             title.ForeColor = tokens.TextPrimary;
         }
 
-        foreach (var caption in new[] { accountsCaptionLabel, cursorCaptionLabel, accountNameLabel, binaryPathLabel })
+        foreach (var caption in new[] { accountsCaptionLabel, cursorCaptionLabel, openCodeGoCaptionLabel, accountNameLabel, binaryPathLabel })
         {
             caption.BackColor = tokens.Background;
             caption.ForeColor = tokens.TextSecondary;
@@ -653,6 +742,7 @@ public sealed class SettingsForm : Form
         materialExpander.ApplyTheme(tokens);
         vibesCard.ApplyTheme(tokens);
         cursorCard.ApplyTheme(tokens);
+        openCodeGoCard.ApplyTheme(tokens);
 
         accountListBox.ApplyTheme(tokens);
         accountNameTextBox.ApplyTheme(tokens);
@@ -825,6 +915,48 @@ public sealed class SettingsForm : Form
         CursorSettings.SaveCookieHeader(string.Empty);
         cursorCookieTextBox.Text = string.Empty;
         CursorSettingsChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void SaveOpenCodeGoSettings()
+    {
+        var normalizedCookie = OpenCodeGoUsageReader.NormalizeCookieHeader(openCodeGoCookieTextBox.Text);
+        if (string.IsNullOrWhiteSpace(normalizedCookie))
+        {
+            MessageBox.Show(
+                this,
+                "Paste the auth cookie value from opencode.ai.",
+                "OpenCode Go session",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        var rawWorkspace = openCodeGoWorkspaceTextBox.Text.Trim();
+        var workspaceId = OpenCodeGoUsageReader.NormalizeWorkspaceId(rawWorkspace);
+        if (rawWorkspace.Length > 0 && workspaceId is null)
+        {
+            MessageBox.Show(
+                this,
+                "The workspace must be a wrk_… id or a full opencode.ai workspace URL.",
+                "OpenCode Go workspace",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        OpenCodeGoSettings.Save(normalizedCookie, workspaceId);
+        openCodeGoCookieTextBox.Text = OpenCodeGoUsageReader.SessionValue(normalizedCookie);
+        openCodeGoWorkspaceTextBox.Text = workspaceId ?? string.Empty;
+        openCodeGoEnabledToggle.Checked = true;
+        OpenCodeGoSettingsChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void ClearOpenCodeGoSession()
+    {
+        var workspaceId = OpenCodeGoUsageReader.NormalizeWorkspaceId(openCodeGoWorkspaceTextBox.Text);
+        OpenCodeGoSettings.Save(string.Empty, workspaceId);
+        openCodeGoCookieTextBox.Text = string.Empty;
+        OpenCodeGoSettingsChanged?.Invoke(this, EventArgs.Empty);
     }
 
     private Label CreatePageTitle(string text)

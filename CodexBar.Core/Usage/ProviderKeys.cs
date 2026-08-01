@@ -3,7 +3,7 @@ namespace CodexBarWindows;
 /// <summary>
 /// The opaque per-provider identity used as a dictionary key everywhere usage is tracked.
 /// Codex is keyed per configured CLI entry (two accounts are two providers); Claude and
-/// Cursor are singletons.
+/// Cursor and OpenCode Go are singletons.
 /// </summary>
 /// <remarks>
 /// The WinForms UI declares the same three strings on <c>UsagePopupForm</c>. They must stay
@@ -13,6 +13,7 @@ public static class ProviderKeys
 {
     public const string Claude = "claude";
     public const string Cursor = "cursor";
+    public const string OpenCodeGo = "opencodego";
 
     public static string Codex(string id) => $"codex:{id}";
 
@@ -23,6 +24,7 @@ public static class ProviderKeys
     {
         Claude => UsageProvider.Claude,
         Cursor => UsageProvider.Cursor,
+        OpenCodeGo => UsageProvider.OpenCodeGo,
         _ => UsageProvider.Codex
     };
 }

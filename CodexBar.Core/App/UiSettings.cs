@@ -35,6 +35,7 @@ public sealed record UiSettings
     private const string CodexEnabledValueName = "ProviderCodexEnabled";
     private const string ClaudeEnabledValueName = "ProviderClaudeEnabled";
     private const string CursorEnabledValueName = "ProviderCursorEnabled";
+    private const string OpenCodeGoEnabledValueName = "ProviderOpenCodeGoEnabled";
     private const string ChartColorsValueName = "ChartColorOverrides";
 
     /// <summary>
@@ -101,6 +102,12 @@ public sealed record UiSettings
     public bool CursorEnabled { get; init; } = true;
 
     /// <summary>
+    /// Opt-in because this provider needs a manually configured browser session. Existing users
+    /// must not gain an error-only card merely by upgrading the app.
+    /// </summary>
+    public bool OpenCodeGoEnabled { get; init; }
+
+    /// <summary>
     /// Per-model chart colour overrides: RAW category label (the <c>ProviderSpendCategory.Label</c>
     /// / <c>ProviderModelUsage.Model</c> string, lower-cased) → <c>"#RRGGBB"</c>. Anything absent
     /// keeps the automatic palette, so an empty map is the shipped behaviour.
@@ -122,6 +129,7 @@ public sealed record UiSettings
     {
         UsageProvider.Claude => ClaudeEnabled,
         UsageProvider.Cursor => CursorEnabled,
+        UsageProvider.OpenCodeGo => OpenCodeGoEnabled,
         _ => CodexEnabled
     };
 
@@ -167,6 +175,9 @@ public sealed record UiSettings
             static bool ReadEnabled(RegistryKey key, string name)
                 => key.GetValue(name) is not int value || value != 0;
 
+            static bool ReadOptIn(RegistryKey key, string name)
+                => key.GetValue(name) is int value && value != 0;
+
             return new UiSettings
             {
                 Theme = theme,
@@ -176,6 +187,7 @@ public sealed record UiSettings
                 CodexEnabled = ReadEnabled(key, CodexEnabledValueName),
                 ClaudeEnabled = ReadEnabled(key, ClaudeEnabledValueName),
                 CursorEnabled = ReadEnabled(key, CursorEnabledValueName),
+                OpenCodeGoEnabled = ReadOptIn(key, OpenCodeGoEnabledValueName),
                 ChartColorOverrides = ReadChartColors(key)
             };
         }
@@ -268,6 +280,7 @@ public sealed record UiSettings
             key.SetValue(CodexEnabledValueName, CodexEnabled ? 1 : 0, RegistryValueKind.DWord);
             key.SetValue(ClaudeEnabledValueName, ClaudeEnabled ? 1 : 0, RegistryValueKind.DWord);
             key.SetValue(CursorEnabledValueName, CursorEnabled ? 1 : 0, RegistryValueKind.DWord);
+            key.SetValue(OpenCodeGoEnabledValueName, OpenCodeGoEnabled ? 1 : 0, RegistryValueKind.DWord);
 
             // WRITTEN UNCONDITIONALLY, and read in LoadCore above: the frozen WinForms app shares
             // this key and compiles against this same type, so a value that is read but not

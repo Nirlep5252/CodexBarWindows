@@ -1945,6 +1945,14 @@ public sealed class FluentTextField : UserControl, IFluentThemeable
         set => textBox.PlaceholderText = value;
     }
 
+    [System.ComponentModel.Browsable(true)]
+    [System.ComponentModel.DefaultValue(false)]
+    public bool UseSystemPasswordChar
+    {
+        get => textBox.UseSystemPasswordChar;
+        set => textBox.UseSystemPasswordChar = value;
+    }
+
     public void ApplyTheme(FluentTokens palette)
     {
         tokens = palette;

@@ -191,7 +191,11 @@ public sealed class UsagePopupForm : Form
         FormClosing += OnFormClosing;
         UiSettings.Changed += OnUiSettingsChanged;
 
-        ConfigureProviders([new ProviderDescriptor(CodexProviderKey("default"), "Codex", UsageProvider.Codex), ClaudeProvider, CursorProvider]);
+        ConfigureProviders([
+            new ProviderDescriptor(CodexProviderKey("default"), "Codex", UsageProvider.Codex),
+            ClaudeProvider,
+            CursorProvider,
+            OpenCodeGoProvider]);
         ApplyScaledLayout();
         ApplyTheme();
         RenderSelectedProvider();
@@ -493,7 +497,8 @@ public sealed class UsagePopupForm : Form
         // A tool being enabled or disabled changes which tabs exist.
         if (previousSettings.CodexEnabled != uiSettings.CodexEnabled ||
             previousSettings.ClaudeEnabled != uiSettings.ClaudeEnabled ||
-            previousSettings.CursorEnabled != uiSettings.CursorEnabled)
+            previousSettings.CursorEnabled != uiSettings.CursorEnabled ||
+            previousSettings.OpenCodeGoEnabled != uiSettings.OpenCodeGoEnabled)
         {
             ConfigureCodexEntries(configuredCodexEntries);
         }
@@ -671,6 +676,7 @@ public sealed class UsagePopupForm : Form
             .Select(entry => new ProviderDescriptor(CodexProviderKey(entry.Id), entry.Name, UsageProvider.Codex))
             .Append(ClaudeProvider)
             .Append(CursorProvider)
+            .Append(OpenCodeGoProvider)
             .Where(descriptor => uiSettings.IsProviderEnabled(descriptor.Provider))
             .ToList();
 
@@ -751,7 +757,9 @@ public sealed class UsagePopupForm : Form
                 ? "Reading from Claude Code OAuth..."
                 : provider.IsCursor
                     ? "Reading from cursor.com..."
-                    : "Reading from Codex CLI...";
+                    : provider.IsOpenCodeGo
+                        ? "Reading from opencode.ai..."
+                        : "Reading from Codex CLI...";
         }
     }
 
@@ -883,7 +891,9 @@ public sealed class UsagePopupForm : Form
         {
             planLabel.Text = provider.IsCursor
                 ? "Waiting for Cursor usage data"
-                : $"Waiting for local {provider.Name} usage data";
+                : provider.IsOpenCodeGo
+                    ? "Waiting for OpenCode Go usage data"
+                    : $"Waiting for local {provider.Name} usage data";
             var titles = DefaultUsageTitles(provider);
             for (var index = 0; index < GetUsageRowCount(provider); index++)
             {
@@ -896,7 +906,11 @@ public sealed class UsagePopupForm : Form
         planLabel.Text = provider.IsCursor
             ? CursorPlanText(snapshot)
             : string.IsNullOrWhiteSpace(snapshot.PlanType)
-                ? provider.IsClaude ? "Claude Code usage data" : "Codex CLI usage data"
+                ? provider.IsClaude
+                    ? "Claude Code usage data"
+                    : provider.IsOpenCodeGo
+                        ? "OpenCode Go usage data"
+                        : "Codex CLI usage data"
                 : $"{ProviderPlanFormatter.DisplayName(provider.Provider, snapshot.PlanType)} plan";
 
         var windows = snapshot.Windows;
@@ -1134,12 +1148,15 @@ public sealed class UsagePopupForm : Form
 
     public const string ClaudeProviderKey = "claude";
     public const string CursorProviderKey = "cursor";
+    public const string OpenCodeGoProviderKey = "opencodego";
     private static readonly ProviderDescriptor ClaudeProvider = new(ClaudeProviderKey, "Claude", UsageProvider.Claude);
     private static readonly ProviderDescriptor CursorProvider = new(CursorProviderKey, "Cursor", UsageProvider.Cursor);
+    private static readonly ProviderDescriptor OpenCodeGoProvider = new(OpenCodeGoProviderKey, "OpenCode Go", UsageProvider.OpenCodeGo);
     private sealed record ProviderDescriptor(string Key, string Name, UsageProvider Provider)
     {
         public bool IsClaude => Provider == UsageProvider.Claude;
         public bool IsCursor => Provider == UsageProvider.Cursor;
+        public bool IsOpenCodeGo => Provider == UsageProvider.OpenCodeGo;
     }
 
     /// <summary>
@@ -2558,6 +2575,10 @@ public sealed class UsagePopupForm : Form
             {
                 DrawCursorLogo(e.Graphics, iconBounds, tokens.IsDark ? Color.White : tokens.TextPrimary);
             }
+            else if (Provider == UsageProvider.OpenCodeGo)
+            {
+                DrawOpenCodeGoLogo(e.Graphics, iconBounds, tokens.IsDark ? Color.White : tokens.TextPrimary);
+            }
             else
             {
                 DrawOpenAiLogo(e.Graphics, iconBounds);
@@ -2591,6 +2612,17 @@ public sealed class UsagePopupForm : Form
             using var pillBrush = new SolidBrush(pillColor);
             using var pillPath = FluentTheme.RoundedRect(pillBounds, pillHeight / 2f);
             graphics.FillPath(pillBrush, pillPath);
+        }
+
+        private static void DrawOpenCodeGoLogo(Graphics graphics, Rectangle bounds, Color color)
+        {
+            using var path = new System.Drawing.Drawing2D.GraphicsPath(System.Drawing.Drawing2D.FillMode.Alternate);
+            path.AddRectangle(bounds);
+            var insetX = Math.Max(3, (int)Math.Round(bounds.Width * 0.25));
+            var insetY = Math.Max(3, (int)Math.Round(bounds.Height * 0.20));
+            path.AddRectangle(Rectangle.Inflate(bounds, -insetX, -insetY));
+            using var brush = new SolidBrush(color);
+            graphics.FillPath(brush, path);
         }
 
         private void DrawOpenAiLogo(Graphics graphics, Rectangle bounds)

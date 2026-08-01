@@ -143,6 +143,10 @@ var tests = new (string Name, Action Run)[]
     ("Cursor enterprise overall drives headline", CursorEnterpriseOverallDrivesHeadline),
     ("Cursor legacy request usage drives primary", CursorLegacyRequestsDrivePrimary),
     ("Cursor cookie header normalization trims prefix", CursorCookieHeaderNormalizationTrimsPrefix),
+    ("OpenCode Go cookie header normalization trims prefix", OpenCodeGoCookieHeaderNormalizationTrimsPrefix),
+    ("OpenCode Go normalizes workspace URLs", OpenCodeGoNormalizesWorkspaceUrls),
+    ("OpenCode Go parses serialized usage windows", OpenCodeGoParsesSerializedUsageWindows),
+    ("OpenCode Go parses nested JSON usage", OpenCodeGoParsesNestedJsonUsage),
     ("Usage ledger re-merges a day idempotently", UsageLedgerRemergesDayIdempotently),
     ("Usage ledger lets a complete rescan decrease a day", UsageLedgerCompleteRescanCanDecreaseDay),
     ("Usage ledger merges a partial batch monotonically", UsageLedgerPartialBatchMergesMonotonically),
@@ -1228,6 +1232,71 @@ static void CursorCookieHeaderNormalizationTrimsPrefix()
         "WorkosCursorSessionToken=abc; next-auth.session-token=def",
         lower,
         "known cursor cookie names should use canonical casing");
+}
+
+static void OpenCodeGoCookieHeaderNormalizationTrimsPrefix()
+{
+    var normalized = OpenCodeGoUsageReader.NormalizeCookieHeader("  Cookie: theme=dark; auth=abc123  ");
+    AssertEqual("auth=abc123", normalized, "full Cookie headers retain only the OpenCode auth cookie");
+
+    AssertEqual("auth=bare-token", OpenCodeGoUsageReader.NormalizeCookieHeader("bare-token"), "bare values become auth cookies");
+    AssertEqual("auth=abc==", OpenCodeGoUsageReader.NormalizeCookieHeader("abc=="), "padding in bare values is preserved");
+    AssertEqual("__Host-auth=host-token", OpenCodeGoUsageReader.NormalizeCookieHeader("__Host-auth=host-token"), "host auth cookies remain compatible");
+    AssertEqual("host-token", OpenCodeGoUsageReader.SessionValue("__Host-auth=host-token"), "settings display only the value");
+    AssertEqual(string.Empty, OpenCodeGoUsageReader.NormalizeCookieHeader("session=abc\r\nInjected: yes"), "header injection is rejected");
+}
+
+static void OpenCodeGoNormalizesWorkspaceUrls()
+{
+    AssertEqual(
+        "wrk_01HABC123",
+        OpenCodeGoUsageReader.NormalizeWorkspaceId("https://opencode.ai/workspace/wrk_01HABC123/go")!,
+        "workspace id is extracted from the dashboard URL");
+    Assert(OpenCodeGoUsageReader.NormalizeWorkspaceId("workspace-123") is null, "invalid workspace ids are rejected");
+    Assert(OpenCodeGoUsageReader.NormalizeWorkspaceId("  ") is null, "blank workspace uses automatic discovery");
+}
+
+static void OpenCodeGoParsesSerializedUsageWindows()
+{
+    var observedAt = new DateTimeOffset(2026, 8, 1, 10, 0, 0, TimeSpan.Zero);
+    const string response =
+        "_$HY.r[\"lite.subscription.get[\\\"wrk_LIVE123\\\"]\"]=$R[17];" +
+        "$R[24]($R[18],$R[27]={" +
+        "rollingUsage:$R[28]={status:\"ok\",resetInSec:3600,usagePercent:42.5}," +
+        "weeklyUsage:$R[29]={status:\"ok\",resetInSec:7200,usagePercent:7}," +
+        "monthlyUsage:$R[30]={status:\"ok\",resetInSec:10800,usagePercent:90}});";
+
+    var snapshot = OpenCodeGoUsageReader.ParseUsage(response, observedAt);
+
+    Assert(snapshot.Provider == UsageProvider.OpenCodeGo, "snapshot is attributed to OpenCode Go");
+    Assert(snapshot.PlanType is null, "OpenCode Go does not repeat its name as a plan label");
+    AssertEqual(3, snapshot.Windows.Count, "all available dashboard windows are retained");
+    AssertClose(42.5m, (decimal)snapshot.Primary.UsedPercent, "rolling usage");
+    AssertClose(7m, (decimal)snapshot.Secondary!.UsedPercent, "weekly usage");
+    AssertClose(90m, (decimal)snapshot.AdditionalWindows![0].UsedPercent, "monthly usage");
+    AssertEqual(observedAt.AddHours(1), snapshot.Primary.ResetsAt!.Value, "rolling reset time");
+}
+
+static void OpenCodeGoParsesNestedJsonUsage()
+{
+    var observedAt = new DateTimeOffset(2026, 8, 1, 10, 0, 0, TimeSpan.Zero);
+    const string response = """
+        {
+          "data": {
+            "usage": {
+              "rollingUsage": { "usagePercent": 0.25, "resetAt": "2026-08-01T12:00:00Z" },
+              "monthlyUsage": { "used": 30, "limit": 60, "resetInSec": 86400 }
+            }
+          }
+        }
+        """;
+
+    var snapshot = OpenCodeGoUsageReader.ParseUsage(response, observedAt);
+
+    AssertEqual(2, snapshot.Windows.Count, "an omitted weekly window remains optional");
+    AssertClose(25m, (decimal)snapshot.Primary.UsedPercent, "fractional rolling utilization is normalized");
+    AssertClose(50m, (decimal)snapshot.AdditionalWindows![0].UsedPercent, "used and limit become a percent");
+    AssertEqual(observedAt.AddDays(1), snapshot.AdditionalWindows[0].ResetsAt!.Value, "monthly reset time");
 }
 
 static ProviderDailyUsage Today(ProviderUsageInsightsLookupResult result)
@@ -2695,13 +2764,16 @@ static void StaleVibesFlagIsInertWithoutVibes()
         CodexEnabled = false,
         ClaudeEnabled = true,
         CursorEnabled = false,
+        OpenCodeGoEnabled = true,
         ChartColorOverrides = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["gpt-5.6"] = "#ABCDEF" }
     }.WithoutVibes();
 
     Assert(carried.Theme == AppThemeMode.Dark, "theme survives");
     Assert(carried.Material == BackdropMaterial.MicaAlt, "material survives");
     AssertEqual(12, carried.TintOpacityPercent, "tint survives");
-    Assert(!carried.CodexEnabled && carried.ClaudeEnabled && !carried.CursorEnabled, "provider opt-outs survive");
+    Assert(
+        !carried.CodexEnabled && carried.ClaudeEnabled && !carried.CursorEnabled && carried.OpenCodeGoEnabled,
+        "provider choices survive");
     AssertEqual(1, carried.ChartColorOverrides.Count, "chart colour overrides survive");
 }
 

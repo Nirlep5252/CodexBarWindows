@@ -251,6 +251,7 @@
                                             Content="Check for updates"
                                             VerticalAlignment="Center" />
                                     </Grid>
+
                                 </StackPanel>
                             </Border>
                         </StackPanel>
@@ -352,6 +353,36 @@
                                             Grid.Column="2"
                                             MinWidth="0"
                                             AutomationProperties.Name="Cursor enabled"
+                                            OffContent=""
+                                            OnContent=""
+                                            VerticalAlignment="Center" />
+                                    </Grid>
+
+                                    <Border Style="{StaticResource RowSeparatorStyle}" />
+
+                                    <Grid Style="{StaticResource SettingRowStyle}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <Border
+                                            x:Name="OpenCodeGoMark"
+                                            Width="16"
+                                            Height="16"
+                                            VerticalAlignment="Center" />
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock Text="OpenCode Go" />
+                                            <TextBlock
+                                                Style="{StaticResource SecondaryCaptionStyle}"
+                                                Text="Show OpenCode Go subscription limits"
+                                                TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <ToggleSwitch
+                                            x:Name="OpenCodeGoEnabledToggle"
+                                            Grid.Column="2"
+                                            MinWidth="0"
+                                            AutomationProperties.Name="OpenCode Go enabled"
                                             OffContent=""
                                             OnContent=""
                                             VerticalAlignment="Center" />
@@ -819,6 +850,56 @@
                                                 Content="Save"
                                                 Style="{StaticResource AccentButtonStyle}" />
                                             <Button x:Name="ClearCursorButton" Content="Clear" />
+                                        </StackPanel>
+                                    </StackPanel>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Style="{StaticResource GroupHeaderStyle}" Text="OpenCode Go" />
+                            <TextBlock
+                                Style="{StaticResource GroupDescriptionStyle}"
+                                Text="Paste only the auth cookie value from opencode.ai. It is stored encrypted for your Windows account (DPAPI). The workspace is discovered automatically." />
+
+                            <Border Style="{StaticResource GroupCardStyle}">
+                                <StackPanel>
+                                    <Grid Style="{StaticResource SettingRowStyle}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <Border
+                                            x:Name="OpenCodeGoAccountMark"
+                                            Width="16"
+                                            Height="16"
+                                            VerticalAlignment="Center" />
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock Text="Dashboard session" />
+                                            <TextBlock
+                                                x:Name="OpenCodeGoSavedText"
+                                                Style="{StaticResource SecondaryCaptionStyle}"
+                                                TextWrapping="Wrap" />
+                                        </StackPanel>
+                                    </Grid>
+
+                                    <StackPanel Padding="12,0,12,12" Spacing="10">
+                                        <PasswordBox
+                                            x:Name="OpenCodeGoCookieBox"
+                                            AutomationProperties.Name="OpenCode Go session value"
+                                            PasswordRevealMode="Peek"
+                                            PlaceholderText="Paste session value" />
+                                        <TextBox
+                                            x:Name="OpenCodeGoWorkspaceBox"
+                                            AutomationProperties.Name="OpenCode Go workspace ID"
+                                            Header="Workspace ID (optional)"
+                                            PlaceholderText="wrk_… — leave blank for automatic discovery" />
+                                        <StackPanel Orientation="Horizontal" Spacing="8">
+                                            <Button
+                                                x:Name="SaveOpenCodeGoButton"
+                                                Content="Save"
+                                                Style="{StaticResource AccentButtonStyle}" />
+                                            <Button x:Name="ClearOpenCodeGoButton" Content="Clear session" />
                                         </StackPanel>
                                     </StackPanel>
                                 </StackPanel>

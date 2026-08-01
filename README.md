@@ -2,7 +2,7 @@
 
 A small Windows tray app for checking AI coding assistant usage limits without opening a terminal.
 
-CodexBarWindows stays in the system tray. Left-click the tray icon to open a compact popup near the taskbar with tabs for Codex, Claude, and Cursor usage limits, including percentage used, remaining allowance, reset time, and Codex history charts.
+CodexBarWindows stays in the system tray. Left-click the tray icon to open a compact popup near the taskbar with tabs for Codex, Claude, Cursor, and OpenCode Go usage limits, including percentage used, remaining allowance, reset time, and Codex history charts.
 
 ![CodexBarWindows Codex history preview](docs/codexbarwindows-history-preview.png)
 
@@ -16,6 +16,7 @@ CodexBarWindows stays in the system tray. Left-click the tray icon to open a com
 - Shows Codex local history charts for estimated 30 day spend and model usage breakdowns from session logs.
 - Displays 5 hour and weekly usage windows for Claude Code, plus the Fable 5 limit when Anthropic provides it.
 - Displays Cursor Total, Auto, and API usage from cursor.com when a Cursor Cookie header is configured.
+- Displays OpenCode Go rolling, weekly, and monthly quota windows when available from opencode.ai.
 - Follows the Windows light/dark system theme.
 - Draggable popup.
 - Tray context menu for settings, manual update checks, and exit.
@@ -31,6 +32,7 @@ CodexBarWindows stays in the system tray. Left-click the tray icon to open a com
 - Optional additional Codex CLI binaries or wrapper scripts for other authenticated accounts.
 - Claude Code installed and authenticated for Claude limits.
 - A Cursor Cookie header from a signed-in cursor.com browser session for Cursor limits.
+- The `auth` cookie value from a signed-in OpenCode Go browser session for OpenCode Go limits.
 
 The installer publishes a self-contained Windows build, so the installed app does not require a separate .NET runtime.
 
@@ -128,6 +130,7 @@ CodexBar.Core/App/        App settings, version info, single-instance guard
 CodexBar.Core/Claude/     Claude Code OAuth usage reading
 CodexBar.Core/Codex/      Codex CLI/RPC usage reading
 CodexBar.Core/Cursor/     Cursor usage reading
+CodexBar.Core/OpenCodeGo/ OpenCode Go usage reading and encrypted session settings
 CodexBar.Core/Usage/      Shared provider usage models
 CodexBar.Core/Updates/    GitHub Releases update checker
 CodexBar.WinUI/            WinUI 3 shell (in-progress rewrite, built side by side)
@@ -213,6 +216,8 @@ No Codex account token is stored by this app. Authentication remains managed by 
 For Claude, the app reads the local Claude Code OAuth credential file at `%USERPROFILE%\.claude\.credentials.json` and calls Anthropic's OAuth usage endpoint. Tokens are read from Claude Code's existing local auth state and refreshed in memory only; this app does not write credentials back to disk.
 
 For Cursor, the app calls cursor.com usage endpoints using a manually configured Cookie header. Paste the header in `Settings` → `Cursor`. The header is stored encrypted for the current Windows user. Stage 1 does not automatically import browser cookies, and Cursor does not currently have a local token/cost history chart.
+
+For OpenCode Go, the app reads the signed-in workspace dashboard at opencode.ai and extracts the rolling five-hour window plus the optional weekly and monthly windows. Paste only the `auth` cookie value in `Settings` → `OpenCode Go`; the app constructs the request cookie internally, and the optional `wrk_…` workspace field can be left blank for automatic discovery. The session value is stored with Windows DPAPI for the current user. An OpenCode API key can make model requests, but OpenCode does not publish a quota-reading API for these subscription windows, so it cannot replace the dashboard session here.
 
 ## Assets
 

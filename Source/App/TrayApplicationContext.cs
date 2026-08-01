@@ -4,6 +4,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 {
     private readonly ClaudeUsageReader claudeUsageReader = new();
     private readonly CursorUsageReader cursorUsageReader = new();
+    private readonly OpenCodeGoUsageReader openCodeGoUsageReader = new();
     private readonly GitHubReleaseUpdater releaseUpdater = new();
     private Icon trayIcon = TrayIconFactory.Create();
     // Program.Main primes FluentTheme.VibesActive before this context is built, so the tray
@@ -23,6 +24,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, CodexRateLimitStabilizer> codexStabilizers = [];
     private ProviderUsageLookupResult latestClaudeUsage = new(null, "Usage has not been loaded yet.");
     private ProviderUsageLookupResult latestCursorUsage = new(null, "Usage has not been loaded yet.");
+    private ProviderUsageLookupResult latestOpenCodeGoUsage = new(null, "Usage has not been loaded yet.");
     private CancellationTokenSource? refreshCancellation;
     private int refreshGeneration;
     private int updateCheckInProgress;
@@ -196,6 +198,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
         popup.UpdateUsage(UsagePopupForm.CursorProviderKey, latestCursorUsage);
+        popup.UpdateUsage(UsagePopupForm.OpenCodeGoProviderKey, latestOpenCodeGoUsage);
         popup.ShowNear(anchor);
 
         if (refresh)
@@ -298,7 +301,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                         popup.UpdateUsage(pair.Key, merged);
                     }
 
-                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage);
+                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage, latestOpenCodeGoUsage);
                 });
             }
 
@@ -327,7 +330,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 {
                     latestClaudeUsage = ProviderUsageLookupResult.KeepLastGood(latestClaudeUsage, claudeResult);
                     popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
-                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage);
+                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage, latestOpenCodeGoUsage);
                 });
             }
 
@@ -352,7 +355,26 @@ public sealed class TrayApplicationContext : ApplicationContext
                 {
                     latestCursorUsage = ProviderUsageLookupResult.KeepLastGood(latestCursorUsage, cursorResult);
                     popup.UpdateUsage(UsagePopupForm.CursorProviderKey, latestCursorUsage);
-                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage);
+                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage, latestOpenCodeGoUsage);
+                });
+            }
+
+            async Task RefreshOpenCodeGoLimitsAsync()
+            {
+                var openCodeGoResult = await openCodeGoUsageReader.ReadLatestAsync(cancellation.Token)
+                    .ConfigureAwait(false);
+                PostIfCurrent(() =>
+                {
+                    latestOpenCodeGoUsage = ProviderUsageLookupResult.KeepLastGood(
+                        latestOpenCodeGoUsage,
+                        openCodeGoResult);
+                    popup.UpdateUsage(UsagePopupForm.OpenCodeGoProviderKey, latestOpenCodeGoUsage);
+                    notifyIcon.Text = BuildTooltip(
+                        codexCliEntries,
+                        latestCodexUsage,
+                        latestClaudeUsage,
+                        latestCursorUsage,
+                        latestOpenCodeGoUsage);
                 });
             }
 
@@ -373,6 +395,11 @@ public sealed class TrayApplicationContext : ApplicationContext
             if (settings.CursorEnabled)
             {
                 refreshTasks.Add(RefreshCursorLimitsAsync());
+            }
+
+            if (settings.OpenCodeGoEnabled)
+            {
+                refreshTasks.Add(RefreshOpenCodeGoLimitsAsync());
             }
 
             if (includeHistory)
@@ -423,7 +450,16 @@ public sealed class TrayApplicationContext : ApplicationContext
                         latestCursorUsage,
                         new ProviderUsageLookupResult(null, message));
                     popup.UpdateUsage(UsagePopupForm.CursorProviderKey, latestCursorUsage);
-                    notifyIcon.Text = BuildTooltip(codexCliEntries, latestCodexUsage, latestClaudeUsage, latestCursorUsage);
+                    latestOpenCodeGoUsage = ProviderUsageLookupResult.KeepLastGood(
+                        latestOpenCodeGoUsage,
+                        new ProviderUsageLookupResult(null, message));
+                    popup.UpdateUsage(UsagePopupForm.OpenCodeGoProviderKey, latestOpenCodeGoUsage);
+                    notifyIcon.Text = BuildTooltip(
+                        codexCliEntries,
+                        latestCodexUsage,
+                        latestClaudeUsage,
+                        latestCursorUsage,
+                        latestOpenCodeGoUsage);
                 });
             }
             finally
@@ -518,6 +554,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         settingsForm = new SettingsForm();
         settingsForm.CodexCliEntriesChanged += (_, _) => ReloadCodexCliEntries();
         settingsForm.CursorSettingsChanged += (_, _) => BeginRefresh(showLoading: true);
+        settingsForm.OpenCodeGoSettingsChanged += (_, _) => BeginRefresh(showLoading: true);
         settingsForm.FormClosed += (_, _) => settingsForm = null;
         // See the graphs window: re-arm the popup's dismissal check when focus leaves here.
         settingsForm.Deactivate += (_, _) => popup.HideIfFocusLeftProcess();
@@ -672,6 +709,11 @@ public sealed class TrayApplicationContext : ApplicationContext
             return latestCursorUsage;
         }
 
+        if (providerKey == UsagePopupForm.OpenCodeGoProviderKey)
+        {
+            return latestOpenCodeGoUsage;
+        }
+
         return latestCodexUsage.TryGetValue(providerKey, out var result)
             ? result
             : new ProviderUsageLookupResult(null, "Usage has not been loaded yet.");
@@ -733,6 +775,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         latestHistory.TryAdd(UsagePopupForm.ClaudeProviderKey, new ProviderUsageInsightsLookupResult(null, "Usage history has not been loaded yet."));
         popup.UpdateUsage(UsagePopupForm.ClaudeProviderKey, latestClaudeUsage);
         popup.UpdateUsage(UsagePopupForm.CursorProviderKey, latestCursorUsage);
+        popup.UpdateUsage(UsagePopupForm.OpenCodeGoProviderKey, latestOpenCodeGoUsage);
 
         if (graphsForm is { IsDisposed: false } activeGraphs)
         {
@@ -747,32 +790,15 @@ public sealed class TrayApplicationContext : ApplicationContext
         IReadOnlyList<CodexCliEntry> codexEntries,
         IReadOnlyDictionary<string, ProviderUsageLookupResult> codexUsage,
         ProviderUsageLookupResult claudeUsage,
-        ProviderUsageLookupResult cursorUsage)
+        ProviderUsageLookupResult cursorUsage,
+        ProviderUsageLookupResult openCodeGoUsage)
     {
-        if (codexUsage.Values.All(result => result.Snapshot is null) && claudeUsage.Snapshot is null && cursorUsage.Snapshot is null)
-        {
-            return TrimTooltip("CodexBarWindows: no usage data found");
-        }
-
-        var codexText = string.Join(
-            ", ",
-            codexEntries.Take(2).Select(entry =>
-            {
-                var result = codexUsage.TryGetValue(UsagePopupForm.CodexProviderKey(entry.Id), out var value)
-                    ? value
-                    : null;
-                return result?.Snapshot is { } snapshot
-                    ? $"{entry.Name} {snapshot.Primary.UsedPercent:0.#}% {ShortWindow(snapshot.Primary.WindowMinutes)}"
-                    : $"{entry.Name} --";
-            }));
-        var claudeText = claudeUsage.Snapshot is { } claude
-            ? $"Claude {claude.Primary.UsedPercent:0.#}% {ShortWindow(claude.Primary.WindowMinutes)}"
-            : "Claude --";
-        var cursorText = cursorUsage.Snapshot is { } cursor
-            ? $"Cursor {cursor.Primary.UsedPercent:0.#}%"
-            : "Cursor --";
-
-        return TrimTooltip($"{codexText}, {claudeText}, {cursorText}");
+        return UsageTooltip.Build(
+            codexEntries,
+            codexUsage,
+            claudeUsage,
+            cursorUsage,
+            UiSettings.Load().OpenCodeGoEnabled ? openCodeGoUsage : null);
     }
 
     /// <summary>
@@ -780,10 +806,5 @@ public sealed class TrayApplicationContext : ApplicationContext
     /// CodexBar.Core so the WinUI shell builds the identical tray tooltip.
     /// </summary>
     internal static string ShortWindow(int windowMinutes) => UsageTooltip.ShortWindow(windowMinutes);
-
-    private static string TrimTooltip(string value)
-    {
-        return value.Length <= 63 ? value : value[..63];
-    }
 
 }

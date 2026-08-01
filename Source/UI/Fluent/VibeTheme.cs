@@ -68,7 +68,7 @@ public static class VibeTheme
         Color.FromArgb(0xFF, 0xFF, 0x8A, 0x3C),
         Color.FromArgb(0xFF, 0xFF, 0x4E, 0x6A));
 
-    /// <summary>The signature magenta -> violet -> blue sweep (Cursor and fallback).</summary>
+    /// <summary>The signature magenta -> violet -> blue sweep (Cursor, OpenCode Go, and fallback).</summary>
     public static readonly ProviderVibe SignatureVibe = new(Accent, GradientStart, GradientMid, GradientEnd);
 
     /// <summary>Resolves the provider-identity palette from a provider key.</summary>
@@ -84,7 +84,10 @@ public static class VibeTheme
             return ClaudeVibe;
         }
 
-        return providerKey.Contains("cursor", StringComparison.OrdinalIgnoreCase) ? SignatureVibe : CodexVibe;
+        return providerKey.Contains("cursor", StringComparison.OrdinalIgnoreCase) ||
+            providerKey.Contains("opencode", StringComparison.OrdinalIgnoreCase)
+                ? SignatureVibe
+                : CodexVibe;
     }
 
     /// <summary>Linear RGB interpolation preserving full opacity.</summary>
@@ -207,7 +210,7 @@ public static class VibeTheme
 
 /// <summary>
 /// One provider's vibe identity: an accent for chrome (tabs, pickers, hairlines) and a
-/// three-stop gradient sweep for fills. Codex is blue-green, Claude is orange, Cursor keeps
+/// three-stop gradient sweep for fills. Codex is blue-green, Claude is orange, Cursor and OpenCode Go keep
 /// the signature violet.
 /// </summary>
 public sealed record ProviderVibe(Color Accent, Color GradientStart, Color GradientMid, Color GradientEnd);

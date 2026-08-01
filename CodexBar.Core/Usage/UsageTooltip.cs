@@ -26,11 +26,13 @@ public static class UsageTooltip
         IReadOnlyList<CodexCliEntry> codexEntries,
         IReadOnlyDictionary<string, ProviderUsageLookupResult> codexUsage,
         ProviderUsageLookupResult claudeUsage,
-        ProviderUsageLookupResult cursorUsage)
+        ProviderUsageLookupResult cursorUsage,
+        ProviderUsageLookupResult? openCodeGoUsage)
     {
         if (codexUsage.Values.All(result => result.Snapshot is null) &&
             claudeUsage.Snapshot is null &&
-            cursorUsage.Snapshot is null)
+            cursorUsage.Snapshot is null &&
+            openCodeGoUsage?.Snapshot is null)
         {
             return Trim("CodexBarWindows: no usage data found");
         }
@@ -52,8 +54,13 @@ public static class UsageTooltip
         var cursorText = cursorUsage.Snapshot is { } cursor
             ? $"Cursor {cursor.Primary.UsedPercent:0.#}%"
             : "Cursor --";
+        var openCodeGoText = openCodeGoUsage?.Snapshot is { } openCodeGo
+            ? $", Go {openCodeGo.Primary.UsedPercent:0.#}% {ShortWindow(openCodeGo.Primary.WindowMinutes)}"
+            : openCodeGoUsage is null
+                ? string.Empty
+                : ", Go --";
 
-        return Trim($"{codexText}, {claudeText}, {cursorText}");
+        return Trim($"{codexText}, {claudeText}, {cursorText}{openCodeGoText}");
     }
 
     private static string Trim(string value) => value.Length <= MaxLength ? value : value[..MaxLength];
