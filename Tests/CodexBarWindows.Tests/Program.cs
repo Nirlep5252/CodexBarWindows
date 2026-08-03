@@ -151,6 +151,8 @@ var tests = new (string Name, Action Run)[]
     ("Grok billing maps weekly credit percent", GrokBillingMapsWeeklyCreditPercent),
     ("Grok billing maps on-demand when cap is set", GrokBillingMapsOnDemandWhenCapIsSet),
     ("Grok billing accepts wrapped config payloads", GrokBillingAcceptsWrappedConfigPayloads),
+    ("Grok billing maps monthly used/limit percent", GrokBillingMapsMonthlyUsedLimitPercent),
+    ("Grok credits view without usage is unmappable", GrokBillingCreditsViewWithoutUsageThrows),
     ("Grok history aggregates turn_completed usage", GrokHistoryAggregatesTurnCompletedUsage),
     ("Grok history excludes rows outside the 30-day report", GrokHistoryExcludesRowsOutsideReport),
     ("Grok history prefers stamped cost ticks", GrokHistoryPrefersStampedCostTicks),
@@ -1402,6 +1404,63 @@ static void GrokBillingAcceptsWrappedConfigPayloads()
     var snapshot = GrokUsageReader.MapUsage(billing);
     AssertClose(5m, (decimal)snapshot.Primary.UsedPercent, "wrapped credit percent");
     AssertEqual("SuperGrok Heavy", snapshot.PlanType!, "subscription tier from wrapper root");
+}
+
+// The plain /v1/billing endpoint (no ?format=credits) that the reader falls back to on
+// monthly-limit / unified-billing accounts. It carries no creditUsagePercent - only used and
+// monthlyLimit - and MapUsage must derive the percentage from those. This is the exact payload
+// shape that produced "Grok billing response did not include credit usage" before the fallback.
+static void GrokBillingMapsMonthlyUsedLimitPercent()
+{
+    var billing = GrokUsageReader.ParseBillingResponse("""
+        {
+          "config": {
+            "monthlyLimit": { "val": 15000 },
+            "used": { "val": 1391 },
+            "onDemandCap": { "val": 0 },
+            "billingPeriodStart": "2026-08-01T00:00:00+00:00",
+            "billingPeriodEnd": "2026-09-01T00:00:00+00:00"
+          }
+        }
+        """);
+
+    var snapshot = GrokUsageReader.MapUsage(billing);
+    AssertClose(9.273333m, (decimal)snapshot.Primary.UsedPercent, "monthly used/limit percent");
+    Assert(snapshot.Secondary is null, "on-demand should be omitted when cap is zero");
+}
+
+// The ?format=credits view returns period and on-demand data but no usage figure on those same
+// accounts. MapUsage cannot produce a percentage from it, which is why the reader retries the
+// plain endpoint; asserting the throw documents the trigger the fallback exists for.
+static void GrokBillingCreditsViewWithoutUsageThrows()
+{
+    var billing = GrokUsageReader.ParseBillingResponse("""
+        {
+          "config": {
+            "currentPeriod": {
+              "type": "USAGE_PERIOD_TYPE_WEEKLY",
+              "start": "2026-08-02T04:07:16.204303+00:00",
+              "end": "2026-08-09T04:07:16.204303+00:00"
+            },
+            "onDemandCap": { "val": 0 },
+            "onDemandUsed": { "val": 0 },
+            "prepaidBalance": { "val": 0 },
+            "isUnifiedBillingUser": true
+          }
+        }
+        """);
+
+    var threw = false;
+    try
+    {
+        GrokUsageReader.MapUsage(billing);
+    }
+    catch (InvalidOperationException)
+    {
+        threw = true;
+    }
+
+    Assert(threw, "credits view without usage should be unmappable");
 }
 
 static void GrokHistoryAggregatesTurnCompletedUsage()

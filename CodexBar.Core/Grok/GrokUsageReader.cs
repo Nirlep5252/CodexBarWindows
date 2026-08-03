@@ -11,7 +11,7 @@ namespace CodexBarWindows;
 /// </summary>
 public sealed class GrokUsageReader
 {
-    private const string DefaultBillingEndpoint = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+    private const string DefaultBillingBaseEndpoint = "https://cli-chat-proxy.grok.com/v1/billing";
     private const string ClientAuthHeaderValue = "xai-grok-cli";
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
     private readonly string authPath;
@@ -218,15 +218,73 @@ public sealed class GrokUsageReader
         GrokSessionCredentials credentials,
         CancellationToken cancellationToken)
     {
-        var endpoint = billingEndpointOverride;
-        if (string.IsNullOrWhiteSpace(endpoint))
+        var (creditsEndpoint, plainEndpoint) = ResolveBillingEndpoints();
+
+        var billing = await FetchBillingFromAsync(httpClient, credentials, creditsEndpoint, cancellationToken)
+            .ConfigureAwait(false);
+        if (HasUsableUsage(billing))
         {
-            var baseUrl = Environment.GetEnvironmentVariable("GROK_CLI_CHAT_PROXY_BASE_URL");
-            endpoint = !string.IsNullOrWhiteSpace(baseUrl)
-                ? $"{baseUrl.TrimEnd('/')}/billing?format=credits"
-                : DefaultBillingEndpoint;
+            return billing;
         }
 
+        // The `format=credits` view carries `creditUsagePercent` for credit-based plans, but on
+        // monthly-limit / unified-billing accounts it returns only period and on-demand data with
+        // no usage figure at all. The plain billing endpoint carries `used`/`monthlyLimit` there,
+        // which MapUsage turns into a percentage - so fall back to it before giving up.
+        if (!string.Equals(plainEndpoint, creditsEndpoint, StringComparison.Ordinal))
+        {
+            var plain = await FetchBillingFromAsync(httpClient, credentials, plainEndpoint, cancellationToken)
+                .ConfigureAwait(false);
+            if (HasUsableUsage(plain))
+            {
+                return plain;
+            }
+        }
+
+        // Neither view had usage; return the credits response so MapUsage throws the usual message.
+        return billing;
+    }
+
+    /// <summary>
+    /// The credits view provides a usage percentage only for credit-based plans; monthly-limit
+    /// accounts express usage as <c>used</c>/<c>monthlyLimit</c> on the plain endpoint instead.
+    /// Mirrors the two paths MapUsage can derive a percentage from.
+    /// </summary>
+    private static bool HasUsableUsage(BillingCreditsResponse billing)
+        => billing.CreditUsagePercent is not null ||
+           (billing.Used is not null && billing.MonthlyLimit is { } limit && limit > 0);
+
+    private (string Credits, string Plain) ResolveBillingEndpoints()
+    {
+        string baseUrl;
+        if (!string.IsNullOrWhiteSpace(billingEndpointOverride))
+        {
+            baseUrl = billingEndpointOverride;
+        }
+        else
+        {
+            var proxyBase = Environment.GetEnvironmentVariable("GROK_CLI_CHAT_PROXY_BASE_URL");
+            baseUrl = !string.IsNullOrWhiteSpace(proxyBase)
+                ? $"{proxyBase.TrimEnd('/')}/billing"
+                : DefaultBillingBaseEndpoint;
+        }
+
+        var plain = StripQuery(baseUrl);
+        return ($"{plain}?format=credits", plain);
+    }
+
+    private static string StripQuery(string url)
+    {
+        var index = url.IndexOf('?');
+        return index >= 0 ? url[..index] : url;
+    }
+
+    private async Task<BillingCreditsResponse> FetchBillingFromAsync(
+        HttpClient httpClient,
+        GrokSessionCredentials credentials,
+        string endpoint,
+        CancellationToken cancellationToken)
+    {
         using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", credentials.AccessToken);
         request.Headers.TryAddWithoutValidation("X-XAI-Token-Auth", ClientAuthHeaderValue);
