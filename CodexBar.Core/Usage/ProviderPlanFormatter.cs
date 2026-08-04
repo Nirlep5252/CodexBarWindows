@@ -50,16 +50,38 @@ internal static class ProviderPlanFormatter
             }
         }
 
-        // Grok's tiers arrive already cased as brands ("SuperGrok", "SuperGrok Heavy"). ToTitleCase
-        // lowercases everything after the first letter, which turned those into "Supergrok heavy".
-        // Anything carrying an interior capital is a name, not a slug, so it is passed through.
-        if (provider == UsageProvider.Grok && value.Skip(1).Any(char.IsUpper))
+        if (provider == UsageProvider.Grok)
         {
-            return value;
+            // Grok states the tier either as a brand ("SuperGrok Heavy", from the billing API) or as
+            // a slug ("supergrok_heavy", from auth.json / the token's tier claim). Brands are passed
+            // through - ToTitleCase would flatten them to "Supergrok heavy" - and slugs are mapped
+            // to the same brand casing so both sources render identically.
+            if (GrokTierNames.TryGetValue(value, out var tierName))
+            {
+                return tierName;
+            }
+
+            if (value.Skip(1).Any(char.IsUpper))
+            {
+                return value;
+            }
         }
 
         return ToTitleCase(value.Replace('_', ' ').Replace('-', ' '));
     }
+
+    /// <summary>xAI subscription slugs, cased the way the plans are marketed.</summary>
+    private static readonly Dictionary<string, string> GrokTierNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["supergrok"] = "SuperGrok",
+        ["supergrok_lite"] = "SuperGrok Lite",
+        ["supergrok_plus"] = "SuperGrok Plus",
+        ["supergrok_heavy"] = "SuperGrok Heavy",
+        ["x_basic"] = "X Basic",
+        ["x_premium"] = "X Premium",
+        ["x_premium_plus"] = "X Premium+",
+        ["free"] = "Free"
+    };
 
     private static string? ExtractMultiplier(string? value)
     {

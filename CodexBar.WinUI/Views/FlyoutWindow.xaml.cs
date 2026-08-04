@@ -122,6 +122,7 @@ public sealed partial class FlyoutWindow : Window
         service.RefreshingChanged += OnRefreshingChanged;
         service.ResetCreditStateChanged += OnResetCreditStateChanged;
         service.CodexEntriesChanged += ConfigureProviders;
+        service.GrokEntriesChanged += ConfigureProviders;
 
         ConfigureProviders();
 
@@ -232,6 +233,7 @@ public sealed partial class FlyoutWindow : Window
         service.RefreshingChanged -= OnRefreshingChanged;
         service.ResetCreditStateChanged -= OnResetCreditStateChanged;
         service.CodexEntriesChanged -= ConfigureProviders;
+        service.GrokEntriesChanged -= ConfigureProviders;
         service.SetWindowOpen(WindowId, false);
         Close();
     }
@@ -272,7 +274,8 @@ public sealed partial class FlyoutWindow : Window
         var descriptors = service.CodexEntries
             .Select(entry => new ProviderDescriptor(ProviderKeys.Codex(entry.Id), entry.Name, UsageProvider.Codex))
             .Append(new ProviderDescriptor(ProviderKeys.Claude, "Claude", UsageProvider.Claude))
-            .Append(new ProviderDescriptor(ProviderKeys.Grok, "Grok", UsageProvider.Grok))
+            .Concat(service.GrokEntries.Select(entry =>
+                new ProviderDescriptor(ProviderKeys.Grok(entry.Id), entry.Name, UsageProvider.Grok)))
             .Append(new ProviderDescriptor(ProviderKeys.Cursor, "Cursor", UsageProvider.Cursor))
             .Append(new ProviderDescriptor(ProviderKeys.OpenCodeGo, "OpenCode Go", UsageProvider.OpenCodeGo))
             .Where(descriptor => settings.IsProviderEnabled(descriptor.Provider))

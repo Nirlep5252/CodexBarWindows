@@ -26,14 +26,15 @@ public static class UsageTooltip
         IReadOnlyList<CodexCliEntry> codexEntries,
         IReadOnlyDictionary<string, ProviderUsageLookupResult> codexUsage,
         ProviderUsageLookupResult claudeUsage,
-        ProviderUsageLookupResult grokUsage,
+        IReadOnlyList<GrokAccountEntry> grokEntries,
+        IReadOnlyDictionary<string, ProviderUsageLookupResult> grokUsage,
         ProviderUsageLookupResult cursorUsage,
         ProviderUsageLookupResult openCodeGoUsage,
         UiSettings settings)
     {
         if (codexUsage.Values.All(result => result.Snapshot is null) &&
             claudeUsage.Snapshot is null &&
-            grokUsage.Snapshot is null &&
+            grokUsage.Values.All(result => result.Snapshot is null) &&
             cursorUsage.Snapshot is null &&
             openCodeGoUsage.Snapshot is null)
         {
@@ -68,9 +69,17 @@ public static class UsageTooltip
 
         if (settings.GrokEnabled)
         {
-            segments.Add(grokUsage.Snapshot is { } grok
-                ? $"Grok {grok.Primary.UsedPercent:0.#}% {ShortWindow(grok.Primary.WindowMinutes)}"
-                : "Grok --");
+            // Capped at two accounts for the same reason as Codex: the whole string is 63
+            // characters, and an unbounded account list would push the providers after it out.
+            segments.AddRange(grokEntries.Take(2).Select(entry =>
+            {
+                var result = grokUsage.TryGetValue(ProviderKeys.Grok(entry.Id), out var value)
+                    ? value
+                    : null;
+                return result?.Snapshot is { } snapshot
+                    ? $"{entry.Name} {snapshot.Primary.UsedPercent:0.#}% {ShortWindow(snapshot.Primary.WindowMinutes)}"
+                    : $"{entry.Name} --";
+            }));
         }
 
         if (settings.CursorEnabled)

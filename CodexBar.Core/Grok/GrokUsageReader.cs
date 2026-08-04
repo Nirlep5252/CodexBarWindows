@@ -162,9 +162,71 @@ public sealed class GrokUsageReader
             ReadString(entry, "user_id") ?? ReadString(entry, "userId") ?? ReadString(entry, "principal_id"),
             ReadString(entry, "oidc_issuer") ?? ReadString(entry, "oidcIssuer") ?? "https://auth.x.ai",
             ReadString(entry, "oidc_client_id") ?? ReadString(entry, "oidcClientId"),
-            ReadString(entry, "subscription_tier") ?? ReadString(entry, "subscriptionTier"));
+            ReadString(entry, "subscription_tier")
+                ?? ReadString(entry, "subscriptionTier")
+                ?? TierSlugFromAccessToken(accessToken));
         return true;
     }
+
+    /// <summary>
+    /// Recovers the subscription slug from the numeric <c>tier</c> claim on the access token.
+    /// The billing endpoint omits <c>subscriptionTier</c> entirely on unified-billing accounts, and
+    /// only some Grok CLI builds write <c>subscription_tier</c> into auth.json during login
+    /// enrichment - on the rest the JWT is the only place the plan is stated at all.
+    /// </summary>
+    internal static string? TierSlugFromAccessToken(string accessToken)
+    {
+        try
+        {
+            var parts = accessToken.Split('.');
+            if (parts.Length < 2)
+            {
+                return null;
+            }
+
+            using var document = JsonDocument.Parse(DecodeBase64Url(parts[1]));
+            if (document.RootElement.ValueKind != JsonValueKind.Object ||
+                !document.RootElement.TryGetProperty("tier", out var tier) ||
+                tier.ValueKind != JsonValueKind.Number ||
+                !tier.TryGetInt32(out var value))
+            {
+                return null;
+            }
+
+            return TierClaimSlugs.GetValueOrDefault(value);
+        }
+        catch
+        {
+            // Opaque or non-JWT tokens simply carry no tier.
+            return null;
+        }
+    }
+
+    private static byte[] DecodeBase64Url(string value)
+    {
+        var padded = value.Replace('-', '+').Replace('_', '/');
+        return Convert.FromBase64String(padded.PadRight(padded.Length + ((4 - (padded.Length % 4)) % 4), '='));
+    }
+
+    /// <summary>
+    /// The <c>tier</c> claim is a plan ordinal, ascending from the cheapest. Derived from the slug
+    /// list the Grok CLI itself carries (<c>supergrok_heavy, supergrok_plus, supergrok,
+    /// supergrok_lite, x_premium_plus, x_premium, x_basic, free, api</c>, highest first) read in
+    /// reverse, and anchored on an observed account: a SuperGrok Plus session carries <c>tier: 7</c>.
+    /// Values outside the table are left unmapped on purpose - showing no plan beats naming the
+    /// wrong one.
+    /// </summary>
+    private static readonly Dictionary<int, string> TierClaimSlugs = new()
+    {
+        [1] = "free",
+        [2] = "x_basic",
+        [3] = "x_premium",
+        [4] = "x_premium_plus",
+        [5] = "supergrok_lite",
+        [6] = "supergrok",
+        [7] = "supergrok_plus",
+        [8] = "supergrok_heavy"
+    };
 
     private static async Task<GrokSessionCredentials> RefreshCredentialsAsync(
         GrokSessionCredentials credentials,
@@ -209,7 +271,9 @@ public sealed class GrokUsageReader
             RefreshToken = string.IsNullOrWhiteSpace(token.RefreshToken) ? credentials.RefreshToken : token.RefreshToken,
             // A refreshed token always has a known lifetime, whatever the entry on disk looked like.
             HasExpiry = true,
-            ExpiresAt = DateTimeOffset.UtcNow.AddSeconds(Math.Max(60, token.ExpiresIn))
+            ExpiresAt = DateTimeOffset.UtcNow.AddSeconds(Math.Max(60, token.ExpiresIn)),
+            // The new token restates the tier, so an upgrade lands without waiting for a re-login.
+            SubscriptionTier = TierSlugFromAccessToken(token.AccessToken) ?? credentials.SubscriptionTier
         };
     }
 

@@ -552,7 +552,8 @@ public sealed partial class GraphsWindow : Window
 
         if (settings.IsProviderEnabled(UsageProvider.Grok))
         {
-            options.Add(new ProviderOption(ProviderKeys.Grok, "Grok"));
+            options.AddRange(service.GrokEntries.Select(
+                entry => new ProviderOption(ProviderKeys.Grok(entry.Id), entry.Name)));
         }
 
         if (options.Count == 0)

@@ -15,7 +15,8 @@ CodexBarWindows stays in the system tray. Left-click the tray icon to open a com
 - Shows banked Codex reset credits with their expiry, and can redeem one per account when a usage window is nearly exhausted.
 - Shows Codex local history charts for estimated 30 day spend and model usage breakdowns from session logs.
 - Displays 5 hour and weekly usage windows for Claude Code, plus the Fable 5 limit when Anthropic provides it.
-- Displays Grok weekly credits, optional on-demand spend, and 30-day local history from Grok CLI sessions.
+- Displays Grok weekly credits, the subscription tier (SuperGrok / Plus / Heavy), optional on-demand spend, and 30-day local history from Grok CLI sessions.
+- Supports multiple Grok accounts, each pointed at its own Grok home folder, with a card per account.
 - Displays Cursor Total, Auto, and API usage from cursor.com when a Cursor Cookie header is configured.
 - Displays OpenCode Go rolling, weekly, and monthly quota windows when available from opencode.ai.
 - Follows the Windows light/dark system theme.
@@ -218,7 +219,9 @@ No Codex account token is stored by this app. Authentication remains managed by 
 
 For Claude, the app reads the local Claude Code OAuth credential file at `%USERPROFILE%\.claude\.credentials.json` and calls Anthropic's OAuth usage endpoint. Tokens are read from Claude Code's existing local auth state and refreshed in memory only; this app does not write credentials back to disk.
 
-For Grok, the app reads the local Grok CLI session file at `%USERPROFILE%\.grok\auth.json` (or `%GROK_HOME%\auth.json`) and calls the cli-chat-proxy billing endpoint used by Grok's `/usage` command. Tokens are refreshed in memory only; this app does not write credentials back to disk. Grok history charts are local estimates from `%USERPROFILE%\.grok\sessions` turn ledgers (`updates.jsonl`), preferring server-stamped `costUsdTicks` when present and falling back to published rates otherwise.
+For Grok, the app reads the local Grok CLI session file at `%USERPROFILE%\.grok\auth.json` (or `%GROK_HOME%\auth.json`) and calls the cli-chat-proxy billing endpoint used by Grok's `/usage` command. Tokens are refreshed in memory only; this app does not write credentials back to disk. The plan shown on the card comes from the billing response's `subscriptionTier` when present, then `subscription_tier` in `auth.json`, and finally the `tier` claim on the access token — the billing API omits the tier entirely on unified-billing accounts.
+
+Extra Grok accounts are configured in the WinUI shell under `Settings` → `Accounts` → `Grok accounts`, each pointing at its own Grok home folder (the folder holding `auth.json` and `sessions`). Sign one in with `$env:GROK_HOME="$HOME\.grok2"; grok login` (PowerShell has no inline `VAR=value cmd` prefix, and `~` is not expanded inside the string). Each account gets its own flyout card, its own tray tooltip segment (first two accounts), and its own history charts. The WinForms shell still shows a single Grok card for the default home. Grok history charts are local estimates from `%USERPROFILE%\.grok\sessions` turn ledgers (`updates.jsonl`), preferring server-stamped `costUsdTicks` when present and falling back to published rates otherwise.
 
 Unlike Codex and Claude, Grok history is **limited to the last 30 days** and is not written to the usage ledger, so `Import history` does not cover it and Grok has no hourly breakdown or past-month view. Grok is scan-only until a ledger writer exists for it.
 

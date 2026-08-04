@@ -153,6 +153,10 @@ var tests = new (string Name, Action Run)[]
     ("Grok billing accepts wrapped config payloads", GrokBillingAcceptsWrappedConfigPayloads),
     ("Grok billing maps monthly used/limit percent", GrokBillingMapsMonthlyUsedLimitPercent),
     ("Grok credits view without usage is unmappable", GrokBillingCreditsViewWithoutUsageThrows),
+    ("Grok reads the plan from the token tier claim", GrokReadsPlanFromTokenTierClaim),
+    ("Grok plan slugs render as brand names", GrokPlanSlugsRenderAsBrandNames),
+    ("Grok accounts key and resolve per home folder", GrokAccountsKeyAndResolvePerHome),
+    ("Tooltip names every configured Grok account", TooltipNamesEveryGrokAccount),
     ("Grok history aggregates turn_completed usage", GrokHistoryAggregatesTurnCompletedUsage),
     ("Grok history excludes rows outside the 30-day report", GrokHistoryExcludesRowsOutsideReport),
     ("Grok history prefers stamped cost ticks", GrokHistoryPrefersStampedCostTicks),
@@ -1461,6 +1465,149 @@ static void GrokBillingCreditsViewWithoutUsageThrows()
     }
 
     Assert(threw, "credits view without usage should be unmappable");
+}
+
+// Unified-billing accounts get no subscriptionTier from the billing API and no subscription_tier in
+// auth.json, so the token's tier claim is the only statement of the plan. 7 is SuperGrok Plus.
+static void GrokReadsPlanFromTokenTierClaim()
+{
+    var billing = GrokUsageReader.ParseBillingResponse("""
+        {
+          "config": {
+            "creditUsagePercent": 79,
+            "currentPeriod": {
+              "type": "USAGE_PERIOD_TYPE_WEEKLY",
+              "start": "2026-08-02T17:17:50.027845+00:00",
+              "end": "2026-08-09T17:17:50.027845+00:00"
+            },
+            "onDemandCap": { "val": 0 },
+            "isUnifiedBillingUser": true
+          }
+        }
+        """);
+
+    AssertEqual("supergrok_plus", GrokUsageReader.TierSlugFromAccessToken(GrokAccessToken("""{"tier":7}"""))!, "tier 7");
+    AssertEqual("supergrok_heavy", GrokUsageReader.TierSlugFromAccessToken(GrokAccessToken("""{"tier":8}"""))!, "tier 8");
+    Assert(
+        GrokUsageReader.TierSlugFromAccessToken(GrokAccessToken("""{"tier":99}""")) is null,
+        "an unknown tier ordinal must not be guessed at");
+    Assert(
+        GrokUsageReader.TierSlugFromAccessToken("not-a-jwt") is null,
+        "an opaque token carries no tier");
+
+    var snapshot = GrokUsageReader.MapUsage(
+        billing,
+        new GrokUsageReader.GrokSessionCredentials(
+            GrokAccessToken("""{"tier":7}"""),
+            true,
+            null,
+            DateTimeOffset.UtcNow.AddHours(1),
+            "user@example.com",
+            "user-1",
+            "https://auth.x.ai",
+            "client",
+            GrokUsageReader.TierSlugFromAccessToken(GrokAccessToken("""{"tier":7}"""))));
+
+    AssertEqual("supergrok_plus", snapshot.PlanType!, "plan from the token claim");
+    AssertEqual("SuperGrok Plus", ProviderPlanFormatter.DisplayName(UsageProvider.Grok, snapshot.PlanType!), "displayed plan");
+}
+
+static void GrokPlanSlugsRenderAsBrandNames()
+{
+    AssertEqual("SuperGrok", ProviderPlanFormatter.DisplayName(UsageProvider.Grok, "supergrok"), "base tier slug");
+    AssertEqual("SuperGrok Plus", ProviderPlanFormatter.DisplayName(UsageProvider.Grok, "supergrok_plus"), "plus tier slug");
+    AssertEqual("SuperGrok Heavy", ProviderPlanFormatter.DisplayName(UsageProvider.Grok, "supergrok_heavy"), "heavy tier slug");
+    // The billing API states the brand directly; both spellings must land on one string.
+    AssertEqual("SuperGrok Heavy", ProviderPlanFormatter.DisplayName(UsageProvider.Grok, "SuperGrok Heavy"), "brand from billing");
+}
+
+static void GrokAccountsKeyAndResolvePerHome()
+{
+    Assert(ProviderKeys.IsGrok(ProviderKeys.Grok("default")), "a Grok key must be recognised as one");
+    Assert(!ProviderKeys.IsGrok(ProviderKeys.Codex("default")), "a Codex key is not a Grok key");
+    Assert(
+        ProviderKeys.ProviderOf(ProviderKeys.Grok("work")) == UsageProvider.Grok,
+        "an account-scoped Grok key routes to the Grok provider");
+    Assert(
+        ProviderKeys.ProviderOf(ProviderKeys.Codex("work")) == UsageProvider.Codex,
+        "Codex keys still route to Codex");
+    Assert(
+        ProviderKeys.ProviderOf(ProviderKeys.Claude) == UsageProvider.Claude,
+        "the singleton providers are unaffected");
+
+    var configured = new GrokAccountEntry("work", "Work", @"C:\grok-homes\work");
+    Assert(!configured.IsDefault, "an entry with a home folder is not the built-in one");
+    AssertEqual(@"C:\grok-homes\work", configured.ResolveHome(), "configured home");
+    AssertEqual(@"C:\grok-homes\work\auth.json", configured.ResolveAuthPath(), "configured auth path");
+    AssertEqual(@"C:\grok-homes\work\sessions", configured.ResolveSessionsPath(), "configured sessions path");
+
+    // The built-in entry follows GROK_HOME, exactly like the Grok CLI itself.
+    var previous = Environment.GetEnvironmentVariable("GROK_HOME");
+    try
+    {
+        Environment.SetEnvironmentVariable("GROK_HOME", @"C:\grok-homes\env");
+        var builtIn = new GrokAccountEntry(GrokAccountSettings.DefaultId, "Grok", null);
+        Assert(builtIn.IsDefault, "an entry without a home folder is the built-in one");
+        AssertEqual(@"C:\grok-homes\env\auth.json", builtIn.ResolveAuthPath(), "GROK_HOME auth path");
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable("GROK_HOME", previous);
+    }
+}
+
+// Two Grok accounts have to be two named segments, not one "Grok" line: the tooltip is the only
+// place the tray states both, and a shared label would make them indistinguishable.
+static void TooltipNamesEveryGrokAccount()
+{
+    var grokEntries = new[]
+    {
+        new GrokAccountEntry("default", "Grok", null),
+        new GrokAccountEntry("alt", "Grok alt", @"C:\grok-homes\alt")
+    };
+
+    var grokUsage = new Dictionary<string, ProviderUsageLookupResult>(StringComparer.Ordinal)
+    {
+        [ProviderKeys.Grok("default")] = new(GrokSnapshot(20), null),
+        [ProviderKeys.Grok("alt")] = new(GrokSnapshot(60), null)
+    };
+
+    var tooltip = UsageTooltip.Build(
+        [],
+        new Dictionary<string, ProviderUsageLookupResult>(StringComparer.Ordinal),
+        new ProviderUsageLookupResult(null, "not loaded"),
+        grokEntries,
+        grokUsage,
+        new ProviderUsageLookupResult(null, "not loaded"),
+        new ProviderUsageLookupResult(null, "not loaded"),
+        new UiSettings
+        {
+            CodexEnabled = false,
+            ClaudeEnabled = false,
+            GrokEnabled = true,
+            CursorEnabled = false,
+            OpenCodeGoEnabled = false
+        });
+
+    AssertEqual("Grok 20% 7d, Grok alt 60% 7d", tooltip, "both Grok accounts in the tooltip");
+}
+
+static ProviderUsageSnapshot GrokSnapshot(double usedPercent) => new(
+    UsageProvider.Grok,
+    DateTimeOffset.Now,
+    "supergrok_plus",
+    new ProviderUsageWindow("Weekly limit", usedPercent, 10080, null),
+    null,
+    "Grok CLI billing");
+
+/// <summary>Builds a JWT-shaped token whose payload is <paramref name="payloadJson"/>.</summary>
+static string GrokAccessToken(string payloadJson)
+{
+    var payload = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(payloadJson))
+        .TrimEnd('=')
+        .Replace('+', '-')
+        .Replace('/', '_');
+    return $"header.{payload}.signature";
 }
 
 static void GrokHistoryAggregatesTurnCompletedUsage()

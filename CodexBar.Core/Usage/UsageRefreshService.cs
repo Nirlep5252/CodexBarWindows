@@ -48,10 +48,17 @@ public sealed class UsageRefreshService : IDisposable
 
     private readonly Action<Action> post;
     private readonly ClaudeUsageReader claudeUsageReader = new();
-    private readonly GrokUsageReader grokUsageReader = new();
     private readonly CursorUsageReader cursorUsageReader = new();
     private readonly OpenCodeGoUsageReader openCodeGoUsageReader = new();
     private readonly Dictionary<string, ProviderUsageLookupResult> latestCodexUsage = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ProviderUsageLookupResult> latestGrokUsage = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// One reader per Grok account, kept ALIVE between refreshes: the reader caches the OAuth
+    /// session it refreshed in memory, and a fresh instance per poll would re-read (and re-refresh)
+    /// the token every minute. Replaced when an account's home directory changes.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, GrokUsageReader> grokReaders = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ProviderUsageInsightsLookupResult> latestHistory = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, CodexRateLimitStabilizer> codexStabilizers = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ResetCreditState> resetCreditStates = new(StringComparer.Ordinal);
@@ -59,7 +66,6 @@ public sealed class UsageRefreshService : IDisposable
     private readonly Timer refreshTimer;
 
     private ProviderUsageLookupResult latestClaudeUsage = NotLoaded;
-    private ProviderUsageLookupResult latestGrokUsage = NotLoaded;
     private ProviderUsageLookupResult latestCursorUsage = NotLoaded;
     private ProviderUsageLookupResult latestOpenCodeGoUsage = NotLoaded;
     private CancellationTokenSource? refreshCancellation;
@@ -90,14 +96,23 @@ public sealed class UsageRefreshService : IDisposable
             codexStabilizers[providerKey] = new CodexRateLimitStabilizer();
         }
 
+        GrokEntries = GrokAccountSettings.Load();
+        foreach (var entry in GrokEntries)
+        {
+            var providerKey = ProviderKeys.Grok(entry.Id);
+            latestGrokUsage[providerKey] = NotLoaded;
+            latestHistory[providerKey] = HistoryNotLoaded;
+        }
+
         latestHistory[ProviderKeys.Claude] = HistoryNotLoaded;
-        latestHistory[ProviderKeys.Grok] = HistoryNotLoaded;
 
         // Created stopped. Start/Stop is driven purely by SetWindowOpen.
         refreshTimer = new Timer(_ => post(() => BeginRefresh()), null, Timeout.Infinite, Timeout.Infinite);
     }
 
     public IReadOnlyList<CodexCliEntry> CodexEntries { get; private set; }
+
+    public IReadOnlyList<GrokAccountEntry> GrokEntries { get; private set; }
 
     /// <summary>Whether at least one refresh is currently running.</summary>
     public bool IsRefreshing => Volatile.Read(ref inFlightRefreshes) > 0;
@@ -126,6 +141,9 @@ public sealed class UsageRefreshService : IDisposable
     /// <summary>Raised on the UI thread after the configured Codex accounts are re-read.</summary>
     public event Action? CodexEntriesChanged;
 
+    /// <summary>Raised on the UI thread after the configured Grok accounts are re-read.</summary>
+    public event Action? GrokEntriesChanged;
+
     public ProviderUsageLookupResult GetUsage(string providerKey)
     {
         if (providerKey == ProviderKeys.Claude)
@@ -133,9 +151,9 @@ public sealed class UsageRefreshService : IDisposable
             return latestClaudeUsage;
         }
 
-        if (providerKey == ProviderKeys.Grok)
+        if (ProviderKeys.IsGrok(providerKey))
         {
-            return latestGrokUsage;
+            return latestGrokUsage.TryGetValue(providerKey, out var grok) ? grok : NotLoaded;
         }
 
         if (providerKey == ProviderKeys.Cursor)
@@ -162,6 +180,7 @@ public sealed class UsageRefreshService : IDisposable
             CodexEntries,
             latestCodexUsage,
             latestClaudeUsage,
+            GrokEntries,
             latestGrokUsage,
             latestCursorUsage,
             latestOpenCodeGoUsage,
@@ -312,9 +331,65 @@ public sealed class UsageRefreshService : IDisposable
         }
 
         UsageUpdated?.Invoke(ProviderKeys.Claude, latestClaudeUsage);
-        UsageUpdated?.Invoke(ProviderKeys.Grok, latestGrokUsage);
+        foreach (var pair in latestGrokUsage)
+        {
+            UsageUpdated?.Invoke(pair.Key, pair.Value);
+        }
+
         UsageUpdated?.Invoke(ProviderKeys.Cursor, latestCursorUsage);
         UsageUpdated?.Invoke(ProviderKeys.OpenCodeGo, latestOpenCodeGoUsage);
+        BeginRefresh();
+    }
+
+    /// <summary>
+    /// Re-reads the configured Grok accounts, keeping cached usage for accounts whose home
+    /// directory did not move and dropping state for accounts that disappeared.
+    /// </summary>
+    public void ReloadGrokEntries()
+    {
+        var previousHomes = GrokEntries.ToDictionary(
+            entry => ProviderKeys.Grok(entry.Id),
+            entry => entry.ResolveHome(),
+            StringComparer.Ordinal);
+
+        GrokEntries = GrokAccountSettings.Load();
+        var activeProviderKeys = GrokEntries
+            .Select(entry => ProviderKeys.Grok(entry.Id))
+            .ToHashSet(StringComparer.Ordinal);
+
+        foreach (var entry in GrokEntries)
+        {
+            var providerKey = ProviderKeys.Grok(entry.Id);
+            var homeChanged = previousHomes.TryGetValue(providerKey, out var previousHome) &&
+                !string.Equals(previousHome, entry.ResolveHome(), StringComparison.OrdinalIgnoreCase);
+            if (homeChanged)
+            {
+                // A different home is a different account: its numbers, and the cached OAuth
+                // session the reader is holding, both belong to the account that just left.
+                latestGrokUsage[providerKey] = NotLoaded;
+                grokReaders.TryRemove(providerKey, out _);
+            }
+            else
+            {
+                latestGrokUsage.TryAdd(providerKey, NotLoaded);
+            }
+
+            latestHistory.TryAdd(providerKey, HistoryNotLoaded);
+        }
+
+        foreach (var providerKey in latestGrokUsage.Keys.Where(key => !activeProviderKeys.Contains(key)).ToArray())
+        {
+            latestGrokUsage.Remove(providerKey);
+            latestHistory.Remove(providerKey);
+            grokReaders.TryRemove(providerKey, out _);
+        }
+
+        GrokEntriesChanged?.Invoke();
+        foreach (var pair in latestGrokUsage)
+        {
+            UsageUpdated?.Invoke(pair.Key, pair.Value);
+        }
+
         BeginRefresh();
     }
 
@@ -548,25 +623,76 @@ public sealed class UsageRefreshService : IDisposable
 
             async Task RefreshGrokLimitsAsync()
             {
-                var grokResult = await grokUsageReader.ReadLatestAsync(cancellation.Token).ConfigureAwait(false);
+                var entries = GrokEntries;
+                var grokTasks = entries
+                    .Select(async entry =>
+                    {
+                        var providerKey = ProviderKeys.Grok(entry.Id);
+                        try
+                        {
+                            var reader = grokReaders.GetOrAdd(
+                                providerKey,
+                                _ => new GrokUsageReader(entry.ResolveAuthPath()));
+                            var result = await reader.ReadLatestAsync(cancellation.Token).ConfigureAwait(false);
+                            return new KeyValuePair<string, ProviderUsageLookupResult>(providerKey, result);
+                        }
+                        catch (Exception exception) when (exception is not OperationCanceledException)
+                        {
+                            return new KeyValuePair<string, ProviderUsageLookupResult>(
+                                providerKey,
+                                new ProviderUsageLookupResult(
+                                    null,
+                                    $"Could not refresh {entry.Name} limits: {exception.Message}"));
+                        }
+                    })
+                    .ToArray();
+
+                // Grouped rather than ToDictionary, for the same reason as Codex: a duplicated
+                // account id would throw here and take the whole refresh down.
+                var grokResults = (await Task.WhenAll(grokTasks).ConfigureAwait(false))
+                    .GroupBy(pair => pair.Key, StringComparer.Ordinal)
+                    .ToDictionary(group => group.Key, group => group.Last().Value, StringComparer.Ordinal);
+
                 PostIfCurrent(() =>
                 {
-                    latestGrokUsage = ProviderUsageLookupResult.KeepLastGood(latestGrokUsage, grokResult);
-                    PublishUsage(ProviderKeys.Grok, latestGrokUsage);
+                    foreach (var pair in grokResults)
+                    {
+                        var merged = ProviderUsageLookupResult.KeepLastGood(
+                            latestGrokUsage.TryGetValue(pair.Key, out var previous) ? previous : null,
+                            pair.Value);
+                        latestGrokUsage[pair.Key] = merged;
+                        PublishUsage(pair.Key, merged);
+                    }
                 });
             }
 
             async Task RefreshGrokHistoryAsync()
             {
-                var grokHistory = await Task.Run(() => new GrokUsageInsightsReader().ReadLatest(), cancellation.Token)
-                    .ConfigureAwait(false);
+                var entries = GrokEntries;
+                // Each account keeps its own sessions/ folder under its own home, so unlike Codex
+                // (one shared log root re-published per account) this really is a scan per account.
+                var historyTasks = entries
+                    .Select(entry => Task.Run(
+                        () => new KeyValuePair<string, ProviderUsageInsightsLookupResult>(
+                            ProviderKeys.Grok(entry.Id),
+                            new GrokUsageInsightsReader([entry.ResolveSessionsPath()]).ReadLatest()),
+                        cancellation.Token))
+                    .ToArray();
+
+                var histories = (await Task.WhenAll(historyTasks).ConfigureAwait(false))
+                    .GroupBy(pair => pair.Key, StringComparer.Ordinal)
+                    .ToDictionary(group => group.Key, group => group.Last().Value, StringComparer.Ordinal);
+
                 PostIfCurrent(() =>
                 {
-                    var merged = ProviderUsageInsightsLookupResult.KeepLastGood(
-                        latestHistory.TryGetValue(ProviderKeys.Grok, out var previous) ? previous : null,
-                        grokHistory);
-                    latestHistory[ProviderKeys.Grok] = merged;
-                    HistoryUpdated?.Invoke(ProviderKeys.Grok, merged);
+                    foreach (var pair in histories)
+                    {
+                        var merged = ProviderUsageInsightsLookupResult.KeepLastGood(
+                            latestHistory.TryGetValue(pair.Key, out var previous) ? previous : null,
+                            pair.Value);
+                        latestHistory[pair.Key] = merged;
+                        HistoryUpdated?.Invoke(pair.Key, merged);
+                    }
                 });
             }
 
@@ -672,10 +798,14 @@ public sealed class UsageRefreshService : IDisposable
                         new ProviderUsageLookupResult(null, message));
                     PublishUsage(ProviderKeys.Claude, latestClaudeUsage);
 
-                    latestGrokUsage = ProviderUsageLookupResult.KeepLastGood(
-                        latestGrokUsage,
-                        new ProviderUsageLookupResult(null, message));
-                    PublishUsage(ProviderKeys.Grok, latestGrokUsage);
+                    foreach (var providerKey in latestGrokUsage.Keys.ToArray())
+                    {
+                        var annotated = ProviderUsageLookupResult.KeepLastGood(
+                            latestGrokUsage[providerKey],
+                            new ProviderUsageLookupResult(null, message));
+                        latestGrokUsage[providerKey] = annotated;
+                        PublishUsage(providerKey, annotated);
+                    }
 
                     latestCursorUsage = ProviderUsageLookupResult.KeepLastGood(
                         latestCursorUsage,

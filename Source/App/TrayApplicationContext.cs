@@ -847,7 +847,23 @@ public sealed class TrayApplicationContext : ApplicationContext
         ProviderUsageLookupResult cursorUsage,
         ProviderUsageLookupResult openCodeGoUsage)
     {
-        return UsageTooltip.Build(codexEntries, codexUsage, claudeUsage, grokUsage, cursorUsage, openCodeGoUsage, UiSettings.Load());
+        // This shell predates multi-account Grok and still tracks exactly one Grok session, so it
+        // presents that session as the single default account the tooltip builder now expects.
+        var grokEntries = new[] { new GrokAccountEntry(GrokAccountSettings.DefaultId, "Grok", null) };
+        var grokByKey = new Dictionary<string, ProviderUsageLookupResult>(StringComparer.Ordinal)
+        {
+            [ProviderKeys.Grok(GrokAccountSettings.DefaultId)] = grokUsage
+        };
+
+        return UsageTooltip.Build(
+            codexEntries,
+            codexUsage,
+            claudeUsage,
+            grokEntries,
+            grokByKey,
+            cursorUsage,
+            openCodeGoUsage,
+            UiSettings.Load());
     }
 
     /// <summary>

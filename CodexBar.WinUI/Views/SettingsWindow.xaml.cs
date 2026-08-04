@@ -74,6 +74,7 @@ public sealed partial class SettingsWindow : Window
     /// </summary>
     private readonly DispatcherQueueTimer chartColorCommitTimer;
     private readonly List<CodexCliEntry> codexEntries;
+    private readonly List<GrokAccountEntry> grokEntries;
     private readonly List<ChartColorRow> chartColorRows = [];
 
     /// <summary>The hex each category was last DRAWN in, as recorded by the graphs window.</summary>
@@ -125,6 +126,7 @@ public sealed partial class SettingsWindow : Window
         settings = AppTheme.Settings;
         palette = FlyoutPalette.For(RootGrid);
         codexEntries = CodexCliSettings.Load().ToList();
+        grokEntries = GrokAccountSettings.Load().ToList();
 
         Title = $"Settings - {AppInfo.AppName}";
         AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "Assets", "CodexBarWindows.ico"));
@@ -302,6 +304,7 @@ public sealed partial class SettingsWindow : Window
         RenderOpenCodeGoSavedState();
         RenderProviderMarks();
         RenderAccounts();
+        RenderGrokAccounts();
         RenderChartColors();
     }
 
@@ -343,6 +346,19 @@ public sealed partial class SettingsWindow : Window
             }
         };
         AddAccountButton.Click += (_, _) => AddCodexCli();
+
+        AddGrokAccountToggle.Click += (_, _) =>
+            ShowAddGrokAccountPanel(AddGrokAccountPanel.Visibility != Visibility.Visible);
+        AddGrokCancelButton.Click += (_, _) => ShowAddGrokAccountPanel(false);
+        AddGrokBrowseButton.Click += async (_, _) =>
+        {
+            var picked = await BrowseForGrokHomeAsync();
+            if (picked is not null)
+            {
+                AddGrokPathBox.Text = picked;
+            }
+        };
+        AddGrokAccountButton.Click += (_, _) => AddGrokAccount();
 
         ResetAllChartColorsButton.Click += (_, _) => ResetAllChartColors();
         ImportHistoryButton.Click += (_, _) => ToggleHistoryImport();
@@ -445,6 +461,7 @@ public sealed partial class SettingsWindow : Window
         CursorMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Cursor, palette.Glyph);
         OpenCodeGoMark.Child = ProviderGeometry.CreateIcon(UsageProvider.OpenCodeGo, palette.Glyph);
         BuiltInAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Codex, palette.Glyph);
+        BuiltInGrokAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Grok, palette.GrokGlyph);
         CursorAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Cursor, palette.Glyph);
         OpenCodeGoAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.OpenCodeGo, palette.Glyph);
 
@@ -453,6 +470,11 @@ public sealed partial class SettingsWindow : Window
         foreach (var host in accountMarks)
         {
             host.Child = ProviderGeometry.CreateIcon(UsageProvider.Codex, palette.Glyph);
+        }
+
+        foreach (var host in grokAccountMarks)
+        {
+            host.Child = ProviderGeometry.CreateIcon(UsageProvider.Grok, palette.GrokGlyph);
         }
     }
 
@@ -1280,6 +1302,248 @@ public sealed partial class SettingsWindow : Window
         CodexCliSettings.SaveAdditional(codexEntries);
         service.ReloadCodexEntries();
         RenderAccounts();
+    }
+
+    // ------------------------------------------------------------ Grok accounts
+
+    /// <summary>Mark hosts on the generated Grok rows, so a theme flip can re-tint them.</summary>
+    private readonly List<Border> grokAccountMarks = [];
+
+    /// <summary>
+    /// The Grok twin of <see cref="RenderAccounts"/>. Deliberately a parallel implementation
+    /// rather than a shared generic one: the two differ in what the path MEANS (a binary vs a
+    /// home folder), which picker opens, and how a path is validated, and the abstraction that
+    /// unified them would be mostly parameters.
+    /// </summary>
+    private void RenderGrokAccounts()
+    {
+        GrokAccountList.Children.Clear();
+        grokAccountMarks.Clear();
+
+        foreach (var entry in grokEntries.Where(entry => !entry.IsDefault))
+        {
+            GrokAccountList.Children.Add(new Border { Style = RowStyle("RowSeparatorStyle") });
+            GrokAccountList.Children.Add(CreateGrokAccountEditor(entry));
+        }
+
+        BuiltInGrokAccountName.Text = grokEntries.FirstOrDefault(entry => entry.IsDefault)?.Name ?? "Grok";
+    }
+
+    private StackPanel CreateGrokAccountEditor(GrokAccountEntry entry)
+    {
+        var mark = new Border
+        {
+            Width = 16,
+            Height = 16,
+            VerticalAlignment = VerticalAlignment.Center,
+            Child = ProviderGeometry.CreateIcon(UsageProvider.Grok, palette.GrokGlyph)
+        };
+        grokAccountMarks.Add(mark);
+
+        var pathCaption = new TextBlock
+        {
+            Style = RowStyle("SecondaryCaptionStyle"),
+            Text = entry.HomePath ?? string.Empty,
+            MaxLines = 1,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        ToolTipService.SetToolTip(pathCaption, entry.HomePath ?? string.Empty);
+
+        var identity = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+        identity.Children.Add(new TextBlock { Text = entry.Name, MaxLines = 1, TextTrimming = TextTrimming.CharacterEllipsis });
+        identity.Children.Add(pathCaption);
+
+        var nameBox = new TextBox
+        {
+            Header = "Display name",
+            Text = entry.Name,
+            PlaceholderText = "Name shown in the flyout"
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(nameBox, $"Name for {entry.Name}");
+
+        var pathBox = new TextBox
+        {
+            Header = "Grok home folder",
+            Text = entry.HomePath ?? string.Empty,
+            PlaceholderText = "Folder containing auth.json and sessions"
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(pathBox, $"Home folder for {entry.Name}");
+
+        var browse = new Button { Content = "Browse", VerticalAlignment = VerticalAlignment.Bottom };
+        browse.Click += async (_, _) =>
+        {
+            var picked = await BrowseForGrokHomeAsync();
+            if (picked is not null)
+            {
+                pathBox.Text = picked;
+            }
+        };
+
+        var pathGrid = new Grid { ColumnSpacing = 8 };
+        pathGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        pathGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        AddAt(pathGrid, pathBox, 0);
+        AddAt(pathGrid, browse, 1);
+
+        var save = new Button
+        {
+            Content = "Save changes",
+            Style = (Style)Application.Current.Resources["AccentButtonStyle"]
+        };
+        save.Click += (_, _) => SaveGrokAccount(entry, nameBox.Text, pathBox.Text);
+
+        var remove = new Button { Content = "Remove" };
+        remove.Click += (_, _) => RemoveGrokAccount(entry);
+
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+        buttons.Children.Add(save);
+        buttons.Children.Add(remove);
+
+        var editor = new StackPanel
+        {
+            Padding = new Thickness(12, 0, 12, 12),
+            Spacing = 10,
+            Visibility = Visibility.Collapsed
+        };
+        editor.Children.Add(nameBox);
+        editor.Children.Add(pathGrid);
+        editor.Children.Add(buttons);
+
+        var edit = new Button { Content = "Edit", VerticalAlignment = VerticalAlignment.Center };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(edit, $"Edit {entry.Name}");
+        edit.Click += (_, _) =>
+        {
+            var opening = editor.Visibility != Visibility.Visible;
+            editor.Visibility = Shown(opening);
+            edit.Content = opening ? "Close" : "Edit";
+        };
+
+        var row = new Grid { Style = RowStyle("SettingRowStyle") };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        AddAt(row, mark, 0);
+        AddAt(row, identity, 1);
+        AddAt(row, edit, 2);
+
+        var block = new StackPanel();
+        block.Children.Add(row);
+        block.Children.Add(editor);
+        return block;
+    }
+
+    private void ShowAddGrokAccountPanel(bool visible)
+    {
+        AddGrokAccountPanel.Visibility = Shown(visible);
+        AddGrokAccountToggle.Content = visible ? "Close" : "Add";
+    }
+
+    /// <summary>
+    /// Folder picker for a GROK_HOME directory. Same Windows App SDK picker as
+    /// <see cref="BrowseForCodexCliAsync"/> - see its remarks for why the WinRT one is unusable
+    /// in this unpackaged build.
+    /// </summary>
+    private async System.Threading.Tasks.Task<string?> BrowseForGrokHomeAsync()
+    {
+        try
+        {
+            var picker = new Microsoft.Windows.Storage.Pickers.FolderPicker(AppWindow.Id)
+            {
+                SuggestedStartLocation = Microsoft.Windows.Storage.Pickers.PickerLocationId.ComputerFolder,
+                CommitButtonText = "Select"
+            };
+
+            var folder = await picker.PickSingleFolderAsync();
+            return folder?.Path;
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write("folder picker failed: {0}", ex);
+            SetStatus($"Could not open the folder picker: {ex.Message}", StatusLevel.Error);
+            return null;
+        }
+    }
+
+    private void AddGrokAccount()
+    {
+        var path = AddGrokPathBox.Text.Trim();
+        if (!ValidateGrokHome(path))
+        {
+            return;
+        }
+
+        var name = string.IsNullOrWhiteSpace(AddGrokNameBox.Text)
+            ? $"Grok {grokEntries.Count + 1}"
+            : AddGrokNameBox.Text.Trim();
+
+        grokEntries.Add(new GrokAccountEntry(Guid.NewGuid().ToString("N"), name, path));
+        SaveGrokAccountEntries();
+
+        AddGrokNameBox.Text = string.Empty;
+        AddGrokPathBox.Text = string.Empty;
+        ShowAddGrokAccountPanel(false);
+        SetStatus($"Added “{name}”.");
+    }
+
+    private void SaveGrokAccount(GrokAccountEntry entry, string name, string path)
+    {
+        path = path.Trim();
+        if (!ValidateGrokHome(path))
+        {
+            return;
+        }
+
+        var index = grokEntries.FindIndex(candidate => candidate.Id == entry.Id);
+        if (index < 0)
+        {
+            return;
+        }
+
+        var resolvedName = string.IsNullOrWhiteSpace(name) ? entry.Name : name.Trim();
+        grokEntries[index] = entry with { Name = resolvedName, HomePath = path };
+        SaveGrokAccountEntries();
+        SetStatus($"Saved “{resolvedName}”.");
+    }
+
+    private void RemoveGrokAccount(GrokAccountEntry entry)
+    {
+        grokEntries.RemoveAll(candidate => candidate.Id == entry.Id);
+        SaveGrokAccountEntries();
+        SetStatus($"Removed “{entry.Name}”.");
+    }
+
+    /// <summary>
+    /// The folder has to exist, but a missing <c>auth.json</c> is only a warning: pointing the app
+    /// at a home you have not signed into yet is a reasonable order to do this in, and the card
+    /// will say "Run `grok login`" until you do.
+    /// </summary>
+    private bool ValidateGrokHome(string path)
+    {
+        if (!Directory.Exists(path))
+        {
+            SetStatus(
+                string.IsNullOrWhiteSpace(path)
+                    ? "Enter the path to a Grok home folder (the one holding auth.json)."
+                    : $"Not found: {path}",
+                StatusLevel.Warning);
+            return false;
+        }
+
+        if (!File.Exists(Path.Combine(path, "auth.json")))
+        {
+            SetStatus(
+                $"No auth.json in {path} yet - sign in with $env:GROK_HOME=\"{path}\"; grok login",
+                StatusLevel.Warning);
+        }
+
+        return true;
+    }
+
+    private void SaveGrokAccountEntries()
+    {
+        GrokAccountSettings.SaveAdditional(grokEntries);
+        service.ReloadGrokEntries();
+        RenderGrokAccounts();
     }
 
     // ------------------------------------------------------------------- cursor
