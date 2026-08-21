@@ -204,6 +204,7 @@ var tests = new (string Name, Action Run)[]
     ("Graphs period arrows follow the granularity's own bound", GraphsPeriodArrowsFollowGranularity),
     ("Graphs period drills one level finer per double-click", GraphsPeriodDrillsOneLevelFiner),
     ("Graphs period names a whole-day column without an hour", GraphsPeriodNamesWholeDayColumnWithoutHour),
+    ("Graphs period puts the day axis labels on the columns", GraphsPeriodPutsDayAxisLabelsOnColumns),
 };
 
 static void CodexRpcPrefersCodexMultiBucketSnapshot()
@@ -3396,6 +3397,64 @@ static void GraphsPeriodNamesWholeDayColumnWithoutHour()
     Assert(
         !wholeDay.Contains("AM", StringComparison.Ordinal) && !wholeDay.Contains("PM", StringComparison.Ordinal),
         $"a whole-day column must not name an hour, got \"{wholeDay}\"");
+}
+
+/// <summary>
+/// The other half of the half-hour-offset regression: a label that names a column has to be DRAWN
+/// on it. LiveCharts places its own separators at absolute multiples of the step, which is the
+/// whole clock hour - the seam between two columns of a grid that starts at :30.
+/// </summary>
+static void GraphsPeriodPutsDayAxisLabelsOnColumns()
+{
+    // A whole-hour zone is already on the grid: nothing is overridden, and the chart keeps placing
+    // its own labels exactly as it did before.
+    var onGrid = new DateTime[24];
+    for (var index = 0; index < onGrid.Length; index++)
+    {
+        onGrid[index] = new DateTime(2026, 5, 11, 0, 0, 0).AddHours(index);
+    }
+
+    Assert(
+        GraphsPeriod.DayAxisLabelTicks(UsageLedgerGranularity.Day, onGrid) is null,
+        "a whole-hour zone must keep the automatic separators");
+    Assert(
+        GraphsPeriod.DayAxisLabelTicks(UsageLedgerGranularity.Month, onGrid) is null,
+        "only the Day axis draws hour columns");
+
+    // +05:30 puts the columns on the UTC grid, so they start at :30 and the labels have to follow.
+    var offGrid = new DateTime[24];
+    for (var index = 0; index < offGrid.Length; index++)
+    {
+        offGrid[index] = new DateTime(2026, 5, 11, 0, 30, 0).AddHours(index);
+    }
+
+    var ticks = GraphsPeriod.DayAxisLabelTicks(UsageLedgerGranularity.Day, offGrid);
+    Assert(ticks is not null, "a half-hour offset must place the labels explicitly");
+    AssertEqual(8, ticks!.Length, "every third column of 24 carries a label");
+
+    for (var index = 0; index < ticks.Length; index++)
+    {
+        var at = new DateTime((long)ticks[index]);
+        AssertEqual(
+            offGrid[index * GraphsPeriod.DayAxisLabelEvery].Ticks,
+            at.Ticks,
+            "a label must sit on a column's start, not between two of them");
+        AssertEqual("h:mm tt", GraphsPeriod.HourPattern(at), "and must then be written with its minutes");
+    }
+
+    // Lord Howe Island shifts by THIRTY minutes across DST, so a day can start on the hour and go
+    // off the grid halfway through - the check is every column, not the first.
+    var shifts = new[]
+    {
+        new DateTime(2026, 4, 5, 0, 0, 0),
+        new DateTime(2026, 4, 5, 1, 0, 0),
+        new DateTime(2026, 4, 5, 1, 30, 0),
+        new DateTime(2026, 4, 5, 2, 30, 0)
+    };
+
+    Assert(
+        GraphsPeriod.DayAxisLabelTicks(UsageLedgerGranularity.Day, shifts) is not null,
+        "a grid that goes off the hour mid-day must place its labels explicitly");
 }
 
 /// <summary>Dense day buckets, the shape UsageLedger.Query returns them in.</summary>

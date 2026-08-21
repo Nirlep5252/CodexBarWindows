@@ -268,6 +268,53 @@ internal static class GraphsPeriod
     public static string HourPattern(DateTime bucketStart) =>
         bucketStart.Minute == 0 ? "h tt" : "h:mm tt";
 
+    /// <summary>How many columns apart the Day axis' labels sit - the step the axis is forced to.</summary>
+    public const int DayAxisLabelEvery = 3;
+
+    /// <summary>
+    /// Explicit positions for the Day axis' labels, or <c>null</c> to leave the chart to place them.
+    /// </summary>
+    /// <remarks>
+    /// LiveCharts picks its own separators at absolute multiples of the step
+    /// (<c>Truncate(min / step) * step</c>), so they land on whole clock hours. The hour columns sit
+    /// on the LEDGER'S UTC GRID - a record is keyed by a whole UTC hour - so in a zone offset by a
+    /// fraction of an hour (IST +05:30, ACST +09:30, NPT +05:45) a column starts at :30 or :45 and
+    /// an automatic label lands on the SEAM between two of them, naming an hour that neither column
+    /// begins. Half a column is exactly the error <see cref="HourPattern"/> exists to stop the
+    /// labels telling, so the columns are named explicitly instead: every label then sits under the
+    /// bar it describes, at the spacing the forced step already chose.
+    ///
+    /// Whole-hour zones are already on the grid and keep the automatic separators untouched. The
+    /// test is every column and not just the first because Lord Howe Island shifts by THIRTY
+    /// MINUTES across DST, which moves the grid mid-day.
+    /// </remarks>
+    public static double[]? DayAxisLabelTicks(UsageLedgerGranularity granularity, IReadOnlyList<DateTime> bucketStarts)
+    {
+        if (granularity != UsageLedgerGranularity.Day || bucketStarts.Count < 2)
+        {
+            return null;
+        }
+
+        var offGrid = false;
+        for (var index = 0; index < bucketStarts.Count && !offGrid; index++)
+        {
+            offGrid = bucketStarts[index].Minute != 0;
+        }
+
+        if (!offGrid)
+        {
+            return null;
+        }
+
+        var ticks = new List<double>();
+        for (var index = 0; index < bucketStarts.Count; index += DayAxisLabelEvery)
+        {
+            ticks.Add(bucketStarts[index].Ticks);
+        }
+
+        return [.. ticks];
+    }
+
     /// <summary>"day" / "week" / "month" / "year" - the unit the arrows step in.</summary>
     public static string Noun(UsageLedgerGranularity granularity) => granularity switch
     {
