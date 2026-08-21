@@ -189,6 +189,17 @@ public sealed partial class GraphsWindow : Window
     private TimeSpan axisUnit = TimeSpan.FromDays(1);
 
     /// <summary>
+    /// The X axis currently installed on the chart, for the label placement that depends on the
+    /// BUCKETS rather than on the granularity.
+    /// </summary>
+    /// <remarks>
+    /// Built in <see cref="ApplyDailyAxis"/>, which runs on a granularity change; the columns move
+    /// under it on every arrow press, so the label positions are re-applied per render from
+    /// <see cref="AlignDailyAxisLabels"/> rather than being baked into the axis once.
+    /// </remarks>
+    private DateTimeAxis? dailyAxis;
+
+    /// <summary>
     /// The collision nudge each category label takes, computed ONCE per render for the whole period.
     /// </summary>
     /// <remarks>
@@ -1939,7 +1950,46 @@ public sealed partial class GraphsWindow : Window
         }
 
         UpdateDailyValues(plan, buckets);
+        AlignDailyAxisLabels(buckets);
         ApplyDailyColors();
+    }
+
+    /// <summary>
+    /// Puts the Day axis' labels ON the columns when the chart would otherwise miss them.
+    /// </summary>
+    /// <remarks>
+    /// See <see cref="GraphsPeriod.DayAxisLabelTicks"/> for why: in a zone whose UTC offset is not a
+    /// whole number of hours the columns start at :30 or :45, and LiveCharts' own separators sit on
+    /// the whole hour - on the seam BETWEEN two columns. Every other granularity, and every
+    /// whole-hour zone, gets a null here and keeps the automatic separators exactly as before.
+    /// </remarks>
+    private void AlignDailyAxisLabels(IReadOnlyList<UsageLedgerBucket> buckets)
+    {
+        if (dailyAxis is not { } axis)
+        {
+            return;
+        }
+
+        var starts = new DateTime[buckets.Count];
+        for (var index = 0; index < buckets.Count; index++)
+        {
+            starts[index] = buckets[index].StartLocal.DateTime;
+        }
+
+        var ticks = GraphsPeriod.DayAxisLabelTicks(granularity, starts);
+
+        // Assigned only when it actually moved: the property raises PropertyChanged, and an
+        // unchanged list re-entering the axis re-measures the chart for nothing.
+        var current = axis.CustomSeparators;
+        var unchanged = current is null
+            ? ticks is null
+            : ticks is not null && current.SequenceEqual(ticks);
+        if (unchanged)
+        {
+            return;
+        }
+
+        axis.CustomSeparators = ticks;
     }
 
     /// <summary>One stacked series' identity: its colour key, its legend name and its selector.</summary>
@@ -2744,7 +2794,7 @@ public sealed partial class GraphsWindow : Window
                 ForceStepToMin = true
             },
             UsageLedgerGranularity.Week => new DateTimeAxis(TimeSpan.FromDays(1), date => date.ToString("ddd d", CultureInfo.CurrentCulture)),
-            UsageLedgerGranularity.Day => new DateTimeAxis(TimeSpan.FromHours(1), date => date.ToString("h tt", CultureInfo.CurrentCulture))
+            UsageLedgerGranularity.Day => new DateTimeAxis(TimeSpan.FromHours(1), date => date.ToString(GraphsPeriod.HourPattern(date), CultureInfo.CurrentCulture))
             {
                 // 24 hourly labels at the 600 DIP minimum width collide, and the 11px text size and
                 // the absence of rotation are the window's ramp rather than a chart preference - so
@@ -2760,6 +2810,7 @@ public sealed partial class GraphsWindow : Window
         axis.SeparatorsPaint = null;
         axis.TicksPaint = null;
 
+        dailyAxis = axis;
         DailyChart.XAxes = [axis];
         DailyChart.YAxes =
         [

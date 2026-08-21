@@ -168,6 +168,7 @@ var tests = new (string Name, Action Run)[]
     ("Usage ledger buckets a range by granularity", UsageLedgerBucketsRangeByGranularity),
     ("Usage ledger buckets by the query time zone", UsageLedgerBucketsByQueryTimeZone),
     ("Usage ledger builds a day's hours on the local timeline across DST", UsageLedgerBuildsDayHoursOnTheLocalTimeline),
+    ("Usage ledger names hour columns for the time they cover", UsageLedgerNamesHourColumnsForTheTimeTheyCover),
     ("Usage ledger splits Claude components per tier", UsageLedgerSplitsClaudeComponentsPerTier),
     ("Usage ledger prices at read time and never stores cost", UsageLedgerPricesAtReadTime),
     ("Usage ledger prices Codex fast turns at per-model priority rates", UsageLedgerPricesFastTurnsAtPriorityRates),
@@ -203,6 +204,7 @@ var tests = new (string Name, Action Run)[]
     ("Graphs period arrows follow the granularity's own bound", GraphsPeriodArrowsFollowGranularity),
     ("Graphs period drills one level finer per double-click", GraphsPeriodDrillsOneLevelFiner),
     ("Graphs period names a whole-day column without an hour", GraphsPeriodNamesWholeDayColumnWithoutHour),
+    ("Graphs period puts the day axis labels on the columns", GraphsPeriodPutsDayAxisLabelsOnColumns),
 };
 
 static void CodexRpcPrefersCodexMultiBucketSnapshot()
@@ -2112,11 +2114,47 @@ static void UsageLedgerBucketsByQueryTimeZone()
     AssertEqual(1100L, istDays.TotalTokens, "re-bucketing must not change the totals");
     AssertEqual(1100L, pacificDays.TotalTokens, "re-bucketing must not change the totals");
 
-    // 11:00 local under +05:30 is the half of 05:30Z..06:30Z the bucket cannot subdivide; assert
-    // the documented behaviour explicitly so a future resolution change is a visible test change.
+    // A half-hour offset puts the columns on the UTC grid, so they run :30 to :30 and the first one
+    // of the local day is 00:30 - which is where 19:00Z belongs and where it is labelled.
     var istHours = UsageLedger.Query(UsageLedgerScope.Codex, new DateTimeOffset(2026, 5, 11, 0, 0, 0, TimeSpan.FromMinutes(330)), new DateTimeOffset(2026, 5, 12, 0, 0, 0, TimeSpan.FromMinutes(330)), UsageLedgerGranularity.Hour, ist);
     AssertEqual(24, istHours.Buckets.Count, "a half-hour offset still yields 24 hourly buckets");
-    AssertEqual(1100L, istHours.Buckets[0].TotalTokens, "19:00Z lands in the 00:00-01:00 local bucket");
+    AssertEqual(30, istHours.Buckets[0].StartLocal.DateTime.Minute, "a half-hour offset puts the columns on the UTC grid");
+    AssertEqual(1100L, istHours.Buckets[0].TotalTokens, "19:00Z lands in the 00:30-01:30 local bucket");
+}
+
+/// <summary>
+/// The half-hour-offset regression: an hour column must be named for the time it actually covers.
+/// </summary>
+/// <remarks>
+/// Records are keyed by a whole UTC hour, so under +05:30 the record covering 16:30-17:30 local
+/// used to land whole in a column drawn as 16:00-17:00 and labelled "4 PM" - a 17:12 session read
+/// as usage at 4 PM, every bar in the day half an hour early.
+/// </remarks>
+static void UsageLedgerNamesHourColumnsForTheTimeTheyCover()
+{
+    using var fixture = new UsageLedgerFixture();
+    var ist = TimeZoneInfo.CreateCustomTimeZone("test-ist", TimeSpan.FromMinutes(330), "test-ist", "test-ist");
+
+    // 11:42Z is 17:12 local - inside the 16:30-17:30 local column.
+    var at = new DateTimeOffset(2026, 5, 11, 11, 42, 0, TimeSpan.Zero);
+    Assert(UsageLedger.TryMerge(UsageLedgerScope.Codex, LedgerCodexBatch(true, (at, "gpt-5.6-sol", 1000, 0, 100, false))), "seed merge");
+
+    var from = new DateTimeOffset(2026, 5, 11, 0, 0, 0, TimeSpan.FromMinutes(330));
+    var hours = UsageLedger.Query(UsageLedgerScope.Codex, from, from.AddDays(1), UsageLedgerGranularity.Hour, ist);
+
+    var used = hours.Buckets.Where(bucket => bucket.TotalTokens > 0).ToArray();
+    AssertEqual(1, used.Length, "the record belongs to exactly one column");
+    AssertEqual(16, used[0].StartLocal.DateTime.Hour, "the column holding 17:12 local starts at 16:30");
+    AssertEqual(30, used[0].StartLocal.DateTime.Minute, "the column holding 17:12 local starts at 16:30");
+    Assert(
+        used[0].EndLocalExclusive.DateTime == used[0].StartLocal.DateTime.AddHours(1),
+        "and it ends an hour later, at 17:30 - the session is inside it");
+    AssertEqual("h:mm tt", GraphsPeriod.HourPattern(used[0].StartLocal.DateTime), "a :30 column must be labelled with its minutes, not rounded to \"4 PM\"");
+
+    // The columns still partition the day the DAY bucket claims, so the two totals agree.
+    var day = UsageLedger.Query(UsageLedgerScope.Codex, from, from.AddDays(1), UsageLedgerGranularity.Day, ist);
+    AssertEqual(day.TotalTokens, hours.Buckets.Sum(bucket => bucket.TotalTokens), "the hour columns must sum to the day");
+    AssertEqual(1100L, day.TotalTokens, "and to the record that was merged");
 }
 
 /// <summary>
@@ -3359,6 +3397,64 @@ static void GraphsPeriodNamesWholeDayColumnWithoutHour()
     Assert(
         !wholeDay.Contains("AM", StringComparison.Ordinal) && !wholeDay.Contains("PM", StringComparison.Ordinal),
         $"a whole-day column must not name an hour, got \"{wholeDay}\"");
+}
+
+/// <summary>
+/// The other half of the half-hour-offset regression: a label that names a column has to be DRAWN
+/// on it. LiveCharts places its own separators at absolute multiples of the step, which is the
+/// whole clock hour - the seam between two columns of a grid that starts at :30.
+/// </summary>
+static void GraphsPeriodPutsDayAxisLabelsOnColumns()
+{
+    // A whole-hour zone is already on the grid: nothing is overridden, and the chart keeps placing
+    // its own labels exactly as it did before.
+    var onGrid = new DateTime[24];
+    for (var index = 0; index < onGrid.Length; index++)
+    {
+        onGrid[index] = new DateTime(2026, 5, 11, 0, 0, 0).AddHours(index);
+    }
+
+    Assert(
+        GraphsPeriod.DayAxisLabelTicks(UsageLedgerGranularity.Day, onGrid) is null,
+        "a whole-hour zone must keep the automatic separators");
+    Assert(
+        GraphsPeriod.DayAxisLabelTicks(UsageLedgerGranularity.Month, onGrid) is null,
+        "only the Day axis draws hour columns");
+
+    // +05:30 puts the columns on the UTC grid, so they start at :30 and the labels have to follow.
+    var offGrid = new DateTime[24];
+    for (var index = 0; index < offGrid.Length; index++)
+    {
+        offGrid[index] = new DateTime(2026, 5, 11, 0, 30, 0).AddHours(index);
+    }
+
+    var ticks = GraphsPeriod.DayAxisLabelTicks(UsageLedgerGranularity.Day, offGrid);
+    Assert(ticks is not null, "a half-hour offset must place the labels explicitly");
+    AssertEqual(8, ticks!.Length, "every third column of 24 carries a label");
+
+    for (var index = 0; index < ticks.Length; index++)
+    {
+        var at = new DateTime((long)ticks[index]);
+        AssertEqual(
+            offGrid[index * GraphsPeriod.DayAxisLabelEvery].Ticks,
+            at.Ticks,
+            "a label must sit on a column's start, not between two of them");
+        AssertEqual("h:mm tt", GraphsPeriod.HourPattern(at), "and must then be written with its minutes");
+    }
+
+    // Lord Howe Island shifts by THIRTY minutes across DST, so a day can start on the hour and go
+    // off the grid halfway through - the check is every column, not the first.
+    var shifts = new[]
+    {
+        new DateTime(2026, 4, 5, 0, 0, 0),
+        new DateTime(2026, 4, 5, 1, 0, 0),
+        new DateTime(2026, 4, 5, 1, 30, 0),
+        new DateTime(2026, 4, 5, 2, 30, 0)
+    };
+
+    Assert(
+        GraphsPeriod.DayAxisLabelTicks(UsageLedgerGranularity.Day, shifts) is not null,
+        "a grid that goes off the hour mid-day must place its labels explicitly");
 }
 
 /// <summary>Dense day buckets, the shape UsageLedger.Query returns them in.</summary>

@@ -399,6 +399,23 @@ public static partial class UsageLedger
             // the count of elapsed hours are the same number by construction, which is the property
             // Elapsed relies on.
             var instant = ToLocal(Floor(fromLocal.DateTime, granularity), zone);
+
+            // ...AND ON THE LEDGER'S OWN GRID. A record is keyed by a whole UTC hour, so a column
+            // whose edges are not UTC hour boundaries cannot be filled honestly: in a zone offset by
+            // a fraction of an hour (IST +05:30, ACST +09:30, NPT +05:45) the record covering
+            // 16:30-17:30 local STARTS inside the 16:00 column and so lands there whole - the "4 PM"
+            // bar was 4:30 PM's usage, every bar in the day shifted half an hour early. Snapping the
+            // grid up to the next UTC hour keeps every record inside exactly one column and lets the
+            // label say 4:30 PM, which is what the stored data actually means. Snapping UP rather
+            // than down also keeps the day's columns to the records the DAY bucket claims (a record
+            // starting before local midnight belongs to the previous day), so hours still sum to the
+            // day. Whole-hour zones are already on the grid and are untouched.
+            var offGrid = instant.UtcDateTime.Ticks % TimeSpan.TicksPerHour;
+            if (offGrid != 0)
+            {
+                instant = instant.AddTicks(TimeSpan.TicksPerHour - offGrid);
+            }
+
             while (instant < toLocalExclusive && buckets.Count < MaxBuckets)
             {
                 var next = instant.AddHours(1);
