@@ -252,10 +252,21 @@ internal static class GraphsPeriod
         return granularity switch
         {
             UsageLedgerGranularity.Year => bucketStart.ToString("MMMM", CultureInfo.CurrentCulture),
-            UsageLedgerGranularity.Day => bucketStart.ToString("ddd d MMM, h tt", CultureInfo.CurrentCulture),
+            UsageLedgerGranularity.Day => bucketStart.ToString($"ddd d MMM, {HourPattern(bucketStart)}", CultureInfo.CurrentCulture),
             _ => bucketStart.ToString("ddd d MMM", CultureInfo.CurrentCulture)
         };
     }
+
+    /// <summary>
+    /// How an hour column's start is written: with its minutes when it HAS any.
+    /// </summary>
+    /// <remarks>
+    /// The ledger keys records by whole UTC hours, so in a zone offset by a fraction of an hour the
+    /// columns sit on the UTC grid and start at :30 (IST, ACST) or :45 (NPT). Printing those with
+    /// "h tt" rounded 16:30 down to "4 PM" and made a 5 PM session look like it happened at 4.
+    /// </remarks>
+    public static string HourPattern(DateTime bucketStart) =>
+        bucketStart.Minute == 0 ? "h tt" : "h:mm tt";
 
     /// <summary>"day" / "week" / "month" / "year" - the unit the arrows step in.</summary>
     public static string Noun(UsageLedgerGranularity granularity) => granularity switch

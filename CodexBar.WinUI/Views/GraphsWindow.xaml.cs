@@ -2744,7 +2744,7 @@ public sealed partial class GraphsWindow : Window
                 ForceStepToMin = true
             },
             UsageLedgerGranularity.Week => new DateTimeAxis(TimeSpan.FromDays(1), date => date.ToString("ddd d", CultureInfo.CurrentCulture)),
-            UsageLedgerGranularity.Day => new DateTimeAxis(TimeSpan.FromHours(1), date => date.ToString("h tt", CultureInfo.CurrentCulture))
+            UsageLedgerGranularity.Day => new DateTimeAxis(TimeSpan.FromHours(1), date => date.ToString(GraphsPeriod.HourPattern(date), CultureInfo.CurrentCulture))
             {
                 // 24 hourly labels at the 600 DIP minimum width collide, and the 11px text size and
                 // the absence of rotation are the window's ramp rather than a chart preference - so
