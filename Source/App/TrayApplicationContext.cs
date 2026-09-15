@@ -847,8 +847,14 @@ public sealed class TrayApplicationContext : ApplicationContext
         ProviderUsageLookupResult cursorUsage,
         ProviderUsageLookupResult openCodeGoUsage)
     {
-        // This shell predates multi-account Grok and still tracks exactly one Grok session, so it
-        // presents that session as the single default account the tooltip builder now expects.
+        // This shell predates multi-account Grok and Claude and still tracks exactly one session
+        // of each, so it presents them as the single default accounts the tooltip builder expects.
+        var claudeEntries = new[] { new ClaudeAccountEntry(ClaudeAccountSettings.DefaultId, "Claude", null) };
+        var claudeByKey = new Dictionary<string, ProviderUsageLookupResult>(StringComparer.Ordinal)
+        {
+            [ProviderKeys.Claude(ClaudeAccountSettings.DefaultId)] = claudeUsage
+        };
+
         var grokEntries = new[] { new GrokAccountEntry(GrokAccountSettings.DefaultId, "Grok", null) };
         var grokByKey = new Dictionary<string, ProviderUsageLookupResult>(StringComparer.Ordinal)
         {
@@ -858,7 +864,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         return UsageTooltip.Build(
             codexEntries,
             codexUsage,
-            claudeUsage,
+            claudeEntries,
+            claudeByKey,
             grokEntries,
             grokByKey,
             cursorUsage,

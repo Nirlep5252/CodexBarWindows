@@ -17,11 +17,13 @@ public sealed class ClaudeUsageReader
     private ClaudeOAuthCredentials? memoryCredentials;
     private DateTime memoryCredentialsWriteTimeUtc;
 
+    /// <summary>
+    /// Reads the built-in account: the same folder <see cref="ClaudeAccountEntry"/> resolves for
+    /// the default entry, so every shell agrees on which login "Claude" means.
+    /// </summary>
     public ClaudeUsageReader()
-        : this(Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".claude",
-            ".credentials.json"))
+        : this(new ClaudeAccountEntry(ClaudeAccountSettings.DefaultId, ClaudeAccountSettings.DefaultName, null)
+            .ResolveCredentialsPath())
     {
     }
 
@@ -29,6 +31,9 @@ public sealed class ClaudeUsageReader
     {
         this.credentialsPath = credentialsPath;
     }
+
+    /// <summary>The file this reader was built for, so a cached instance can be checked against a re-resolved account.</summary>
+    public string CredentialsPath => credentialsPath;
 
     public async Task<ProviderUsageLookupResult> ReadLatestAsync(CancellationToken cancellationToken)
     {
@@ -276,13 +281,19 @@ public sealed class ClaudeUsageReader
             : null;
     }
 
+    /// <summary>
+    /// Resolved once per process: the version is machine-wide, and spawning <c>claude --version</c>
+    /// per request would fork one Node process per account every poll.
+    /// </summary>
+    private static readonly Lazy<string> ClaudeCodeVersion = new(ResolveClaudeCodeVersion);
+
     private static HttpClient CreateHttpClient()
     {
         var client = new HttpClient
         {
             Timeout = RequestTimeout
         };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd($"claude-code/{ResolveClaudeCodeVersion()}");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd($"claude-code/{ClaudeCodeVersion.Value}");
         return client;
     }
 

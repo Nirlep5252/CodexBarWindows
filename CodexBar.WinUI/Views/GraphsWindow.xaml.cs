@@ -314,6 +314,8 @@ public sealed partial class GraphsWindow : Window
         service.HistoryUpdated += OnHistoryUpdated;
         service.RefreshingChanged += OnRefreshingChanged;
         service.CodexEntriesChanged += ConfigureProviders;
+        service.ClaudeEntriesChanged += ConfigureProviders;
+        service.GrokEntriesChanged += ConfigureProviders;
 
         DailyChart.UpdateFinished += OnDailyChartUpdateFinished;
         DailyChart.DataPointerDown += OnDailyChartDataPointerDown;
@@ -444,6 +446,8 @@ public sealed partial class GraphsWindow : Window
         service.HistoryUpdated -= OnHistoryUpdated;
         service.RefreshingChanged -= OnRefreshingChanged;
         service.CodexEntriesChanged -= ConfigureProviders;
+        service.ClaudeEntriesChanged -= ConfigureProviders;
+        service.GrokEntriesChanged -= ConfigureProviders;
         DailyChart.UpdateFinished -= OnDailyChartUpdateFinished;
         DailyChart.DataPointerDown -= OnDailyChartDataPointerDown;
 
@@ -558,7 +562,13 @@ public sealed partial class GraphsWindow : Window
 
         if (settings.IsProviderEnabled(UsageProvider.Claude))
         {
-            options.Add(new ProviderOption(ProviderKeys.Claude, "Claude"));
+            // One option however many Claude accounts are configured: the 30-day history scan
+            // reads the default account's transcripts only, so a per-account entry would plot
+            // the same series under another account's name.
+            var builtIn = service.ClaudeEntries.FirstOrDefault(entry => entry.IsDefault);
+            options.Add(new ProviderOption(
+                ProviderKeys.Claude(ClaudeAccountSettings.DefaultId),
+                builtIn?.Name ?? ClaudeAccountSettings.DefaultName));
         }
 
         if (settings.IsProviderEnabled(UsageProvider.Grok))

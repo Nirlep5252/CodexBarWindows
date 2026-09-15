@@ -47,11 +47,19 @@ public sealed class UsageRefreshService : IDisposable
     public static readonly TimeSpan ManualRefreshDebounce = TimeSpan.FromSeconds(2);
 
     private readonly Action<Action> post;
-    private readonly ClaudeUsageReader claudeUsageReader = new();
     private readonly CursorUsageReader cursorUsageReader = new();
     private readonly OpenCodeGoUsageReader openCodeGoUsageReader = new();
     private readonly Dictionary<string, ProviderUsageLookupResult> latestCodexUsage = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ProviderUsageLookupResult> latestClaudeUsage = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ProviderUsageLookupResult> latestGrokUsage = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// One reader per Claude account, kept ALIVE between refreshes: the reader caches the OAuth
+    /// credentials it loaded (and refreshed) in memory, and holds the 401-then-reload rule that
+    /// notices a re-login. A fresh instance per poll would re-read and re-refresh the token every
+    /// minute. Replaced when an account's config directory changes.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, ClaudeUsageReader> claudeReaders = new(StringComparer.Ordinal);
 
     /// <summary>
     /// One reader per Grok account, kept ALIVE between refreshes: the reader caches the OAuth
@@ -65,7 +73,6 @@ public sealed class UsageRefreshService : IDisposable
     private readonly HashSet<string> openWindows = new(StringComparer.Ordinal);
     private readonly Timer refreshTimer;
 
-    private ProviderUsageLookupResult latestClaudeUsage = NotLoaded;
     private ProviderUsageLookupResult latestCursorUsage = NotLoaded;
     private ProviderUsageLookupResult latestOpenCodeGoUsage = NotLoaded;
     private CancellationTokenSource? refreshCancellation;
@@ -104,13 +111,24 @@ public sealed class UsageRefreshService : IDisposable
             latestHistory[providerKey] = HistoryNotLoaded;
         }
 
-        latestHistory[ProviderKeys.Claude] = HistoryNotLoaded;
+        ClaudeEntries = ClaudeAccountSettings.Load();
+        foreach (var entry in ClaudeEntries)
+        {
+            latestClaudeUsage[ProviderKeys.Claude(entry.Id)] = NotLoaded;
+        }
+
+        // History is NOT per account: multi-account Claude is a limits-only split, and the 30-day
+        // scan still reads only the default account's projects/ root. Extra accounts' transcripts
+        // are not scanned at all, so the history stays keyed by the default account.
+        latestHistory[ProviderKeys.Claude(ClaudeAccountSettings.DefaultId)] = HistoryNotLoaded;
 
         // Created stopped. Start/Stop is driven purely by SetWindowOpen.
         refreshTimer = new Timer(_ => post(() => BeginRefresh()), null, Timeout.Infinite, Timeout.Infinite);
     }
 
     public IReadOnlyList<CodexCliEntry> CodexEntries { get; private set; }
+
+    public IReadOnlyList<ClaudeAccountEntry> ClaudeEntries { get; private set; }
 
     public IReadOnlyList<GrokAccountEntry> GrokEntries { get; private set; }
 
@@ -141,14 +159,17 @@ public sealed class UsageRefreshService : IDisposable
     /// <summary>Raised on the UI thread after the configured Codex accounts are re-read.</summary>
     public event Action? CodexEntriesChanged;
 
+    /// <summary>Raised on the UI thread after the configured Claude accounts are re-read.</summary>
+    public event Action? ClaudeEntriesChanged;
+
     /// <summary>Raised on the UI thread after the configured Grok accounts are re-read.</summary>
     public event Action? GrokEntriesChanged;
 
     public ProviderUsageLookupResult GetUsage(string providerKey)
     {
-        if (providerKey == ProviderKeys.Claude)
+        if (ProviderKeys.IsClaude(providerKey))
         {
-            return latestClaudeUsage;
+            return latestClaudeUsage.TryGetValue(providerKey, out var claude) ? claude : NotLoaded;
         }
 
         if (ProviderKeys.IsGrok(providerKey))
@@ -179,6 +200,7 @@ public sealed class UsageRefreshService : IDisposable
         UsageTooltip.Build(
             CodexEntries,
             latestCodexUsage,
+            ClaudeEntries,
             latestClaudeUsage,
             GrokEntries,
             latestGrokUsage,
@@ -330,7 +352,11 @@ public sealed class UsageRefreshService : IDisposable
             UsageUpdated?.Invoke(providerKey, GetUsage(providerKey));
         }
 
-        UsageUpdated?.Invoke(ProviderKeys.Claude, latestClaudeUsage);
+        foreach (var pair in latestClaudeUsage)
+        {
+            UsageUpdated?.Invoke(pair.Key, pair.Value);
+        }
+
         foreach (var pair in latestGrokUsage)
         {
             UsageUpdated?.Invoke(pair.Key, pair.Value);
@@ -338,6 +364,55 @@ public sealed class UsageRefreshService : IDisposable
 
         UsageUpdated?.Invoke(ProviderKeys.Cursor, latestCursorUsage);
         UsageUpdated?.Invoke(ProviderKeys.OpenCodeGo, latestOpenCodeGoUsage);
+        BeginRefresh();
+    }
+
+    /// <summary>
+    /// Re-reads the configured Claude accounts, keeping cached usage for accounts whose config
+    /// directory did not move and dropping state for accounts that disappeared.
+    /// </summary>
+    public void ReloadClaudeEntries()
+    {
+        var previousDirs = ClaudeEntries.ToDictionary(
+            entry => ProviderKeys.Claude(entry.Id),
+            entry => entry.ResolveConfigDir(),
+            StringComparer.Ordinal);
+
+        ClaudeEntries = ClaudeAccountSettings.Load();
+        var activeProviderKeys = ClaudeEntries
+            .Select(entry => ProviderKeys.Claude(entry.Id))
+            .ToHashSet(StringComparer.Ordinal);
+
+        foreach (var entry in ClaudeEntries)
+        {
+            var providerKey = ProviderKeys.Claude(entry.Id);
+            var configDirChanged = previousDirs.TryGetValue(providerKey, out var previousDir) &&
+                !string.Equals(previousDir, entry.ResolveConfigDir(), StringComparison.OrdinalIgnoreCase);
+            if (configDirChanged)
+            {
+                // A different config directory is a different account: its numbers, and the cached
+                // OAuth credentials the reader is holding, both belong to the account that just left.
+                latestClaudeUsage[providerKey] = NotLoaded;
+                claudeReaders.TryRemove(providerKey, out _);
+            }
+            else
+            {
+                latestClaudeUsage.TryAdd(providerKey, NotLoaded);
+            }
+        }
+
+        foreach (var providerKey in latestClaudeUsage.Keys.Where(key => !activeProviderKeys.Contains(key)).ToArray())
+        {
+            latestClaudeUsage.Remove(providerKey);
+            claudeReaders.TryRemove(providerKey, out _);
+        }
+
+        ClaudeEntriesChanged?.Invoke();
+        foreach (var pair in latestClaudeUsage)
+        {
+            UsageUpdated?.Invoke(pair.Key, pair.Value);
+        }
+
         BeginRefresh();
     }
 
@@ -599,25 +674,72 @@ public sealed class UsageRefreshService : IDisposable
 
             async Task RefreshClaudeLimitsAsync()
             {
-                var claudeResult = await claudeUsageReader.ReadLatestAsync(cancellation.Token).ConfigureAwait(false);
+                var entries = ClaudeEntries;
+                var claudeTasks = entries
+                    .Select(async entry =>
+                    {
+                        var providerKey = ProviderKeys.Claude(entry.Id);
+                        try
+                        {
+                            // Keyed by id but checked by path: a poll that read its entries just
+                            // before ReloadClaudeEntries evicted this key could otherwise re-insert
+                            // a reader for the folder the account just left.
+                            var credentialsPath = entry.ResolveCredentialsPath();
+                            var reader = claudeReaders.AddOrUpdate(
+                                providerKey,
+                                _ => new ClaudeUsageReader(credentialsPath),
+                                (_, cached) => string.Equals(cached.CredentialsPath, credentialsPath, StringComparison.OrdinalIgnoreCase)
+                                    ? cached
+                                    : new ClaudeUsageReader(credentialsPath));
+                            var result = await reader.ReadLatestAsync(cancellation.Token).ConfigureAwait(false);
+                            return new KeyValuePair<string, ProviderUsageLookupResult>(providerKey, result);
+                        }
+                        catch (Exception exception) when (exception is not OperationCanceledException)
+                        {
+                            return new KeyValuePair<string, ProviderUsageLookupResult>(
+                                providerKey,
+                                new ProviderUsageLookupResult(
+                                    null,
+                                    $"Could not refresh {entry.Name} limits: {exception.Message}"));
+                        }
+                    })
+                    .ToArray();
+
+                // Grouped rather than ToDictionary, for the same reason as Codex: a duplicated
+                // account id would throw here and take the whole refresh down.
+                var claudeResults = (await Task.WhenAll(claudeTasks).ConfigureAwait(false))
+                    .GroupBy(pair => pair.Key, StringComparer.Ordinal)
+                    .ToDictionary(group => group.Key, group => group.Last().Value, StringComparer.Ordinal);
+
                 PostIfCurrent(() =>
                 {
-                    latestClaudeUsage = ProviderUsageLookupResult.KeepLastGood(latestClaudeUsage, claudeResult);
-                    PublishUsage(ProviderKeys.Claude, latestClaudeUsage);
+                    foreach (var pair in claudeResults)
+                    {
+                        var merged = ProviderUsageLookupResult.KeepLastGood(
+                            latestClaudeUsage.TryGetValue(pair.Key, out var previous) ? previous : null,
+                            pair.Value);
+                        latestClaudeUsage[pair.Key] = merged;
+                        PublishUsage(pair.Key, merged);
+                    }
                 });
             }
 
             async Task RefreshClaudeHistoryAsync()
             {
+                // One scan, not one per account: multi-account Claude is a LIMITS-only split. The
+                // reader resolves the default account's projects/ root (CLAUDE_CONFIG_DIR or
+                // ~/.claude) and never looks inside an extra account's folder, so the history is
+                // the default account's alone and stays under its key.
+                var historyKey = ProviderKeys.Claude(ClaudeAccountSettings.DefaultId);
                 var claudeHistory = await Task.Run(() => new ClaudeUsageInsightsReader().ReadLatest(), cancellation.Token)
                     .ConfigureAwait(false);
                 PostIfCurrent(() =>
                 {
                     var merged = ProviderUsageInsightsLookupResult.KeepLastGood(
-                        latestHistory.TryGetValue(ProviderKeys.Claude, out var previous) ? previous : null,
+                        latestHistory.TryGetValue(historyKey, out var previous) ? previous : null,
                         claudeHistory);
-                    latestHistory[ProviderKeys.Claude] = merged;
-                    HistoryUpdated?.Invoke(ProviderKeys.Claude, merged);
+                    latestHistory[historyKey] = merged;
+                    HistoryUpdated?.Invoke(historyKey, merged);
                 });
             }
 
@@ -793,10 +915,14 @@ public sealed class UsageRefreshService : IDisposable
                         PublishUsage(providerKey, annotated);
                     }
 
-                    latestClaudeUsage = ProviderUsageLookupResult.KeepLastGood(
-                        latestClaudeUsage,
-                        new ProviderUsageLookupResult(null, message));
-                    PublishUsage(ProviderKeys.Claude, latestClaudeUsage);
+                    foreach (var providerKey in latestClaudeUsage.Keys.ToArray())
+                    {
+                        var annotated = ProviderUsageLookupResult.KeepLastGood(
+                            latestClaudeUsage[providerKey],
+                            new ProviderUsageLookupResult(null, message));
+                        latestClaudeUsage[providerKey] = annotated;
+                        PublishUsage(providerKey, annotated);
+                    }
 
                     foreach (var providerKey in latestGrokUsage.Keys.ToArray())
                     {

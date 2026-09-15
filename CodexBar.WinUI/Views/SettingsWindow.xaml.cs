@@ -74,6 +74,7 @@ public sealed partial class SettingsWindow : Window
     /// </summary>
     private readonly DispatcherQueueTimer chartColorCommitTimer;
     private readonly List<CodexCliEntry> codexEntries;
+    private readonly List<ClaudeAccountEntry> claudeEntries;
     private readonly List<GrokAccountEntry> grokEntries;
     private readonly List<ChartColorRow> chartColorRows = [];
 
@@ -126,6 +127,7 @@ public sealed partial class SettingsWindow : Window
         settings = AppTheme.Settings;
         palette = FlyoutPalette.For(RootGrid);
         codexEntries = CodexCliSettings.Load().ToList();
+        claudeEntries = ClaudeAccountSettings.Load().ToList();
         grokEntries = GrokAccountSettings.Load().ToList();
 
         Title = $"Settings - {AppInfo.AppName}";
@@ -304,6 +306,7 @@ public sealed partial class SettingsWindow : Window
         RenderOpenCodeGoSavedState();
         RenderProviderMarks();
         RenderAccounts();
+        RenderClaudeAccounts();
         RenderGrokAccounts();
         RenderChartColors();
     }
@@ -346,6 +349,32 @@ public sealed partial class SettingsWindow : Window
             }
         };
         AddAccountButton.Click += (_, _) => AddCodexCli();
+
+        AddClaudeAccountToggle.Click += (_, _) =>
+            ShowAddClaudeAccountPanel(AddClaudeAccountPanel.Visibility != Visibility.Visible);
+        AddClaudeCancelButton.Click += (_, _) => ShowAddClaudeAccountPanel(false);
+        AddClaudeBrowseButton.Click += async (_, _) =>
+        {
+            var picked = await BrowseForClaudeConfigDirAsync();
+            if (picked is not null)
+            {
+                AddClaudePathBox.Text = picked;
+                // The picked folder usually knows whose account it is, and a name typed before
+                // browsing is the user's own and outranks it.
+                if (string.IsNullOrWhiteSpace(AddClaudeNameBox.Text))
+                {
+                    AddClaudeNameBox.Text = AccountEmailIn(picked) ?? string.Empty;
+                }
+            }
+        };
+        AddClaudeAccountButton.Click += (_, _) => AddClaudeAccount();
+        BuiltInClaudeAccountEditToggle.Click += (_, _) =>
+        {
+            var opening = BuiltInClaudeAccountEditor.Visibility != Visibility.Visible;
+            BuiltInClaudeAccountEditor.Visibility = Shown(opening);
+            BuiltInClaudeAccountEditToggle.Content = opening ? "Close" : "Edit";
+        };
+        BuiltInClaudeSaveButton.Click += (_, _) => RenameBuiltInClaudeAccount(BuiltInClaudeNameBox.Text);
 
         AddGrokAccountToggle.Click += (_, _) =>
             ShowAddGrokAccountPanel(AddGrokAccountPanel.Visibility != Visibility.Visible);
@@ -461,6 +490,7 @@ public sealed partial class SettingsWindow : Window
         CursorMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Cursor, palette.Glyph);
         OpenCodeGoMark.Child = ProviderGeometry.CreateIcon(UsageProvider.OpenCodeGo, palette.Glyph);
         BuiltInAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Codex, palette.Glyph);
+        BuiltInClaudeAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Claude, palette.ClaudeGlyph);
         BuiltInGrokAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Grok, palette.GrokGlyph);
         CursorAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.Cursor, palette.Glyph);
         OpenCodeGoAccountMark.Child = ProviderGeometry.CreateIcon(UsageProvider.OpenCodeGo, palette.Glyph);
@@ -470,6 +500,11 @@ public sealed partial class SettingsWindow : Window
         foreach (var host in accountMarks)
         {
             host.Child = ProviderGeometry.CreateIcon(UsageProvider.Codex, palette.Glyph);
+        }
+
+        foreach (var host in claudeAccountMarks)
+        {
+            host.Child = ProviderGeometry.CreateIcon(UsageProvider.Claude, palette.ClaudeGlyph);
         }
 
         foreach (var host in grokAccountMarks)
@@ -1302,6 +1337,310 @@ public sealed partial class SettingsWindow : Window
         CodexCliSettings.SaveAdditional(codexEntries);
         service.ReloadCodexEntries();
         RenderAccounts();
+    }
+
+    // ---------------------------------------------------------- Claude accounts
+
+    /// <summary>Mark hosts on the generated Claude rows, so a theme flip can re-tint them.</summary>
+    private readonly List<Border> claudeAccountMarks = [];
+
+    /// <summary>
+    /// The Claude twin of <see cref="RenderAccounts"/>, and a parallel implementation for the same
+    /// reason the Grok one below is: what the path means (a CLAUDE_CONFIG_DIR folder) and what
+    /// makes it valid are the account's own, and only the row chrome is shared.
+    /// </summary>
+    private void RenderClaudeAccounts()
+    {
+        ClaudeAccountList.Children.Clear();
+        claudeAccountMarks.Clear();
+
+        foreach (var entry in claudeEntries.Where(entry => !entry.IsDefault))
+        {
+            ClaudeAccountList.Children.Add(new Border { Style = RowStyle("RowSeparatorStyle") });
+            ClaudeAccountList.Children.Add(CreateClaudeAccountEditor(entry));
+        }
+
+        var builtIn = claudeEntries.FirstOrDefault(entry => entry.IsDefault);
+        BuiltInClaudeAccountName.Text = builtIn?.Name ?? ClaudeAccountSettings.DefaultName;
+        BuiltInClaudeNameBox.Text = BuiltInClaudeAccountName.Text;
+        if (builtIn is not null)
+        {
+            // The resolved folder, not the rule: when this process inherited CLAUDE_CONFIG_DIR from
+            // whatever launched it, the built-in card is already that account, and adding the same
+            // folder again just shows one login twice.
+            BuiltInClaudeAccountPath.Text =
+                $"{builtIn.ResolveConfigDir()} - the account Claude Code itself is signed in to";
+        }
+    }
+
+    private StackPanel CreateClaudeAccountEditor(ClaudeAccountEntry entry)
+    {
+        var mark = new Border
+        {
+            Width = 16,
+            Height = 16,
+            VerticalAlignment = VerticalAlignment.Center,
+            Child = ProviderGeometry.CreateIcon(UsageProvider.Claude, palette.ClaudeGlyph)
+        };
+        claudeAccountMarks.Add(mark);
+
+        var pathCaption = new TextBlock
+        {
+            Style = RowStyle("SecondaryCaptionStyle"),
+            Text = entry.ConfigDir ?? string.Empty,
+            MaxLines = 1,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        ToolTipService.SetToolTip(pathCaption, entry.ConfigDir ?? string.Empty);
+
+        var identity = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+        identity.Children.Add(new TextBlock { Text = entry.Name, MaxLines = 1, TextTrimming = TextTrimming.CharacterEllipsis });
+        identity.Children.Add(pathCaption);
+
+        var nameBox = new TextBox
+        {
+            Header = "Display name",
+            Text = entry.Name,
+            PlaceholderText = "Name shown in the flyout"
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(nameBox, $"Name for {entry.Name}");
+
+        var pathBox = new TextBox
+        {
+            Header = "Claude config folder",
+            Text = entry.ConfigDir ?? string.Empty,
+            PlaceholderText = "Folder containing .credentials.json"
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(pathBox, $"Config folder for {entry.Name}");
+
+        var browse = new Button { Content = "Browse", VerticalAlignment = VerticalAlignment.Bottom };
+        browse.Click += async (_, _) =>
+        {
+            var picked = await BrowseForClaudeConfigDirAsync();
+            if (picked is not null)
+            {
+                pathBox.Text = picked;
+            }
+        };
+
+        var pathGrid = new Grid { ColumnSpacing = 8 };
+        pathGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        pathGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        AddAt(pathGrid, pathBox, 0);
+        AddAt(pathGrid, browse, 1);
+
+        var save = new Button
+        {
+            Content = "Save changes",
+            Style = (Style)Application.Current.Resources["AccentButtonStyle"]
+        };
+        save.Click += (_, _) => SaveClaudeAccount(entry, nameBox.Text, pathBox.Text);
+
+        var remove = new Button { Content = "Remove" };
+        remove.Click += (_, _) => RemoveClaudeAccount(entry);
+
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+        buttons.Children.Add(save);
+        buttons.Children.Add(remove);
+
+        var editor = new StackPanel
+        {
+            Padding = new Thickness(12, 0, 12, 12),
+            Spacing = 10,
+            Visibility = Visibility.Collapsed
+        };
+        editor.Children.Add(nameBox);
+        editor.Children.Add(pathGrid);
+        editor.Children.Add(buttons);
+
+        var edit = new Button { Content = "Edit", VerticalAlignment = VerticalAlignment.Center };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(edit, $"Edit {entry.Name}");
+        edit.Click += (_, _) =>
+        {
+            var opening = editor.Visibility != Visibility.Visible;
+            editor.Visibility = Shown(opening);
+            edit.Content = opening ? "Close" : "Edit";
+        };
+
+        var row = new Grid { Style = RowStyle("SettingRowStyle") };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        AddAt(row, mark, 0);
+        AddAt(row, identity, 1);
+        AddAt(row, edit, 2);
+
+        var block = new StackPanel();
+        block.Children.Add(row);
+        block.Children.Add(editor);
+        return block;
+    }
+
+    private void ShowAddClaudeAccountPanel(bool visible)
+    {
+        AddClaudeAccountPanel.Visibility = Shown(visible);
+        AddClaudeAccountToggle.Content = visible ? "Close" : "Add";
+    }
+
+    /// <summary>
+    /// Folder picker for a CLAUDE_CONFIG_DIR directory. Same Windows App SDK picker as
+    /// <see cref="BrowseForCodexCliAsync"/> - see its remarks for why the WinRT one is unusable
+    /// in this unpackaged build.
+    /// </summary>
+    private async System.Threading.Tasks.Task<string?> BrowseForClaudeConfigDirAsync()
+    {
+        try
+        {
+            var picker = new Microsoft.Windows.Storage.Pickers.FolderPicker(AppWindow.Id)
+            {
+                SuggestedStartLocation = Microsoft.Windows.Storage.Pickers.PickerLocationId.ComputerFolder,
+                CommitButtonText = "Select"
+            };
+
+            var folder = await picker.PickSingleFolderAsync();
+            return folder?.Path;
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write("folder picker failed: {0}", ex);
+            SetStatus($"Could not open the folder picker: {ex.Message}", StatusLevel.Error);
+            return null;
+        }
+    }
+
+    /// <summary>The email signed in to a config folder, for naming the entry after it.</summary>
+    private static string? AccountEmailIn(string configDir) =>
+        ClaudeAccountSettings.ReadAccountEmail(ClaudeAccountEntry.ConfigJsonPathFor(configDir));
+
+    private void AddClaudeAccount()
+    {
+        var path = AddClaudePathBox.Text.Trim();
+        if (!ValidateClaudeConfigDir(path))
+        {
+            return;
+        }
+
+        // A typed-in path never went through the picker, so this is the other place the folder
+        // can name itself; "Claude 2" is only the answer when it will not.
+        var name = string.IsNullOrWhiteSpace(AddClaudeNameBox.Text)
+            ? AccountEmailIn(path) ?? $"Claude {claudeEntries.Count + 1}"
+            : AddClaudeNameBox.Text.Trim();
+
+        claudeEntries.Add(new ClaudeAccountEntry(Guid.NewGuid().ToString("N"), name, path));
+        SaveClaudeAccountEntries();
+
+        AddClaudeNameBox.Text = string.Empty;
+        AddClaudePathBox.Text = string.Empty;
+        ShowAddClaudeAccountPanel(false);
+        SetStatus($"Added “{name}”.");
+    }
+
+    private void SaveClaudeAccount(ClaudeAccountEntry entry, string name, string path)
+    {
+        path = path.Trim();
+        if (!ValidateClaudeConfigDir(path, excludeId: entry.Id))
+        {
+            return;
+        }
+
+        var index = claudeEntries.FindIndex(candidate => candidate.Id == entry.Id);
+        if (index < 0)
+        {
+            return;
+        }
+
+        var resolvedName = string.IsNullOrWhiteSpace(name) ? entry.Name : name.Trim();
+        claudeEntries[index] = entry with { Name = resolvedName, ConfigDir = path };
+        SaveClaudeAccountEntries();
+        SetStatus($"Saved “{resolvedName}”.");
+    }
+
+    private void RemoveClaudeAccount(ClaudeAccountEntry entry)
+    {
+        claudeEntries.RemoveAll(candidate => candidate.Id == entry.Id);
+        SaveClaudeAccountEntries();
+        SetStatus($"Removed “{entry.Name}”.");
+    }
+
+    /// <summary>
+    /// Unlike the Grok home, a config folder without <c>.credentials.json</c> is rejected outright:
+    /// the limits come from the OAuth token in that file and nowhere else, so a signed-out folder
+    /// could only ever produce a card that never loads.
+    /// </summary>
+    private bool ValidateClaudeConfigDir(string path, string? excludeId = null)
+    {
+        if (!Directory.Exists(path))
+        {
+            SetStatus(
+                string.IsNullOrWhiteSpace(path)
+                    ? "Enter the path to a Claude config folder (the one holding .credentials.json)."
+                    : $"Not found: {path}",
+                StatusLevel.Warning);
+            return false;
+        }
+
+        if (!File.Exists(Path.Combine(path, ".credentials.json")))
+        {
+            SetStatus(
+                $"That folder has no .credentials.json. Sign in there first with $env:CLAUDE_CONFIG_DIR=\"{path}\"; claude login",
+                StatusLevel.Warning);
+            return false;
+        }
+
+        // Two entries on one folder are not two accounts: they show one login twice, and both
+        // readers refresh the same token, each invalidating the other's. The built-in entry is
+        // compared by what it RESOLVES to, so an inherited CLAUDE_CONFIG_DIR is caught as well.
+        var duplicate = claudeEntries.FirstOrDefault(entry =>
+            entry.Id != excludeId && SameFolder(entry.ResolveConfigDir(), path));
+        if (duplicate is not null)
+        {
+            SetStatus(
+                $"That folder is already “{duplicate.Name}” ({duplicate.ResolveConfigDir()}).",
+                StatusLevel.Warning);
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool SameFolder(string left, string right)
+    {
+        try
+        {
+            return string.Equals(
+                Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The built-in account has no folder to edit and cannot be removed, so its editor is just
+    /// the name. An emptied box restores the stock name rather than saving a blank card title.
+    /// </summary>
+    private void RenameBuiltInClaudeAccount(string name)
+    {
+        var index = claudeEntries.FindIndex(entry => entry.IsDefault);
+        if (index < 0)
+        {
+            return;
+        }
+
+        var resolvedName = string.IsNullOrWhiteSpace(name) ? ClaudeAccountSettings.DefaultName : name.Trim();
+        claudeEntries[index] = claudeEntries[index] with { Name = resolvedName };
+        SaveClaudeAccountEntries();
+        SetStatus($"Saved “{resolvedName}”.");
+    }
+
+    private void SaveClaudeAccountEntries()
+    {
+        ClaudeAccountSettings.Save(claudeEntries);
+        service.ReloadClaudeEntries();
+        RenderClaudeAccounts();
     }
 
     // ------------------------------------------------------------ Grok accounts

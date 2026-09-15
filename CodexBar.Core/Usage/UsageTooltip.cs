@@ -25,7 +25,8 @@ public static class UsageTooltip
     public static string Build(
         IReadOnlyList<CodexCliEntry> codexEntries,
         IReadOnlyDictionary<string, ProviderUsageLookupResult> codexUsage,
-        ProviderUsageLookupResult claudeUsage,
+        IReadOnlyList<ClaudeAccountEntry> claudeEntries,
+        IReadOnlyDictionary<string, ProviderUsageLookupResult> claudeUsage,
         IReadOnlyList<GrokAccountEntry> grokEntries,
         IReadOnlyDictionary<string, ProviderUsageLookupResult> grokUsage,
         ProviderUsageLookupResult cursorUsage,
@@ -33,7 +34,7 @@ public static class UsageTooltip
         UiSettings settings)
     {
         if (codexUsage.Values.All(result => result.Snapshot is null) &&
-            claudeUsage.Snapshot is null &&
+            claudeUsage.Values.All(result => result.Snapshot is null) &&
             grokUsage.Values.All(result => result.Snapshot is null) &&
             cursorUsage.Snapshot is null &&
             openCodeGoUsage.Snapshot is null)
@@ -62,9 +63,17 @@ public static class UsageTooltip
 
         if (settings.ClaudeEnabled)
         {
-            segments.Add(claudeUsage.Snapshot is { } claude
-                ? $"Claude {claude.Primary.UsedPercent:0.#}% {ShortWindow(claude.Primary.WindowMinutes)}"
-                : "Claude --");
+            // Capped at two accounts for the same reason as Codex: the whole string is 63
+            // characters, and an unbounded account list would push the providers after it out.
+            segments.AddRange(claudeEntries.Take(2).Select(entry =>
+            {
+                var result = claudeUsage.TryGetValue(ProviderKeys.Claude(entry.Id), out var value)
+                    ? value
+                    : null;
+                return result?.Snapshot is { } snapshot
+                    ? $"{entry.Name} {snapshot.Primary.UsedPercent:0.#}% {ShortWindow(snapshot.Primary.WindowMinutes)}"
+                    : $"{entry.Name} --";
+            }));
         }
 
         if (settings.GrokEnabled)

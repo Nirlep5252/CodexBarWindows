@@ -15,6 +15,7 @@ CodexBarWindows stays in the system tray. Left-click the tray icon to open a com
 - Shows banked Codex reset credits with their expiry, and can redeem one per account when a usage window is nearly exhausted.
 - Shows Codex local history charts for estimated 30 day spend and model usage breakdowns from session logs.
 - Displays 5 hour and weekly usage windows for Claude Code, plus the Fable 5 limit when Anthropic provides it.
+- Supports multiple Claude accounts, each pointed at its own Claude config folder, with a usage card per account.
 - Displays Grok weekly credits, the subscription tier (SuperGrok / Plus / Heavy), optional on-demand spend, and 30-day local history from Grok CLI sessions.
 - Supports multiple Grok accounts, each pointed at its own Grok home folder, with a card per account.
 - Displays Cursor Total, Auto, and API usage from cursor.com when a Cursor Cookie header is configured.
@@ -217,7 +218,9 @@ The built-in Codex tab uses `CODEX_BINARY` or `PATH`, matching the existing beha
 
 No Codex account token is stored by this app. Authentication remains managed by the Codex CLI.
 
-For Claude, the app reads the local Claude Code OAuth credential file at `%USERPROFILE%\.claude\.credentials.json` and calls Anthropic's OAuth usage endpoint. Tokens are read from Claude Code's existing local auth state and refreshed in memory only; this app does not write credentials back to disk.
+For Claude, the app reads the local Claude Code OAuth credential file at `%USERPROFILE%\.claude\.credentials.json` (or `%CLAUDE_CONFIG_DIR%\.credentials.json`) and calls Anthropic's OAuth usage endpoint. Tokens are read from Claude Code's existing local auth state and refreshed in memory only; this app does not write credentials back to disk.
+
+Extra Claude accounts are configured in the WinUI shell under `Settings` → `Accounts` → `Claude accounts`, each pointing at its own Claude config folder (the folder holding `.credentials.json`). Sign one in with `$env:CLAUDE_CONFIG_DIR="$HOME\.claude-work"; claude login`, then pick that folder in Settings. The display name is pre-filled from the signed-in email when Claude Code recorded one, and the built-in account can be renamed too. Each account gets its own flyout card and tray tooltip segment. History charts stay on the default account only. The WinForms shell still shows a single Claude card for the default folder.
 
 For Grok, the app reads the local Grok CLI session file at `%USERPROFILE%\.grok\auth.json` (or `%GROK_HOME%\auth.json`) and calls the cli-chat-proxy billing endpoint used by Grok's `/usage` command. Tokens are refreshed in memory only; this app does not write credentials back to disk. The plan shown on the card comes from the billing response's `subscriptionTier` when present, then `subscription_tier` in `auth.json`, and finally the `tier` claim on the access token — the billing API omits the tier entirely on unified-billing accounts.
 
