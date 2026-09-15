@@ -138,6 +138,9 @@ var tests = new (string Name, Action Run)[]
     ("Claude usage maps Fable from the legacy window", ClaudeUsageMapsLegacyFableLimit),
     ("Claude usage omits Fable when Anthropic omits it", ClaudeUsageOmitsMissingFableLimit),
     ("Claude plan includes the dynamic Max multiplier", ClaudePlanIncludesMultiplier),
+    ("Claude accounts key and resolve per config dir", ClaudeAccountsKeyAndResolvePerConfigDir),
+    ("Tooltip names every configured Claude account", TooltipNamesEveryClaudeAccount),
+    ("Claude account email reads oauthAccount.emailAddress", ClaudeAccountEmailReadsOauthAccount),
     ("Provider plan labels map Codex Pro tiers", ProviderPlanLabelsMapCodexTiers),
     ("Cursor usage keeps fractional percent fields", CursorUsageKeepsFractionalPercents),
     ("Cursor enterprise overall drives headline", CursorEnterpriseOverallDrivesHeadline),
@@ -1148,6 +1151,149 @@ static void ClaudePlanIncludesMultiplier()
         "Claude plan fallback without a tier");
 }
 
+static void ClaudeAccountsKeyAndResolvePerConfigDir()
+{
+    Assert(ProviderKeys.IsClaude(ProviderKeys.Claude("default")), "a Claude key must be recognised as one");
+    Assert(!ProviderKeys.IsClaude(ProviderKeys.Codex("default")), "a Codex key is not a Claude key");
+    Assert(
+        ProviderKeys.ProviderOf(ProviderKeys.Claude("work")) == UsageProvider.Claude,
+        "an account-scoped Claude key routes to the Claude provider");
+
+    var configured = new ClaudeAccountEntry("work", "Work", @"C:\claude-configs\work");
+    Assert(!configured.IsDefault, "an entry with a config directory is not the built-in one");
+    AssertEqual(@"C:\claude-configs\work", configured.ResolveConfigDir(), "configured config directory");
+    AssertEqual(
+        @"C:\claude-configs\work\.credentials.json",
+        configured.ResolveCredentialsPath(),
+        "configured credentials path");
+    AssertEqual(
+        @"C:\claude-configs\work\.claude.json",
+        configured.ResolveConfigJsonPath(),
+        "configured .claude.json path");
+
+    // The built-in entry follows CLAUDE_CONFIG_DIR - the first of the comma-separated list, which
+    // is the one Claude Code writes to - exactly like the CLI itself.
+    var previous = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
+    try
+    {
+        Environment.SetEnvironmentVariable("CLAUDE_CONFIG_DIR", @"C:\claude-configs\env,C:\claude-configs\other");
+        var fromEnvironment = new ClaudeAccountEntry(ClaudeAccountSettings.DefaultId, "Claude", null);
+        Assert(fromEnvironment.IsDefault, "an entry without a config directory is the built-in one");
+        AssertEqual(
+            @"C:\claude-configs\env\.credentials.json",
+            fromEnvironment.ResolveCredentialsPath(),
+            "CLAUDE_CONFIG_DIR credentials path");
+        AssertEqual(
+            @"C:\claude-configs\env\.claude.json",
+            fromEnvironment.ResolveConfigJsonPath(),
+            "CLAUDE_CONFIG_DIR .claude.json path");
+
+        // Without the variable, .claude.json sits in the profile ROOT rather than inside
+        // ~/.claude. That asymmetry is Claude Code's own layout.
+        Environment.SetEnvironmentVariable("CLAUDE_CONFIG_DIR", null);
+        var builtIn = new ClaudeAccountEntry(ClaudeAccountSettings.DefaultId, "Claude", null);
+        var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        AssertEqual(
+            Path.Combine(profile, ".claude", ".credentials.json"),
+            builtIn.ResolveCredentialsPath(),
+            "default credentials path");
+        AssertEqual(
+            Path.Combine(profile, ".claude.json"),
+            builtIn.ResolveConfigJsonPath(),
+            "default .claude.json path");
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable("CLAUDE_CONFIG_DIR", previous);
+    }
+}
+
+// Two Claude accounts have to be two named segments, not one "Claude" line: the tooltip is the
+// only place the tray states both, and a shared label would make them indistinguishable.
+static void TooltipNamesEveryClaudeAccount()
+{
+    var claudeEntries = new[]
+    {
+        new ClaudeAccountEntry("default", "Claude", null),
+        new ClaudeAccountEntry("work", "Claude work", @"C:\claude-configs\work")
+    };
+
+    var claudeUsage = new Dictionary<string, ProviderUsageLookupResult>(StringComparer.Ordinal)
+    {
+        [ProviderKeys.Claude("default")] = new(ClaudeSnapshot(42), null),
+        [ProviderKeys.Claude("work")] = new(ClaudeSnapshot(8), null)
+    };
+
+    var tooltip = UsageTooltip.Build(
+        [],
+        new Dictionary<string, ProviderUsageLookupResult>(StringComparer.Ordinal),
+        claudeEntries,
+        claudeUsage,
+        [],
+        new Dictionary<string, ProviderUsageLookupResult>(StringComparer.Ordinal),
+        new ProviderUsageLookupResult(null, "not loaded"),
+        new ProviderUsageLookupResult(null, "not loaded"),
+        new UiSettings
+        {
+            CodexEnabled = false,
+            ClaudeEnabled = true,
+            GrokEnabled = false,
+            CursorEnabled = false,
+            OpenCodeGoEnabled = false
+        });
+
+    AssertEqual("Claude 42% 5h, Claude work 8% 5h", tooltip, "both Claude accounts in the tooltip");
+}
+
+static ProviderUsageSnapshot ClaudeSnapshot(double usedPercent) => new(
+    UsageProvider.Claude,
+    DateTimeOffset.Now,
+    "max 20x",
+    new ProviderUsageWindow("5 hour limit", usedPercent, 300, null),
+    null,
+    "Claude Code OAuth");
+
+// The email is what the accounts editor offers as a display name, so an unreadable or older
+// .claude.json has to come back as "no answer" rather than throwing at the user.
+static void ClaudeAccountEmailReadsOauthAccount()
+{
+    var root = Path.Combine(Path.GetTempPath(), "codexbar-claude-account-tests", Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(root);
+    try
+    {
+        var configJsonPath = Path.Combine(root, ".claude.json");
+        File.WriteAllText(configJsonPath, """
+            {
+              "numStartups": 12,
+              "oauthAccount": {
+                "accountUuid": "0f6a1f6e-0000-4000-8000-000000000000",
+                "emailAddress": "person@example.com",
+                "organizationName": "Example"
+              }
+            }
+            """);
+
+        AssertEqual(
+            "person@example.com",
+            ClaudeAccountSettings.ReadAccountEmail(configJsonPath)!,
+            "email from oauthAccount");
+
+        var withoutAccount = Path.Combine(root, "no-account.json");
+        File.WriteAllText(withoutAccount, """{ "numStartups": 12 }""");
+        Assert(
+            ClaudeAccountSettings.ReadAccountEmail(withoutAccount) is null,
+            "a config without oauthAccount states no email");
+
+        Assert(
+            ClaudeAccountSettings.ReadAccountEmail(Path.Combine(root, "missing.json")) is null,
+            "a missing config states no email");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
 static void ProviderPlanLabelsMapCodexTiers()
 {
     AssertEqual("Pro 5x", ProviderPlanFormatter.DisplayName(UsageProvider.Codex, "prolite"), "Codex ProLite plan");
@@ -1534,7 +1680,7 @@ static void GrokAccountsKeyAndResolvePerHome()
         ProviderKeys.ProviderOf(ProviderKeys.Codex("work")) == UsageProvider.Codex,
         "Codex keys still route to Codex");
     Assert(
-        ProviderKeys.ProviderOf(ProviderKeys.Claude) == UsageProvider.Claude,
+        ProviderKeys.ProviderOf(ProviderKeys.Cursor) == UsageProvider.Cursor,
         "the singleton providers are unaffected");
 
     var configured = new GrokAccountEntry("work", "Work", @"C:\grok-homes\work");
@@ -1577,7 +1723,8 @@ static void TooltipNamesEveryGrokAccount()
     var tooltip = UsageTooltip.Build(
         [],
         new Dictionary<string, ProviderUsageLookupResult>(StringComparer.Ordinal),
-        new ProviderUsageLookupResult(null, "not loaded"),
+        [],
+        new Dictionary<string, ProviderUsageLookupResult>(StringComparer.Ordinal),
         grokEntries,
         grokUsage,
         new ProviderUsageLookupResult(null, "not loaded"),
